@@ -372,7 +372,8 @@ OAuth2 tokens are stored encrypted in your profiles directory:
 ### Encryption Details
 
 - **Algorithm:** AES-256-CBC
-- **Key Derivation:** PBKDF2 with 100,000 iterations
+- **Key Derivation:** PBKDF2 with 100,000 iterations (HMAC-SHA256 via `openssl enc` on Unix/macOS, HMAC-SHA1 via .NET on Windows)
+- **Portability:** Token files are not interchangeable between Unix/macOS and Windows; run `ccswap oauth login` on each machine
 - **File Permissions:** 600 (user read/write only on Unix/macOS)
 - **Password:** User-provided, not stored anywhere
 

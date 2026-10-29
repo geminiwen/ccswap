@@ -54,7 +54,7 @@ detect_auth_type() {
     fi
 }
 
-# Encrypt token file using AES-256-CBC with PBKDF2
+# Encrypt token file using AES-256-CBC with PBKDF2 (openssl enc, salted)
 encrypt_tokens() {
     local input_file="$1"
     local output_file="$2"
@@ -65,33 +65,16 @@ encrypt_tokens() {
         return 1
     fi
 
-    # Generate random salt (16 bytes = 32 hex chars)
-    local salt=$(openssl rand -hex 16)
-
-    # Derive key and IV using PBKDF2 (48 bytes = 32 key + 16 IV)
-    local key_iv=$(echo -n "${password}" | openssl pbkdf2 -iter 100000 -salt "${salt}" -keylen 48 -hex 2>/dev/null)
-
-    if [ -z "$key_iv" ]; then
-        echo "Error: Failed to derive encryption key" >&2
-        return 1
-    fi
-
-    local key=$(echo "${key_iv}" | cut -c 1-64)
-    local iv=$(echo "${key_iv}" | cut -c 65-96)
-
-    # Encrypt the data
+    # Password goes through stdin so it never shows up in the process list
     local temp_output=$(mktemp)
-    if ! openssl enc -aes-256-cbc -in "${input_file}" -out "${temp_output}" \
-        -K "${key}" -iv "${iv}" -pbkdf2 -iter 100000 2>/dev/null; then
+    if ! printf '%s\n' "$password" | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -salt \
+        -pass stdin -in "$input_file" -out "$temp_output" 2>/dev/null; then
         echo "Error: Encryption failed" >&2
         rm -f "$temp_output"
         return 1
     fi
 
-    # Prepend salt to encrypted file
-    echo -n "${salt}" > "${output_file}"
-    cat "${temp_output}" >> "${output_file}"
-    rm -f "$temp_output"
+    mv "$temp_output" "$output_file"
 
     # Set restrictive permissions (600 = user read/write only)
     chmod 600 "${output_file}" 2>/dev/null || true
@@ -115,35 +98,14 @@ decrypt_tokens() {
         return 1
     fi
 
-    # Read the file
-    local file_content
-    file_content=$(cat "$input_file")
-
-    # Extract salt (first 32 hex chars = 16 bytes) and encrypted data
-    local salt="${file_content:0:32}"
-    local encrypted_data="${file_content:32}"
-
-    if [ ${#salt} -lt 32 ]; then
-        echo "Error: Invalid token file format" >&2
+    if ! printf '%s\n' "$password" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 \
+        -pass stdin -in "$input_file" -out "$output_file" 2>/dev/null; then
+        echo "Error: Decryption failed (wrong password?)" >&2
         return 1
     fi
 
-    # Derive key and IV using PBKDF2
-    local key_iv=$(echo -n "${password}" | openssl pbkdf2 -iter 100000 -salt "${salt}" -keylen 48 -hex 2>/dev/null)
-
-    if [ -z "$key_iv" ]; then
-        echo "Error: Failed to derive decryption key" >&2
-        return 1
-    fi
-
-    local key=$(echo "${key_iv}" | cut -c 1-64)
-    local iv=$(echo "${key_iv}" | cut -c 65-96)
-
-    # Decrypt the data
-    echo -n "${encrypted_data}" | openssl enc -aes-256-cbc -d -out "${output_file}" \
-        -K "${key}" -iv "${iv}" -pbkdf2 -iter 100000 2>/dev/null
-
-    if [ $? -ne 0 ]; then
+    # A wrong password can occasionally pass the padding check, so make sure we got JSON back
+    if ! jq -e . "$output_file" > /dev/null 2>&1; then
         echo "Error: Decryption failed (wrong password?)" >&2
         return 1
     fi

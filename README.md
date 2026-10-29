@@ -73,6 +73,25 @@ You should see the usage information if installed correctly.
 2. Save your first profile: `ccswap save default`
 3. Create additional profiles as needed
 
+## Surge Proxy Switching (macOS)
+
+Add a `surge` section to a profile to switch [Surge](https://nssurge.com) policy groups on `ccswap use`:
+
+```
+{
+  "env": { ... },
+  "surge": {
+    "Claude": "US-Proxy",
+    "Proxy": "HK-Proxy"
+  }
+}
+```
+
+- Keys are Surge policy group names, values are the policy to select in that group
+- The policy must already be a member of the group in your Surge profile; otherwise it is skipped with a warning
+- Profiles without a `surge` section leave Surge untouched
+- Skipped with a warning when `surge-cli` is missing or Surge is not running
+
 ## Example profile for GLM 4.6
 ```
 {

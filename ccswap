@@ -95,6 +95,52 @@ list_profiles() {
     done
 }
 
+# Function to switch Surge policy groups to the profile's "surge" selection
+switch_surge() {
+    local profile_file="$1"
+
+    # Profiles without a "surge" section leave Surge untouched
+    if ! jq -e '.surge | length > 0' "$profile_file" > /dev/null 2>&1; then
+        return 0
+    fi
+
+    local surge_cli=$(command -v surge-cli || echo "/Applications/Surge.app/Contents/Applications/surge-cli")
+    if [ ! -x "$surge_cli" ]; then
+        echo -e "${YELLOW}Warning: surge-cli not found, Surge policies not switched${NC}"
+        return 0
+    fi
+
+    local groups=$("$surge_cli" --raw dump policy-group-sub-policies 2>/dev/null)
+    if ! echo "$groups" | jq -e '.map' > /dev/null 2>&1; then
+        echo -e "${YELLOW}Warning: Surge is not running, Surge policies not switched${NC}"
+        return 0
+    fi
+
+    # Surge only accepts a policy that is a member of the group
+    local args=()
+    local valid entry
+    while IFS=$'\t' read -r valid entry; do
+        if [ "$valid" = "true" ]; then
+            args+=("ProxyGroupSelection.${entry}")
+        else
+            echo -e "${YELLOW}Warning: Surge group '${entry%%=*}' has no policy '${entry#*=}', skipped${NC}"
+        fi
+    done < <(jq -r --argjson groups "$groups" \
+        '.surge | to_entries[] | .key as $g | .value as $p
+         | "\([$groups.map[$g][]?.name] | any(. == $p))\t\($g)=\($p)"' "$profile_file")
+
+    if [ ${#args[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    if "$surge_cli" --raw set "${args[@]}" 2>/dev/null | jq -e '.result == "success"' > /dev/null 2>&1; then
+        local switched=$(printf '%s, ' "${args[@]#ProxyGroupSelection.}")
+        echo -e "${GREEN}Switched Surge: ${switched%, }${NC}"
+    else
+        echo -e "${YELLOW}Warning: surge-cli set failed, Surge policies not switched${NC}"
+    fi
+}
+
 # Function to switch profile
 use_profile() {
     local profile_name="$1"
@@ -184,6 +230,7 @@ use_profile() {
         cp "$temp_settings" "$SETTINGS_FILE"
         rm -f "$temp_settings"
 
+        switch_surge "$profile_file"
         echo "$profile_name" > "$ACTIVE_PROFILE_FILE"
         echo -e "${GREEN}Successfully switched to OAuth2 profile: ${profile_name}${NC}"
         return 0
@@ -191,6 +238,7 @@ use_profile() {
 
     # API key profile (original behavior)
     cp "$profile_file" "$SETTINGS_FILE"
+    switch_surge "$profile_file"
     echo "$profile_name" > "$ACTIVE_PROFILE_FILE"
 
     echo -e "${GREEN}Successfully switched to profile: ${profile_name}${NC}"

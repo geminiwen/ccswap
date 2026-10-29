@@ -1,0 +1,835 @@
+#!/bin/bash
+# ccacc – Claude Code official account switcher for macOS/Linux
+# Everything cccleaner wipes follows the account instead: the whole keychain item
+# "Claude Code-credentials" (or ~/.claude/.credentials.json on Linux), the account-bound keys of
+# ~/.claude.json, the history/state folders under ~/.claude and the Claude CLI cache.
+# Keychain items with a suffix (other CLAUDE_CONFIG_DIRs, Orca accounts), the shared Cowork
+# device keys and the Claude desktop app are never touched.
+# Login backups are files encrypted with one master password (AES-256-CBC, PBKDF2)
+# Make it executable: chmod +x ccacc
+# Move to PATH: sudo mv ccacc /usr/local/bin/
+
+set -e
+
+SCRIPT_NAME="ccacc"
+VERSION="0.1.0"
+
+# Always the default config dir, whatever CLAUDE_CONFIG_DIR says
+CONFIG_DIR="$HOME/.claude"
+CLAUDE_JSON="$HOME/.claude.json"
+CREDENTIALS_FILE="$CONFIG_DIR/.credentials.json"
+KEYCHAIN_SERVICE="Claude Code-credentials"
+DEVICE_KEY_SERVICE="Claude Code-device-keys"
+DEVICE_KEY_FILE="$CONFIG_DIR/.device-keys.json"
+ACCOUNTS_DIR="$CONFIG_DIR/accounts"
+ACTIVE_FILE="$ACCOUNTS_DIR/.active"
+CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
+MASTER_PASSWORD=""
+SURGE_CLI=""
+
+# Account-bound keys of ~/.claude.json: everything cccleaner clears or resets (identity IDs,
+# account caches, per-install counters and usage, project history, repo paths, bridge records).
+# Everything else (mcpServers, settings, ...) stays shared between accounts
+ACCOUNT_KEYS='[
+    "userID", "userId", "anonymousId", "machineID",
+    "oauthAccount", "chromeExtension", "hasShownOpus45Notice",
+    "cachedChangelog", "cachedStatsigGates", "cachedDynamicConfigs", "cachedGrowthBookFeatures",
+    "cachedGrowthBookFeaturesAt", "metricsStatusCache", "clientDataCache", "clientDataCacheSlots",
+    "additionalModelOptionsCache", "overageCreditGrantCache", "groveConfigCache",
+    "passesEligibilityCache", "s1mAccessCache", "changelogLastFetched", "lastPlanModeUse",
+    "passesUpsellSeenCount", "passesLastSeenRemaining",
+    "numStartups", "btwUseCount", "promptQueueUseCount", "opus1mMergeNoticeSeenCount",
+    "voiceNoticeSeenCount", "slackAppInstallCount", "autoPermissionsNotificationCount",
+    "remoteControlUpsellSeenCount", "closedIssuesLastChecked", "ideHintShownCount",
+    "opusProMigrationTimestamp", "claudeCodeFirstTokenDate", "routineFiredWatermark",
+    "skillUsage", "toolUsage", "pluginUsage", "agentLastUsed", "feedbackSurveyState",
+    "tipsHistory", "tipLifetimeShownCounts",
+    "firstStartTime", "lastShownEmergencyTip", "companion", "lastOnboardingVersion", "lastReleaseNotesSeen",
+    "projects", "githubRepoPaths", "replBridgePlaceholders"
+]'
+
+# Files and folders cccleaner wipes; they are moved in and out with the account (<backup name>|<path>)
+ACCOUNT_PATHS=(
+    "backups|$CONFIG_DIR/backups"
+    "debug|$CONFIG_DIR/debug"
+    "file-history|$CONFIG_DIR/file-history"
+    "paste-cache|$CONFIG_DIR/paste-cache"
+    "plans|$CONFIG_DIR/plans"
+    "projects|$CONFIG_DIR/projects"
+    "session-env|$CONFIG_DIR/session-env"
+    "shell-snapshots|$CONFIG_DIR/shell-snapshots"
+    "stats-cache.json|$CONFIG_DIR/stats-cache.json"
+    "statsig|$CONFIG_DIR/statsig"
+    "tasks|$CONFIG_DIR/tasks"
+    "telemetry|$CONFIG_DIR/telemetry"
+    "todos|$CONFIG_DIR/todos"
+    "history.jsonl|$CONFIG_DIR/history.jsonl"
+    "cache|$CONFIG_DIR/cache"
+    "gh-pr-status-cache.json|$CONFIG_DIR/gh-pr-status-cache.json"
+    "cli-nodejs-cache|$HOME/Library/Caches/claude-cli-nodejs"
+)
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to show usage
+usage() {
+    cat << EOF
+${BLUE}ccacc – Claude Code Account Switcher v${VERSION}${NC}
+
+Usage: $SCRIPT_NAME [COMMAND] [OPTIONS]
+
+Commands:
+  ls                    List saved accounts
+  current               Show the current Claude account
+  save <name>           Back up the current account as <name> and make it active
+  use <name>            Back up the active account, then switch to <name>
+  new <name>            Back up the active account, then start <name> like a fresh install
+                        (logged out, new IDs; run 'claude /login' next)
+  surge <name>          Choose the Surge policies <name> uses (e.g. its own exit for the Claude group)
+  rm <name>             Delete a saved account and its saved history
+  help                  Show this help message
+  -v, --version         Show version information
+
+An account is everything cccleaner would wipe:
+  - the whole keychain item "Claude Code-credentials" (macOS) or ~/.claude/.credentials.json (Linux)
+  - the account-bound keys of ~/.claude.json (IDs, oauthAccount, caches, counters, projects, ...)
+  - ~/.claude history/state folders (projects, file-history, statsig, telemetry, history.jsonl, ...)
+  - ~/Library/Caches/claude-cli-nodejs
+Login backups are encrypted with one master password, asked once per save/use/new.
+Folders are moved, not copied, so switching is instant.
+With Surge installed, save/new ask which Surge policies the account uses and use applies them;
+without Surge nothing is asked.
+
+Left alone: CLAUDE_CONFIG_DIR, suffixed keychain items, the shared Cowork device keys,
+mcpServers, settings and the Claude desktop app. Quit Claude Code before switching.
+
+Examples:
+  $SCRIPT_NAME save personal
+  $SCRIPT_NAME new work
+  $SCRIPT_NAME use personal
+
+EOF
+}
+
+# Function to show version
+version() {
+    echo "${SCRIPT_NAME} v${VERSION}"
+}
+
+# Function to check that jq, openssl and Claude Code's config are available
+check_ready() {
+    if ! command -v jq &> /dev/null || ! command -v openssl &> /dev/null; then
+        echo -e "${RED}Error: jq and openssl are required${NC}"
+        return 1
+    fi
+
+    if [ ! -f "$CLAUDE_JSON" ]; then
+        echo -e "${RED}Error: $CLAUDE_JSON not found, run Claude Code at least once${NC}"
+        return 1
+    fi
+
+    if [ -n "$CLAUDE_CONFIG_DIR" ]; then
+        echo -e "${YELLOW}Note: CLAUDE_CONFIG_DIR is ignored; ccacc only switches the default account in ~/.claude${NC}"
+    fi
+
+    mkdir -p -m 700 "$ACCOUNTS_DIR"
+}
+
+# Function to validate an account name (it becomes a file and folder name)
+check_name() {
+    if [ -z "$1" ]; then
+        echo -e "${RED}Error: Account name required${NC}"
+        usage
+        return 1
+    fi
+
+    if [[ ! "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo -e "${RED}Error: Account name must start with a letter or digit and only contain letters, digits, '.', '_' and '-'${NC}"
+        return 1
+    fi
+}
+
+# Function to make sure Claude Code is closed: it keeps the old account in memory,
+# may write it back, and keeps writing history into the folders being moved
+confirm_not_running() {
+    if pgrep -f '(^|/)claude( |$)' > /dev/null 2>&1; then
+        echo -e "${YELLOW}Warning: Claude Code is running; quit it first, or it may write the old account and history back${NC}"
+        read -p "Switch anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Cancelled"
+            exit 1
+        fi
+    fi
+}
+
+# Function to point out Cowork device keys: Claude Code keeps them under one fixed keychain name
+# shared by every config dir, so ccacc leaves them alone (checks existence only, never reads them)
+note_device_keys() {
+    if [ -e "$DEVICE_KEY_FILE" ] || { command -v security &> /dev/null \
+        && security find-generic-password -s "$DEVICE_KEY_SERVICE" > /dev/null 2>&1; }; then
+        echo -e "${YELLOW}Note: Cowork device keys (${DEVICE_KEY_SERVICE}) are shared by all Claude Code config dirs and are not switched${NC}"
+    fi
+}
+
+# Functions to read/write a macOS keychain secret (service, account)
+keychain_read() {
+    local status=0
+    local secret
+    secret=$(security find-generic-password -s "$1" -a "$2" -w 2>/dev/null) || status=$?
+
+    # 44 = no such item
+    if [ $status -eq 44 ]; then
+        return 0
+    elif [ $status -ne 0 ]; then
+        return 1
+    fi
+
+    # security prints secrets containing non-ASCII bytes as hex
+    if ! printf '%s' "$secret" | jq -e . > /dev/null 2>&1 && [[ "$secret" =~ ^[0-9a-f]+$ ]]; then
+        secret=$(printf '%s' "$secret" | xxd -r -p)
+    fi
+    printf '%s' "$secret"
+}
+
+keychain_write() {
+    # Fed through `security -i` so the secret never shows up in the process list
+    local hex=$(printf '%s' "$3" | od -An -v -tx1 | tr -d ' \n')
+    printf 'add-generic-password -U -a "%s" -s "%s" -X "%s"\n' "$2" "$1" "$hex" | security -i > /dev/null
+
+    [ "$(keychain_read "$1" "$2")" = "$3" ]
+}
+
+# Functions to read/write/delete Claude Code's default credentials (keychain on macOS, file elsewhere).
+# `security -s` matches the service name exactly, so suffixed items are never affected
+read_credentials() {
+    if command -v security &> /dev/null; then
+        keychain_read "$KEYCHAIN_SERVICE" "$USER"
+    elif [ -f "$CREDENTIALS_FILE" ]; then
+        cat "$CREDENTIALS_FILE"
+    fi
+}
+
+write_credentials() {
+    if command -v security &> /dev/null; then
+        keychain_write "$KEYCHAIN_SERVICE" "$USER" "$1"
+    else
+        (umask 077; printf '%s\n' "$1" > "$CREDENTIALS_FILE")
+        chmod 600 "$CREDENTIALS_FILE"
+    fi
+}
+
+delete_credentials() {
+    if command -v security &> /dev/null; then
+        security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" > /dev/null 2>&1 || true
+    else
+        rm -f "$CREDENTIALS_FILE"
+    fi
+
+    local left
+    left=$(read_credentials) && [ -z "$left" ]
+}
+
+# Function to replace Claude Code's whole credentials entry: delete it, then write the backup (if any)
+replace_credentials() {
+    delete_credentials || return 1
+
+    if [ -n "$1" ]; then
+        write_credentials "$1"
+    fi
+}
+
+# Functions to encrypt stdin into a file / decrypt a file to stdout with the master password
+# (the password goes through fd 3, so it never shows up in the process list or on disk)
+encrypt_to() {
+    local temp_file=$(mktemp)
+
+    if ! openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -salt -pass fd:3 \
+        -out "$temp_file" 3< <(printf '%s\n' "$MASTER_PASSWORD") 2>/dev/null; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    chmod 600 "$temp_file"
+    mv "$temp_file" "$1"
+}
+
+decrypt_from() {
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -pass fd:3 \
+        -in "$1" 3< <(printf '%s\n' "$MASTER_PASSWORD") 2>/dev/null
+}
+
+# Function to ask for the master password once per run.
+# The first one is confirmed and recorded in a check file, so a typo can't split backups across passwords
+ask_password() {
+    if [ -n "$MASTER_PASSWORD" ]; then
+        return 0
+    fi
+
+    if [ -f "$CHECK_FILE" ]; then
+        IFS= read -r -s -p "ccacc master password: " MASTER_PASSWORD
+        echo
+        if [ "$(decrypt_from "$CHECK_FILE")" != "ccacc" ]; then
+            MASTER_PASSWORD=""
+            echo -e "${RED}Error: Wrong master password${NC}"
+            return 1
+        fi
+        return 0
+    fi
+
+    local confirm
+    IFS= read -r -s -p "Set a ccacc master password: " MASTER_PASSWORD
+    echo
+    IFS= read -r -s -p "Confirm master password: " confirm
+    echo
+
+    if [ -z "$MASTER_PASSWORD" ] || [ "$MASTER_PASSWORD" != "$confirm" ]; then
+        MASTER_PASSWORD=""
+        echo -e "${RED}Error: Passwords are empty or do not match${NC}"
+        return 1
+    fi
+
+    printf 'ccacc' | encrypt_to "$CHECK_FILE"
+}
+
+# Functions to keep an account's encrypted backups as <name>.<kind>.enc (kind: credentials)
+read_backup() {
+    local backup_file="$ACCOUNTS_DIR/$1.$2.enc"
+
+    if [ -f "$backup_file" ]; then
+        decrypt_from "$backup_file"
+    fi
+}
+
+write_backup() {
+    local name="$1"
+    local kind="$2"
+    local content="$3"
+
+    if [ -z "$content" ]; then
+        delete_backup "$name" "$kind"
+        return 0
+    fi
+
+    printf '%s' "$content" | encrypt_to "$ACCOUNTS_DIR/${name}.${kind}.enc" \
+        && [ "$(read_backup "$name" "$kind")" = "$content" ]
+}
+
+delete_backup() {
+    rm -f "$ACCOUNTS_DIR/$1.$2.enc"
+}
+
+# Function to generate a fresh Claude Code identity (userID + anonymousId + machineID)
+new_identity() {
+    local user_id=$(od -An -v -tx1 -N32 /dev/urandom | tr -d ' \n')
+    local machine_id=$(od -An -v -tx1 -N32 /dev/urandom | tr -d ' \n')
+    local uuid
+    if command -v uuidgen &> /dev/null; then
+        uuid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+    else
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+    fi
+
+    jq -n --arg user_id "$user_id" --arg anonymous_id "claudecode.v1.${uuid}" --arg machine_id "$machine_id" \
+        '{userID: $user_id, anonymousId: $anonymous_id, machineID: $machine_id}'
+}
+
+# Function to replace the account-bound keys of .claude.json with an account's saved ones
+# (keys the account doesn't have are removed, so nothing of the previous account is left behind)
+set_account_state() {
+    local state="$1"
+    local temp_config=$(mktemp)
+
+    if ! jq --argjson keys "$ACCOUNT_KEYS" --argjson state "$state" \
+        'with_entries(select(.key as $k | $keys | index($k) | not))
+         + ($state | with_entries(select(.value != null)))' \
+        "$CLAUDE_JSON" > "$temp_config"; then
+        rm -f "$temp_config"
+        return 1
+    fi
+
+    cp "$temp_config" "$CLAUDE_JSON"
+    rm -f "$temp_config"
+}
+
+# Function to reset the account-bound keys like a fresh install (the same resets cccleaner does), with new IDs
+reset_account_state() {
+    local temp_config=$(mktemp)
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+
+    if ! jq --argjson ids "$(new_identity)" --arg now "$now" '
+        def zero_leaves:
+            if type == "object" then with_entries(.value |= zero_leaves)
+            elif type == "array" then map(zero_leaves)
+            else 0 end;
+        def reset($key; $value): if has($key) then .[$key] = $value else . end;
+        def zero($key): if has($key) then .[$key] |= zero_leaves else . end;
+
+        del(.oauthAccount, .chromeExtension, .hasShownOpus45Notice, .userId,
+            .cachedChangelog, .cachedStatsigGates, .cachedDynamicConfigs, .cachedGrowthBookFeatures,
+            .cachedGrowthBookFeaturesAt, .metricsStatusCache, .clientDataCache, .clientDataCacheSlots,
+            .additionalModelOptionsCache, .overageCreditGrantCache,
+            .firstStartTime, .lastShownEmergencyTip, .companion, .lastOnboardingVersion, .lastReleaseNotesSeen,
+            .githubRepoPaths, .replBridgePlaceholders)
+        | .projects = {}
+        | reset("groveConfigCache"; {}) | reset("passesEligibilityCache"; {}) | reset("s1mAccessCache"; {})
+        | reset("changelogLastFetched"; 0) | reset("lastPlanModeUse"; 0) | reset("passesUpsellSeenCount"; 0)
+        | reset("passesLastSeenRemaining"; 0) | reset("numStartups"; 0) | reset("btwUseCount"; 0)
+        | reset("promptQueueUseCount"; 0) | reset("opus1mMergeNoticeSeenCount"; 0)
+        | reset("voiceNoticeSeenCount"; 0) | reset("slackAppInstallCount"; 0)
+        | reset("autoPermissionsNotificationCount"; 0) | reset("remoteControlUpsellSeenCount"; 0)
+        | reset("closedIssuesLastChecked"; 0) | reset("ideHintShownCount"; 0)
+        | reset("opusProMigrationTimestamp"; 0)
+        | reset("claudeCodeFirstTokenDate"; $now) | reset("routineFiredWatermark"; $now)
+        | reset("skillUsage"; {}) | reset("toolUsage"; {})
+        | zero("pluginUsage") | zero("agentLastUsed") | zero("feedbackSurveyState") | zero("tipLifetimeShownCounts")
+        | if has("tipsHistory") then .tipsHistory |= with_entries(.value = 0) else . end
+        | . + $ids
+    ' "$CLAUDE_JSON" > "$temp_config"; then
+        rm -f "$temp_config"
+        return 1
+    fi
+
+    cp "$temp_config" "$CLAUDE_JSON"
+    rm -f "$temp_config"
+}
+
+# Function to move the account-bound files and folders out of the way, into an account's backup folder
+stash_paths() {
+    local stash="$ACCOUNTS_DIR/$1"
+    local entry label path
+
+    mkdir -p -m 700 "$stash"
+    for entry in "${ACCOUNT_PATHS[@]}"; do
+        label="${entry%%|*}"
+        path="${entry#*|}"
+
+        # Clear any stale copy first, or mv would nest a folder inside it
+        rm -rf "${stash:?}/${label:?}"
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            mv "$path" "$stash/$label" || return 1
+        fi
+    done
+}
+
+# Function to move an account's files and folders back into place
+unstash_paths() {
+    local stash="$ACCOUNTS_DIR/$1"
+    local entry label path
+
+    for entry in "${ACCOUNT_PATHS[@]}"; do
+        label="${entry%%|*}"
+        path="${entry#*|}"
+
+        if [ -e "$stash/$label" ] || [ -L "$stash/$label" ]; then
+            rm -rf "${path:?}"
+            mkdir -p "$(dirname "$path")"
+            mv "$stash/$label" "$path" || return 1
+        fi
+    done
+}
+
+# Function to back up the current account (credentials + account-bound keys) as <name>.
+# Folders stay in place while the account is active; they are only moved when switching away
+save_account() {
+    local name="$1"
+    local credentials
+
+    if ! credentials=$(read_credentials); then
+        echo -e "${RED}Error: Could not read the Claude login from $KEYCHAIN_SERVICE${NC}"
+        return 1
+    fi
+
+    local temp_account=$(mktemp)
+    if ! jq --argjson keys "$ACCOUNT_KEYS" 'with_entries(select(.key as $k | $keys | index($k)))' \
+        "$CLAUDE_JSON" > "$temp_account" \
+        || ! write_backup "$name" credentials "$credentials"; then
+        rm -f "$temp_account"
+        echo -e "${RED}Error: Could not back up account '${name}'${NC}"
+        return 1
+    fi
+
+    mv "$temp_account" "$ACCOUNTS_DIR/${name}.json"
+}
+
+# Function to restore a saved account's credentials and account-bound keys
+load_account() {
+    local name="$1"
+    local credentials
+
+    # Read the backup before changing anything, so a bad backup leaves the current account in place
+    if ! credentials=$(read_backup "$name" credentials); then
+        echo -e "${RED}Error: Could not read the credentials backup of '${name}'${NC}"
+        return 1
+    fi
+    if [ -n "$credentials" ] && ! printf '%s' "$credentials" | jq -e . > /dev/null 2>&1; then
+        echo -e "${RED}Error: Credentials backup of '${name}' is not valid JSON${NC}"
+        return 1
+    fi
+
+    if ! replace_credentials "$credentials" \
+        || ! set_account_state "$(cat "$ACCOUNTS_DIR/${name}.json")"; then
+        echo -e "${RED}Error: Failed to restore account '${name}'${NC}"
+        return 1
+    fi
+}
+
+# Function to find surge-cli; fails quietly when Surge isn't installed, so nothing is asked or shown
+find_surge() {
+    SURGE_CLI=$(command -v surge-cli || echo "/Applications/Surge.app/Contents/Applications/surge-cli")
+    [ -x "$SURGE_CLI" ]
+}
+
+# Function to print Surge's select groups and their policies as {group: [policy, ...]} in profile order.
+# Fails when Surge isn't running
+surge_groups() {
+    local members select_groups
+
+    members=$("$SURGE_CLI" --raw dump policy-group-sub-policies 2>/dev/null) || return 1
+    printf '%s' "$members" | jq -e '.map' > /dev/null 2>&1 || return 1
+
+    # Only select groups can be switched; read their names from the effective profile
+    select_groups=$("$SURGE_CLI" dump profile effective 2>/dev/null \
+        | awk '/^\[/ { s = ($0 == "[Proxy Group]") }
+               s && /=[[:space:]]*select([[:space:]]*,|[[:space:]]*$)/ { sub(/[[:space:]]*=.*/, ""); gsub(/^"|"$/, ""); print }' \
+        | jq -R . | jq -sc .)
+
+    printf '%s' "$members" | jq -c --argjson select "$select_groups" \
+        '.map as $map | reduce $select[] as $g ({}; if $map[$g] then . + {($g): ($map[$g] | map(.name))} else . end)'
+}
+
+# Function to choose the Surge policies an account uses and save them as <name>.surge.
+# Quiet when Surge isn't installed
+setup_surge() {
+    local name="$1"
+    local groups current group policy answer index pick
+    local picks="{}"
+    local names=()
+
+    find_surge || return 0
+    if ! groups=$(surge_groups) || [ "$groups" = "{}" ]; then
+        echo -e "${YELLOW}Note: Surge is not running, skipped its setup; run '$SCRIPT_NAME surge ${name}' later${NC}"
+        return 0
+    fi
+    current=$("$SURGE_CLI" --raw environment 2>/dev/null | jq -c '.environment.ProxyGroupSelection // {}') || current="{}"
+
+    echo -e "${BLUE}Surge setup for '${name}'${NC} (select groups, current policy in brackets):"
+    while IFS= read -r group; do
+        names+=("$group")
+        echo "  ${#names[@]}) ${group} [$(printf '%s' "$current" | jq -r --arg g "$group" '.[$g] // "-"')]"
+    done < <(printf '%s' "$groups" | jq -r 'keys_unsorted[]')
+
+    read -r -p "Groups to set for '${name}' (numbers separated by spaces, Enter to skip): " answer
+    for index in $answer; do
+        if ! [[ "$index" =~ ^[0-9]+$ ]] || [ "$index" -lt 1 ] || [ "$index" -gt ${#names[@]} ]; then
+            echo -e "${YELLOW}Skipped '${index}': not a group number${NC}"
+            continue
+        fi
+
+        group="${names[$((index - 1))]}"
+        local policies=()
+        while IFS= read -r policy; do
+            policies+=("$policy")
+            echo "    ${#policies[@]}) ${policy}"
+        done < <(printf '%s' "$groups" | jq -r --arg g "$group" '.[$g][]')
+
+        read -r -p "  Policy for ${group}: " pick
+        if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le ${#policies[@]} ]; then
+            picks=$(printf '%s' "$picks" | jq -c --arg g "$group" --arg p "${policies[$((pick - 1))]}" '. + {($g): $p}')
+        else
+            echo -e "${YELLOW}Skipped ${group}${NC}"
+        fi
+    done
+
+    if [ "$picks" != "{}" ]; then
+        printf '%s\n' "$picks" > "$ACCOUNTS_DIR/${name}.surge"
+        echo -e "${GREEN}Saved Surge policies for '${name}'${NC}"
+    fi
+}
+
+# Function to switch Surge to an account's saved policies; quiet when Surge isn't installed
+apply_surge() {
+    local name="$1"
+    local surge_file="$ACCOUNTS_DIR/${name}.surge"
+    local groups valid entry
+    local args=()
+
+    if [ ! -f "$surge_file" ] || ! find_surge; then
+        return 0
+    fi
+    if ! groups=$(surge_groups); then
+        echo -e "${YELLOW}Warning: Surge is not running, Surge policies of '${name}' not applied${NC}"
+        return 0
+    fi
+
+    # Surge only accepts a policy that is a member of the group
+    while IFS=$'\t' read -r valid entry; do
+        if [ "$valid" = "true" ]; then
+            args+=("ProxyGroupSelection.${entry}")
+        else
+            echo -e "${YELLOW}Warning: Surge group '${entry%%=*}' has no policy '${entry#*=}', skipped${NC}"
+        fi
+    done < <(jq -r --argjson groups "$groups" \
+        'to_entries[] | .key as $g | .value as $p | "\(($groups[$g] // []) | any(. == $p))\t\($g)=\($p)"' "$surge_file")
+
+    if [ ${#args[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    if "$SURGE_CLI" --raw set "${args[@]}" 2>/dev/null | jq -e '.result == "success"' > /dev/null 2>&1; then
+        local switched=$(printf '%s, ' "${args[@]#ProxyGroupSelection.}")
+        echo -e "${GREEN}Switched Surge: ${switched%, }${NC}"
+    else
+        echo -e "${YELLOW}Warning: surge-cli set failed, Surge policies not switched${NC}"
+    fi
+}
+
+# Function to print the active account name (empty if none)
+active_account() {
+    if [ -f "$ACTIVE_FILE" ]; then
+        local name=$(cat "$ACTIVE_FILE")
+        if [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
+            echo "$name"
+        fi
+    fi
+}
+
+# Function to back up the active account before switching away from it.
+# Refuses when no account is active: the current state and history belong to nobody and would be lost
+backup_active() {
+    local active=$(active_account)
+
+    if [ -z "$active" ]; then
+        echo -e "${RED}Error: The current Claude account is not saved yet${NC}"
+        echo "Run '$SCRIPT_NAME save <name>' first"
+        return 1
+    fi
+
+    save_account "$active"
+}
+
+# Function to describe the current account
+current_email() {
+    local email=$(jq -r '.oauthAccount.emailAddress // empty' "$CLAUDE_JSON")
+    echo "${email:-not logged in}"
+}
+
+# Function to list saved accounts
+list_accounts() {
+    check_ready
+    echo -e "${BLUE}Saved accounts${NC} (${CONFIG_DIR}):"
+
+    local active=$(active_account)
+    local found=0
+    for file in "$ACCOUNTS_DIR"/*.json; do
+        if [ -f "$file" ]; then
+            found=1
+            local name=$(basename "$file" .json)
+            local email=$(jq -r '.oauthAccount.emailAddress // "not logged in"' "$file")
+            local surge=""
+            if [ -f "$ACCOUNTS_DIR/${name}.surge" ]; then
+                surge=" [Surge: $(jq -r 'to_entries | map("\(.key)=\(.value)") | join(", ")' "$ACCOUNTS_DIR/${name}.surge")]"
+            fi
+            if [ "$name" = "$active" ]; then
+                echo -e "  ${GREEN}* ${name}${NC} ${email}${surge} (active)"
+            else
+                echo -e "  ${YELLOW}  ${name}${NC} ${email}${surge}"
+            fi
+        fi
+    done
+
+    if [ $found -eq 0 ]; then
+        echo "No accounts saved. Save the current one with: $SCRIPT_NAME save <name>"
+    fi
+}
+
+# Function to show the current account
+show_current() {
+    check_ready
+    local active=$(active_account)
+    echo -e "Account:    $(current_email)"
+    echo -e "Saved as:   ${active:-(not saved)}"
+    echo -e "Config dir: ${CONFIG_DIR}"
+}
+
+# Function to save the current account as <name>
+save_command() {
+    local name="$1"
+    check_name "$name"
+    check_ready
+    ask_password
+
+    save_account "$name"
+    echo "$name" > "$ACTIVE_FILE"
+    echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
+
+    if [ ! -f "$ACCOUNTS_DIR/${name}.surge" ]; then
+        setup_surge "$name"
+        apply_surge "$name"
+    fi
+}
+
+# Function to switch to a saved account
+use_command() {
+    local name="$1"
+    check_name "$name"
+    check_ready
+
+    if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
+        echo -e "${RED}Error: Account '${name}' not found${NC}"
+        list_accounts
+        return 1
+    fi
+
+    local active=$(active_account)
+    if [ "$active" = "$name" ]; then
+        echo -e "${YELLOW}'${name}' is already active${NC}"
+        return 0
+    fi
+
+    ask_password
+    confirm_not_running
+    note_device_keys
+    backup_active
+    load_account "$name"
+    stash_paths "$active"
+    unstash_paths "$name"
+    echo "$name" > "$ACTIVE_FILE"
+    echo -e "${GREEN}Switched to Claude account: ${name} ($(current_email))${NC}"
+    apply_surge "$name"
+}
+
+# Function to start a new account like a fresh install: logged out, new IDs, no history
+new_command() {
+    local name="$1"
+    check_name "$name"
+    check_ready
+
+    if [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
+        echo -e "${RED}Error: Account '${name}' already exists${NC}"
+        return 1
+    fi
+
+    local active=$(active_account)
+    ask_password
+    confirm_not_running
+    note_device_keys
+    backup_active
+
+    if ! delete_credentials || ! reset_account_state; then
+        echo -e "${RED}Error: Failed to start a new account${NC}"
+        return 1
+    fi
+    stash_paths "$active"
+    save_account "$name"
+    echo "$name" > "$ACTIVE_FILE"
+
+    echo -e "${GREEN}Started new Claude account: ${name}${NC}"
+
+    # Before the login, so it already goes out through the account's own exit
+    setup_surge "$name"
+    apply_surge "$name"
+    echo "Run 'claude /login' to sign in; it is saved to '${name}' when you switch away"
+}
+
+# Function to (re)choose the Surge policies of an account; applied right away when it is active
+surge_command() {
+    local name="$1"
+    check_name "$name"
+    check_ready
+
+    if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
+        echo -e "${RED}Error: Account '${name}' not found${NC}"
+        return 1
+    fi
+    if ! find_surge; then
+        echo -e "${RED}Error: Surge is not installed${NC}"
+        return 1
+    fi
+
+    setup_surge "$name"
+    if [ "$(active_account)" = "$name" ]; then
+        apply_surge "$name"
+    fi
+}
+
+# Function to delete a saved account
+delete_command() {
+    local name="$1"
+    check_name "$name"
+    check_ready
+
+    if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
+        echo -e "${RED}Error: Account '${name}' not found${NC}"
+        return 1
+    fi
+
+    if [ "$(active_account)" = "$name" ]; then
+        echo -e "${YELLOW}Warning: '${name}' is currently active; its login and history stay in place but are no longer saved${NC}"
+    else
+        echo -e "${YELLOW}Warning: this deletes the saved login and history of '${name}'${NC}"
+    fi
+    read -p "Delete anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        return 1
+    fi
+
+    if [ "$(active_account)" = "$name" ]; then
+        rm -f "$ACTIVE_FILE"
+    fi
+    rm -f "$ACCOUNTS_DIR/${name}.json"
+    delete_backup "$name" credentials
+    rm -f "$ACCOUNTS_DIR/${name}.surge"
+    rm -rf "${ACCOUNTS_DIR:?}/${name:?}"
+    echo -e "${GREEN}Deleted account: ${name}${NC}"
+}
+
+# Main function
+main() {
+    case "${1:-}" in
+        ls)
+            list_accounts
+            ;;
+        current)
+            show_current
+            ;;
+        save)
+            save_command "$2"
+            ;;
+        use)
+            use_command "$2"
+            ;;
+        new)
+            new_command "$2"
+            ;;
+        surge)
+            surge_command "$2"
+            ;;
+        rm)
+            delete_command "$2"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        --version|-v)
+            version
+            ;;
+        "")
+            usage
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown command '${1}'${NC}"
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

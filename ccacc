@@ -97,6 +97,8 @@ Commands:
   timezone [name]       Print the saved TZ only (defaults to the active account)
   timezone <name> <ZONE>
                         Set the account timezone without accessing credentials
+  configure-shell [name]
+                        Install the dynamic Claude shell hook using the saved TZ
   use <name>            Back up the active account, then switch to <name>
   new <name> [--alias <alias-name>] [--timezone <ZONE>]
                         Back up the active account, then start <name> like a fresh install
@@ -190,21 +192,23 @@ probe_alias() {
         \builtin printf "\n%s\n" "$2"
         if \builtin test -n "${ZSH_VERSION:-}"; then
             if (( ${+aliases[$1]} )); then
-                \command jq -cn --arg value "${aliases[$1]}" "{format: \"raw\", value: \$value}"
+                \builtin printf "%s" "${aliases[$1]}" | \command jq -Rsc --arg directory "${ZDOTDIR:-$HOME}" "{format: \"raw\", value: ., startupDirectory: \$directory}"
             else
-                \command jq -cn "{missing: true}"
+                \command jq -cn --arg directory "${ZDOTDIR:-$HOME}" "{missing: true, startupDirectory: \$directory}"
             fi
         elif value=$(\builtin alias -- "$1" 2>/dev/null); then
-            \command jq -cn --arg value "$value" "{format: \"bash\", value: \$value}"
+            \builtin printf "%s" "$value" | \command jq -Rsc --arg directory "$HOME" "{format: \"bash\", value: ., startupDirectory: \$directory}"
         else
-            \command jq -cn "{missing: true}"
+            \command jq -cn --arg directory "$HOME" "{missing: true, startupDirectory: \$directory}"
         fi
         \builtin printf "%s\n" "$2"
     ' ccacc "$alias_name" "$marker" 2>/dev/null) || return 1
     printf '%s\n' "$output" | jq -Rsc --arg marker "$marker" --arg name "$alias_name" '
         split("\n" + $marker + "\n")
         | if length == 3 then .[1] | fromjson else error("Missing alias response") end
-        | if .missing == true then {missing: true}
+        | .startupDirectory as $directory
+        | if ($directory | type) != "string" then error("Invalid startup directory")
+          elif .missing == true then {missing: true}
           elif .format == "raw" and (.value | type) == "string" then {definition: .value}
           elif .format == "bash" then
             .value | ltrimstr("alias ") | ltrimstr($name + "=")
@@ -212,6 +216,7 @@ probe_alias() {
                 {definition: (.[1:-1] | split("\u0027\\\u0027\u0027") | join("\u0027"))}
               else error("Invalid alias response") end
           else error("Invalid alias response") end
+        | . + {startupDirectory: $directory}
     ' 2>/dev/null
 }
 
@@ -219,7 +224,7 @@ probe_alias() {
 # expansions and arbitrary later command arguments cannot supply a TZ. Parsing
 # stays in jq; even quotes and command substitutions in the definition are data.
 alias_timezone() {
-    jq -nr --arg definition "$1" '
+    printf '%s' "$1" | jq -Rsr '
         def word: "^(?<word>(?:[^ \\t\\r\\n;|&<>()\"\u0027\\\\]|\\\\[^\\n]|\u0027[^\u0027]*\u0027|\"[^\"]*\")+)(?<rest>[\\s\\S]*)$";
         def assignments($s; $tz):
             ($s | sub("^[ \\t]+"; "")) as $s
@@ -228,7 +233,7 @@ alias_timezone() {
               elif ($next.word | test("^[A-Za-z_][A-Za-z0-9_]*=")) then
                 assignments($next.rest; if ($next.word | startswith("TZ=")) then $next.word else $tz end)
               else $tz end;
-        ($definition | sub("^[ \\t]*(?:_op_agent[ \\t]+)?env[ \\t]+"; ""))
+        (sub("^[ \\t]*(?:_op_agent[ \\t]+)?env[ \\t]+"; ""))
         | assignments(.; "")
         | try capture("^TZ=(?:\u0027(?<single>[A-Za-z0-9_+/-]+)\u0027|\"(?<double>[A-Za-z0-9_+/-]+)\"|(?<bare>[A-Za-z0-9_+/-]+))$")
           | .single // .double // .bare // empty
@@ -263,8 +268,8 @@ write_alias_backup() {
     fi
     mkdir -p -m 700 "$ACCOUNTS_DIR" "$ALIASES_DIR"
     temp_alias=$(mktemp "$ALIASES_DIR/.alias.XXXXXX") || return 1
-    if ! jq -n --arg name "$alias_name" --argjson captured "$captured" --arg zone "$zone" \
-        '{aliasName: $name, definition: $captured.definition, env: (if $zone == "" then {} else {TZ: $zone} end)}' \
+    if ! printf '%s' "$captured" | jq --arg name "$alias_name" --arg zone "$zone" \
+        '{aliasName: $name, definition: .definition, env: (if $zone == "" then {} else {TZ: $zone} end)}' \
         > "$temp_alias" || ! chmod 600 "$temp_alias" \
         || ! mv -f "$temp_alias" "$ALIASES_DIR/${name}.json"; then
         rm -f "$temp_alias"
@@ -301,6 +306,57 @@ set_timezone() {
     if ! printf '%s\n' "$zone" > "$temp_timezone" || ! chmod 600 "$temp_timezone" \
         || ! mv -f "$temp_timezone" "$TIMEZONES_DIR/$name"; then
         rm -f "$temp_timezone"
+        return 1
+    fi
+}
+
+# Locate the companion beside the deployed core, independently of credentials.
+load_shell_companion() {
+    local source_path="${BASH_SOURCE[0]}" directory library shell="${SHELL:-/bin/bash}"
+    case "$shell" in
+        */bash|*/zsh|bash|zsh) ;;
+        *) echo "Error: Shell configuration supports only Bash and Zsh" >&2; return 1 ;;
+    esac
+    command -v "$shell" >/dev/null 2>&1 || {
+        echo "Error: Shell executable is unavailable: $shell" >&2; return 1;
+    }
+    command -v jq >/dev/null 2>&1 || { echo "Error: jq is required for shell configuration" >&2; return 1; }
+    directory=$(cd -- "$(dirname -- "$source_path")" && pwd -P) || return 1
+    CCACC_ABSOLUTE_SCRIPT="$directory/$(basename -- "$source_path")"
+    library="$directory/ccacc_shell.sh"
+    [ -f "$library" ] && [ -r "$library" ] || {
+        echo "Error: Install the readable ccacc_shell.sh companion beside $CCACC_ABSOLUTE_SCRIPT" >&2
+        return 1
+    }
+    # The library defines functions only; sourcing it never launches Claude.
+    . "$library" || { echo "Error: Could not load shell companion: $library" >&2; return 1; }
+    declare -F ccacc_install_shell_hook >/dev/null && declare -F ccacc_preflight_shell_hook >/dev/null || {
+        echo "Error: Invalid ccacc_shell.sh companion: installer or preflight API is missing" >&2; return 1;
+    }
+}
+
+# Complete library validation without writes, before passwords or account moves.
+configure_shell_preflight() {
+    local name="$1" zone="$2" SHELL="${SHELL:-/bin/bash}"
+    load_shell_companion || return 1
+    if ! ccacc_preflight_shell_hook "$CCACC_ABSOLUTE_SCRIPT" "$name" "$zone"; then
+        echo "Error: Shell configuration preflight failed; account unchanged" >&2
+        return 1
+    fi
+}
+
+# Metadata and startup files only: deliberately bypass check_ready and passwords.
+configure_shell_command() {
+    local name="${1:-}" zone SHELL="${SHELL:-/bin/bash}"
+    if [ -z "$name" ]; then name=$(active_account); fi
+    check_name "$name" >&2 || return 1
+    zone=$(timezone_command "$name") || {
+        echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME timezone $name <ZONE>' first" >&2
+        return 1
+    }
+    load_shell_companion || return 1
+    if ! ccacc_install_shell_hook "$CCACC_ABSOLUTE_SCRIPT" "$name" "$zone"; then
+        echo "Error: Shell hook installation failed; run '$SCRIPT_NAME configure-shell $name' after fixing the error" >&2
         return 1
     fi
 }
@@ -974,13 +1030,15 @@ show_current() {
 save_command() {
     local name="${1:-}"
     prepare_account_metadata "$@" || return 1
+    configure_shell_preflight "$name" "$PREPARED_TIMEZONE" || return 1
     check_ready
     ask_password
     save_prepared_metadata "$name" || return 1
 
-    save_account "$name"
+    save_account "$name" || return 1
     echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
+    configure_shell_command "$name" || return 1
 
     if [ ! -f "$ACCOUNTS_DIR/${name}.surge" ]; then
         setup_surge "$name"
@@ -990,20 +1048,26 @@ save_command() {
 
 # Function to switch to a saved account
 use_command() {
-    local name="$1"
-    check_name "$name"
-    check_ready
-
+    local name="$1" zone
+    check_name "$name" || return 1
     if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
         echo -e "${RED}Error: Account '${name}' not found${NC}"
         list_accounts
         return 1
     fi
 
+    zone=$(timezone_command "$name") || {
+        echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME timezone $name <ZONE>' first" >&2
+        return 1
+    }
+    configure_shell_preflight "$name" "$zone" || return 1
+    check_ready
+
     local active=$(active_account)
     if [ "$active" = "$name" ]; then
         echo -e "${YELLOW}'${name}' is already active${NC}"
-        return 0
+        configure_shell_command "$name"
+        return $?
     fi
 
     ask_password
@@ -1015,6 +1079,7 @@ use_command() {
     unstash_paths "$name"
     echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Switched to Claude account: ${name} ($(current_email))${NC}"
+    configure_shell_command "$name" || return 1
     apply_surge "$name"
 }
 
@@ -1028,6 +1093,7 @@ new_command() {
         return 1
     fi
     prepare_account_metadata "$@" || return 1
+    configure_shell_preflight "$name" "$PREPARED_TIMEZONE" || return 1
     check_ready
 
     local active=$(active_account)
@@ -1042,10 +1108,11 @@ new_command() {
         return 1
     fi
     stash_paths "$active"
-    save_account "$name"
+    save_account "$name" || return 1
     echo "$name" > "$ACTIVE_FILE"
 
     echo -e "${GREEN}Started new Claude account: ${name}${NC}"
+    configure_shell_command "$name" || return 1
 
     # Before the login, so it already goes out through the account's own exit
     setup_surge "$name"
@@ -1132,6 +1199,10 @@ main() {
             else
                 timezone_command "${2:-}"
             fi
+            ;;
+        configure-shell)
+            [ "$#" -le 2 ] || { echo "Error: configure-shell accepts at most one account" >&2; return 1; }
+            configure_shell_command "${2:-}"
             ;;
         use)
             use_command "$2"

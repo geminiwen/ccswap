@@ -40,6 +40,8 @@ keychain_write() {
     printf '%s' "$3" > "$STATE"
 }
 ask_password() { :; }
+configure_shell_preflight() { :; }
+configure_shell_command() { :; }
 stop_claude() { :; }
 note_device_keys() { :; }
 setup_surge() { :; }
@@ -152,6 +154,8 @@ save_account original
 printf 'original\n' > "$ACTIVE_FILE"
 printf '%s' "$(cat "$FIXTURE/target.json")" | encrypt_to "$ACCOUNTS_DIR/other.credentials.enc"
 printf '{"userID":"fixture-other-id"}' > "$ACCOUNTS_DIR/other.json"
+set_timezone other UTC
+set_timezone original UTC
 use_command other
 jq '.mcpOAuth.extra = {accessToken:"fixture-new-shared"}' "$STATE" > "$FIXTURE/refreshed.json"
 cp "$FIXTURE/refreshed.json" "$STATE"

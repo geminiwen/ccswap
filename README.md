@@ -11,7 +11,19 @@ Built with ❤️ by JUAN MACKIE
 
 `ccacc` switches official Claude Code accounts separately from `ccswap` profiles.
 Run it with `bash ./ccacc` from this checkout, or install it as an executable on
-your PATH. The account commands require `jq` and `openssl`.
+your PATH. Deploy **both `ccacc` and `ccacc_shell.sh` in the same directory**;
+the companion is sourced by the core and does not need executable permission.
+For example:
+
+```bash
+mkdir -p "$HOME/bin"
+install -m 700 ccacc "$HOME/bin/ccacc"
+install -m 600 ccacc_shell.sh "$HOME/bin/ccacc_shell.sh"
+```
+
+The account commands require `jq` and `openssl`. The shell hook supports Bash
+and Zsh and requires a regular absolute installation path without symlink
+components. It also works when `ccacc` is not executable: run `bash /path/to/ccacc`.
 
 ```bash
 ccacc save personal                         # Also back up the personal shell alias, if present
@@ -22,6 +34,8 @@ ccacc alias work work-claude                # Back up the alias without saving c
 ccacc timezone work                        # Print the saved timezone
 ccacc timezone                             # Default to the active saved account
 ccacc timezone work Australia/Sydney        # Set timezone metadata only
+ccacc configure-shell work                  # Install/repair the hook using saved TZ
+ccacc configure-shell                       # Default to the active saved account
 ```
 
 `save <name>` and `new <name>` accept `--alias <alias-name>` and `--timezone <ZONE>`
@@ -30,6 +44,10 @@ valid saved timezone, a literal TZ from the selected shell alias, then a prompt.
 There is no default timezone. Invalid input is prompted again; an empty choice
 or EOF fails before passwords, credentials, process shutdown or active-account
 changes. Invalid, missing, duplicate and unknown flags fail before any writes.
+Save/new/use also validate the supported shell, adjacent companion, startup paths,
+managed blocks and original Claude alias without writes before accessing passwords,
+stopping processes or changing credentials. `use` requires a valid saved timezone;
+set one with `ccacc timezone <account> <ZONE>` before switching an older account.
 
 Resolved timezones are stored independently as one zone per private
 `~/.claude/accounts/.timezones/<account>` file (mode `600`, directory `700`).
@@ -41,7 +59,8 @@ Alias backup queries the alias builtin in a new login/interactive Bash or Zsh
 using `$SHELL` (Bash when unset). The shell's normal startup files run during
 that query; the captured alias body is never evaluated or executed. Shell
 startup/logout output is ignored. Missing aliases and failed probes leave any
-existing alias backup unchanged. Unsupported shells are skipped with a warning.
+existing alias backup unchanged. `ccacc alias` skips unsupported shells with a warning;
+save/new/use fail if their required shell configuration cannot be prepared.
 An absent alias creates no alias-definition backup; save/new can still proceed
 with a saved timezone, `--timezone`, or a valid prompted choice.
 
@@ -73,20 +92,49 @@ the full alias definition remains in the private backup.
 to a valid TZ in the captured alias backup. It never starts a shell, asks for a master
 password, accesses credentials, stops processes, or changes account state. It
 prints one validated timezone and a newline on success. Missing or invalid TZ
-returns nonzero with no stdout. Applying that timezone belongs to your shell
-integration. `ccacc rm <account>` also removes that account's alias backup and
+returns nonzero with no stdout. `ccacc rm <account>` also removes that account's alias backup and
 independent timezone metadata; metadata alone does not make an account appear
 in `ls` or `current`.
+
+After a successful `save`, `new`, or `use` (including an already-active account),
+ccacc installs the dynamic Claude shell hook. The workflow is: read the existing
+alias, store the selected account timezone, install the hook, then **source the
+printed hook path once in your current shell**. A child `ccacc` process cannot
+update its calling shell. New interactive terminals load the hook automatically.
+`configure-shell [account]` repeats installation without passwords, credential
+access, process shutdown, or account switching; it validates the saved TZ first.
+Missing companions and installation failures return nonzero with an error, so an
+account operation may have completed even if its subsequent hook installation failed.
+
+The hook reads `ccacc timezone` on every Claude launch, so switching the active
+account updates TZ in an already-sourced shell. It also sets `BROWSER=false`.
+It preserves literal command arguments, other leading assignments and supported
+`env` / `_op_agent env` wrappers from the original `claude` alias. The first original
+alias is stored privately in `~/.ccacc-shell/original-alias.json`; later installs
+reuse it instead of backing up the generated alias. Arbitrary wrappers and dynamic
+shell expressions fail explicitly rather than being evaluated. Captured alias
+bodies stay on stdin between parsing tools, out of external process arguments.
+
+The generated hook and original-alias record are private (directory `700`, files
+`600`). Installation adds one managed source block at the end of Bash's `.bashrc`
+and selected login file, or Zsh's `.zshrc` and `.zlogin`. Zsh's actual initialized
+`${ZDOTDIR:-$HOME}` is used even when `.zshenv` sets `ZDOTDIR` without exporting it.
+Repeat installation preserves unchanged startup-file bytes and mtimes. Sourcing
+the hook defines the launcher without starting Claude.
 
 Run the fixture-only regressions from the repository root:
 
 ```bash
 uv run tests/test_ccacc_alias_timezone.py
 uv run tests/test_mcp_preservation.py
+uv run tests/test_ccacc_shell.py
+uv run tests/test_ccacc_shell_integration.py
 ```
 
-These use isolated HOME directories, fake shell startup/alias definitions, and
+These use isolated HOME directories, fixture shell startup/alias definitions, and
 mocked process control, Keychain and Surge. They never switch a real account.
+The integration suite uses the real core probe and real Bash/Zsh startup files,
+with fake `_op_agent`, Claude and credential operations.
 
 ## Windows Installation
 

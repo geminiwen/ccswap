@@ -1,0 +1,270 @@
+"""Fixture-only CLI and probe checks; run with uv run tests/test_ccacc_alias_timezone.py."""
+
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = (ROOT / "ccacc").read_text().rsplit('main "$@"', 1)[0]
+
+
+class AliasTimezoneTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT / ".orca", prefix="alias-timezone-")
+        self.addCleanup(self.temp.cleanup)
+        self.fixture = Path(self.temp.name)
+        self.home = self.fixture / "home"
+        self.accounts = self.home / ".claude/accounts"
+        self.accounts.mkdir(parents=True)
+        self.bin = self.fixture / "bin"
+        self.bin.mkdir()
+        self.log = self.fixture / "forbidden.log"
+        self.probes = self.fixture / "probes.log"
+        # Fail closed if any metadata operation reaches process control, Keychain,
+        # Surge or encryption. No real account/config directory is read or changed.
+        for name in ("ps", "kill", "security", "osascript", "surge-cli", "openssl"):
+            self.executable(name, '#!/bin/bash\nprintf "%s\\n" "$0" >> "$FORBIDDEN"\nexit 98\n')
+        for shell in ("bash", "zsh"):
+            # Execute the actual probe code with startup disabled and fixture aliases.
+            # The stub itself never launches an interactive/login shell.
+            self.executable(shell, f'''#!/bin/bash
+printf '%s\\n' "$*" >> "$PROBES"
+[ "$1" = -ilc ] || exit 97
+probe_code="$2"
+shift 2
+exec /bin/{shell} {'--noprofile --norc' if shell == 'bash' else '-f'} -c '. "$ALIAS_FIXTURE"; '"$probe_code" "$@"
+''')
+        self.aliases = self.fixture / "aliases.sh"
+        self.aliases.write_text("printf 'startup noise\\n'\ntrap \"printf 'logout noise\\n'\" EXIT\n")
+        self.env = dict(os.environ, HOME=str(self.home), TMPDIR=str(self.fixture),
+                        SHELL=str(self.bin / "bash"), PATH=str(self.bin) + ":" + os.environ["PATH"],
+                        ALIAS_FIXTURE=str(self.aliases), FORBIDDEN=str(self.log),
+                        PROBES=str(self.probes), CLAUDE_CONFIG_DIR="fixture-ignored")
+        # Avoid inherited startup hooks while invoking bash -c in harness tests.
+        self.env.pop("BASH_ENV", None)
+        self.env.pop("ENV", None)
+
+    def executable(self, name, source):
+        path = self.bin / name
+        path.write_text(source)
+        path.chmod(0o700)
+
+    def define(self, name, definition):
+        with self.aliases.open("a") as handle:
+            handle.write("builtin alias " + shlex.quote(name + "=" + definition) + "\n")
+
+    def run_cli(self, *args, success=True, stdin=""):
+        result = subprocess.run(["/bin/bash", str(ROOT / "ccacc"), *args],
+                                env=self.env, text=True, input=stdin, capture_output=True)
+        self.assertEqual(result.returncode == 0, success, (args, result.stdout, result.stderr))
+        self.assertFalse(self.log.exists(), self.log.read_text() if self.log.exists() else "")
+        return result
+
+    def run_harness(self, body, stdin="", success=True):
+        mocks = '''
+ask_password() { MASTER_PASSWORD=fixture-only; }
+save_account() { printf '{"userID":"fixture-id"}' > "$ACCOUNTS_DIR/$1.json"; }
+setup_surge() { :; }
+apply_surge() { :; }
+kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
+'''
+        result = subprocess.run(["/bin/bash", "-c", SOURCE + mocks + body], env=self.env,
+                                input=stdin, text=True, capture_output=True)
+        self.assertEqual(result.returncode == 0, success, (result.stdout, result.stderr))
+        self.assertFalse(self.log.exists())
+        return result
+
+    def metadata(self, name="example"):
+        return json.loads((self.accounts / (name + ".alias")).read_text())
+
+    def test_bash_and_zsh_capture_exact_definition_without_execution(self):
+        definition = ('TZ="Asia/Tokyo" CLAUDE_CONFIG_DIR="$HOME/fixture dir" '
+                      'claude "don\'t change" "$(touch \'$HOME/executed\')"; '
+                      'touch "$HOME/executed"\n')
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                self.env["SHELL"] = str(self.bin / shell)
+                self.define("quoted-alias", definition)
+                self.run_cli("alias", "example", "quoted-alias")
+                self.assertEqual(self.metadata(), {"aliasName": "quoted-alias", "definition": definition,
+                                                  "env": {"TZ": "Asia/Tokyo"}})
+                self.assertEqual((self.accounts / "example.alias").stat().st_mode & 0o777, 0o600)
+                self.assertFalse((self.home / "executed").exists())
+
+    def test_missing_alias_does_not_create_or_delete_backup(self):
+        for shell in ("bash", "zsh"):
+            self.env["SHELL"] = str(self.bin / shell)
+            self.run_cli("alias", "missing")
+            self.assertFalse((self.accounts / "missing.alias").exists())
+            backup = self.accounts / "example.alias"
+            backup.write_text("fixture-unchanged")
+            backup.chmod(0o640)
+            self.run_cli("alias", "example", "missing")
+            self.assertEqual(backup.read_text(), "fixture-unchanged")
+            self.assertEqual(backup.stat().st_mode & 0o777, 0o640)
+
+    def test_timezone_literal_prefixes(self):
+        cases = {
+            "TZ=UTC": "UTC",
+            "TZ=Asia/Tokyo claude": "Asia/Tokyo",
+            "TZ='Australia/Sydney' claude": "Australia/Sydney",
+            'env TZ="Etc/GMT+8" claude': "Etc/GMT+8",
+            '_op_agent env BROWSER=false TZ=Australia/Sydney CLAUDE_CONFIG_DIR="$HOME/fixture" claude': "Australia/Sydney",
+            '_op_agent env BROWSER=false TZ=Asia/Tokyo claude': "Asia/Tokyo",
+            'FOO="$HOME/a b" TZ=UTC claude': "UTC",
+            "TZ=Asia/Tokyo TZ=UTC claude": "UTC",
+            "claude": None,
+            "claude 'TZ=Asia/Tokyo'": None,
+            "echo TZ=Asia/Tokyo; claude": None,
+            "TZ=Invalid/Zone claude": None,
+            "TZ='../UTC' claude": None,
+            'TZ="$ZONE" claude': None,
+            'TZ="$(touch fixture-executed)" claude': None,
+            'TZ=`touch fixture-executed` claude': None,
+            "TZ=Asia/Tokyo TZ=$ZONE claude": None,
+            "TZ=Asia/Tokyo TZ=$(touch fixture-executed) claude": None,
+        }
+        for definition, zone in cases.items():
+            with self.subTest(definition=definition):
+                self.define("example", definition)
+                self.run_cli("alias", "example")
+                self.assertEqual(self.metadata()["env"], {"TZ": zone} if zone else {})
+                result = self.run_cli("timezone", "example", success=zone is not None)
+                self.assertEqual(result.stdout, zone + "\n" if zone else "")
+                self.assertFalse((ROOT / "fixture-executed").exists())
+
+    def test_timezone_active_lookup_and_no_config_or_password_needed(self):
+        self.define("example", "TZ=UTC claude")
+        self.run_cli("alias", "example")
+        self.run_cli("timezone", success=False)
+        (self.accounts / "example.json").write_text("{}")
+        (self.accounts / ".active").write_text("example\n")
+        self.assertEqual(self.run_cli("timezone").stdout, "UTC\n")
+        self.probes.unlink()
+        self.assertEqual(self.run_cli("timezone", "example").stdout, "UTC\n")
+        self.assertFalse(self.probes.exists())
+        (self.accounts / ".active").write_text("../outside\n")
+        self.assertEqual(self.run_cli("timezone", success=False).stdout, "")
+
+    def test_timezone_rejects_corrupt_or_invalid_metadata_without_stdout(self):
+        for content in ('{bad', 'null', '[]', '{"env":{"TZ":23}}',
+                        '{"env":{"TZ":"UTC\\n"}}', '{"env":{"TZ":"Invalid/Zone"}}',
+                        '{"env":{"TZ":"../UTC"}}', '{"env":{"TZ":"$(touch nope)"}}',
+                        '{"env":{"TZ":"UTC"}} {"env":{"TZ":"UTC"}}'):
+            (self.accounts / "example.alias").write_text(content)
+            self.assertEqual(self.run_cli("timezone", "example", success=False).stdout, "")
+
+    def test_invalid_names_never_probe_or_write(self):
+        for name in ("../escape", "-flag", "bad/name", "$(touch nope)", "has space", ""):
+            self.run_cli("alias", name, success=False)
+            self.run_cli("alias", "example", name, success=False)
+            self.assertEqual(self.run_cli("timezone", name, success=False).stdout, "")
+        self.assertFalse(self.probes.exists())
+        self.assertEqual(list(self.accounts.iterdir()), [])
+
+    def test_metadata_is_not_an_account_and_dotted_names_remain_valid(self):
+        (self.home / ".claude.json").write_text("{}")
+        self.define("example", "TZ=UTC claude")
+        self.run_cli("alias", "example")
+        self.assertIn("No accounts saved", self.run_cli("ls").stdout)
+        (self.accounts / ".active").write_text("example\n")
+        self.assertIn("(not saved)", self.run_cli("current").stdout)
+        self.run_cli("rm", "example", success=False, stdin="y\n")
+        self.assertTrue((self.accounts / "example.alias").exists())
+        (self.accounts / "example.alias.json").write_text("{}")
+        self.run_cli("alias", "example.alias", "example")
+        (self.accounts / ".active").write_text("example.alias\n")
+        self.assertEqual(self.run_cli("timezone").stdout, "UTC\n")
+        self.assertIn("example.alias", self.run_cli("ls").stdout)
+        self.assertIn("example.alias", self.run_cli("current").stdout)
+
+    def test_removal_cleans_only_target_metadata(self):
+        (self.home / ".claude.json").write_text("{}")
+        for name in ("example", "other"):
+            (self.accounts / (name + ".json")).write_text("{}")
+            (self.accounts / (name + ".alias")).write_text("fixture-metadata")
+            (self.accounts / (name + ".surge")).write_text("{}")
+            (self.accounts / (name + ".credentials.enc")).write_text("fixture-encrypted")
+            (self.accounts / name).mkdir()
+        (self.accounts / ".active").write_text("example\n")
+        self.run_cli("rm", "example", stdin="y\n")
+        self.assertEqual(sorted(path.name for path in self.accounts.iterdir()),
+                         ["other", "other.alias", "other.credentials.enc", "other.json", "other.surge"])
+
+    def test_save_default_explicit_alias_and_argument_compatibility(self):
+        (self.home / ".claude.json").write_text("{}")
+        self.define("example", "TZ=UTC claude")
+        self.define("wrapper", "TZ=Asia/Tokyo claude")
+        self.run_harness('main save example')
+        self.assertEqual(self.metadata()["env"], {"TZ": "UTC"})
+        self.run_harness('main save example --alias wrapper')
+        self.assertEqual(self.metadata()["aliasName"], "wrapper")
+        self.assertEqual(self.metadata()["env"], {"TZ": "Asia/Tokyo"})
+        self.run_harness('main save example --alias missing')
+        self.assertEqual(self.metadata()["aliasName"], "wrapper")
+        self.run_harness('main save missing')
+        self.assertFalse((self.accounts / "missing.alias").exists())
+        self.run_harness('main save example --alias', success=False)
+        self.run_harness('main save example --alias ""', success=False)
+        self.run_harness('main save', success=False)
+
+    def test_probe_failure_preserves_backup(self):
+        (self.accounts / "example.alias").write_text("fixture-unchanged")
+        self.executable("bash", "#!/bin/bash\nprintf 'startup only\\n'\nexit 2\n")
+        self.run_cli("alias", "example")
+        self.assertEqual((self.accounts / "example.alias").read_text(), "fixture-unchanged")
+
+    def test_aliases_named_command_and_builtin_are_never_invoked(self):
+        definition = 'touch "$HOME/executed"'
+        for shell in ("bash", "zsh"):
+            self.env["SHELL"] = str(self.bin / shell)
+            self.aliases.write_text("\\builtin alias " + shlex.quote("command=" + definition)
+                                    + "\n\\builtin alias " + shlex.quote("builtin=" + definition) + "\n")
+            for name in ("command", "builtin"):
+                self.run_cli("alias", "example", name)
+                self.assertEqual(self.metadata()["definition"], definition)
+                self.assertFalse((self.home / "executed").exists())
+
+    def test_process_matching_uses_owner_and_executable(self):
+        result = self.run_harness(r'''
+id() { printf '501\n'; }
+ps() { cat <<'PROCESSES'
+101 501 claude
+102 501 /opt/bin/claude
+103 501 /Users/fixture/.local/share/claude/versions/1.2.3
+104 502 /opt/bin/claude
+105 501 /Applications/Claude.app/Contents/MacOS/Claude
+106 501 /opt/bin/other --mention /opt/bin/claude ignored
+107 501 /opt/bin/claude-helper
+PROCESSES
+}
+claude_process_ids
+''')
+        self.assertEqual(result.stdout, "101\n102\n103\n")
+
+    def test_process_shutdown_escalates_with_fake_kill_only(self):
+        result = self.run_harness(r'''
+printf '0' > "$HOME/inspections"
+claude_process_ids() {
+    local n=$(cat "$HOME/inspections")
+    printf '%s' "$((n+1))" > "$HOME/inspections"
+    if [ "$n" -lt 7 ]; then printf 'fixture-pid\n'; fi
+}
+kill() { printf '%s\n' "$*" >> "$HOME/signals"; }
+sleep() { :; }
+stop_claude
+''')
+        self.assertIn("Stopping", result.stdout)
+        self.assertEqual((self.home / "signals").read_text(),
+                         "-TERM fixture-pid\n-KILL fixture-pid\n")
+        self.run_harness('claude_process_ids() { return 1; }; stop_claude', success=False)
+
+
+if __name__ == "__main__":
+    (ROOT / ".orca").mkdir(exist_ok=True)
+    unittest.main()

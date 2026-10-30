@@ -87,7 +87,11 @@ Usage: $SCRIPT_NAME [COMMAND] [OPTIONS]
 Commands:
   ls                    List saved accounts
   current               Show the current Claude account
-  save <name>           Back up the current account as <name> and make it active
+  save <name> [--alias <alias-name>]
+                        Back up the current account and its same-named shell alias
+  alias <name> [alias-name]
+                        Back up an existing shell alias (optional, never executed)
+  timezone [name]       Print the saved TZ only (defaults to the active account)
   use <name>            Back up the active account, then switch to <name>
   new <name>            Back up the active account, then start <name> like a fresh install
                         (logged out, new IDs; run 'claude /login' next)
@@ -155,6 +159,114 @@ check_name() {
         echo -e "${RED}Error: Account name must start with a letter or digit and only contain letters, digits, '.', '_' and '-'${NC}"
         return 1
     fi
+}
+
+check_alias_name() {
+    if [[ ! "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
+        echo "Error: Invalid alias name" >&2
+        return 1
+    fi
+}
+
+# Startup files define aliases in the user's login shell. Only query the alias
+# builtin; never interpolate the name into code, eval its output, or run its body.
+# A framed JSON response separates the result from startup/logout chatter.
+probe_alias() {
+    local alias_name="$1" shell="${SHELL:-/bin/bash}" output marker
+    case "${shell##*/}" in
+        bash|zsh) ;;
+        *) echo "Warning: Alias backup supports bash and zsh; skipped" >&2; return 1 ;;
+    esac
+    marker="ccacc-alias-$RANDOM-$RANDOM-$RANDOM"
+    output=$("$shell" -ilc '
+        \builtin printf "\n%s\n" "$2"
+        if \builtin test -n "${ZSH_VERSION:-}"; then
+            if (( ${+aliases[$1]} )); then
+                \command jq -cn --arg value "${aliases[$1]}" "{format: \"raw\", value: \$value}"
+            else
+                \command jq -cn "{missing: true}"
+            fi
+        elif value=$(\builtin alias -- "$1" 2>/dev/null); then
+            \command jq -cn --arg value "$value" "{format: \"bash\", value: \$value}"
+        else
+            \command jq -cn "{missing: true}"
+        fi
+        \builtin printf "%s\n" "$2"
+    ' ccacc "$alias_name" "$marker" 2>/dev/null) || return 1
+    printf '%s\n' "$output" | jq -Rsc --arg marker "$marker" --arg name "$alias_name" '
+        split("\n" + $marker + "\n")
+        | if length == 3 then .[1] | fromjson else error("Missing alias response") end
+        | if .missing == true then {missing: true}
+          elif .format == "raw" and (.value | type) == "string" then {definition: .value}
+          elif .format == "bash" then
+            .value | ltrimstr("alias ") | ltrimstr($name + "=")
+            | if startswith("\u0027") and endswith("\u0027") then
+                {definition: (.[1:-1] | split("\u0027\\\u0027\u0027") | join("\u0027"))}
+              else error("Invalid alias response") end
+          else error("Invalid alias response") end
+    ' 2>/dev/null
+}
+
+# Read only leading assignments (optionally after env or _op_agent env). Shell punctuation,
+# expansions and arbitrary later command arguments cannot supply a TZ. Parsing
+# stays in jq; even quotes and command substitutions in the definition are data.
+alias_timezone() {
+    jq -nr --arg definition "$1" '
+        def word: "^(?<word>(?:[^ \\t\\r\\n;|&<>()\"\u0027\\\\]|\\\\[^\\n]|\u0027[^\u0027]*\u0027|\"[^\"]*\")+)(?<rest>[\\s\\S]*)$";
+        def assignments($s; $tz):
+            ($s | sub("^[ \\t]+"; "")) as $s
+            | ((try ($s | capture(word)) catch null) // null) as $next
+            | if $next == null then $tz
+              elif ($next.word | test("^[A-Za-z_][A-Za-z0-9_]*=")) then
+                assignments($next.rest; if ($next.word | startswith("TZ=")) then $next.word else $tz end)
+              else $tz end;
+        ($definition | sub("^[ \\t]*(?:_op_agent[ \\t]+)?env[ \\t]+"; ""))
+        | assignments(.; "")
+        | try capture("^TZ=(?:\u0027(?<single>[A-Za-z0-9_+/-]+)\u0027|\"(?<double>[A-Za-z0-9_+/-]+)\"|(?<bare>[A-Za-z0-9_+/-]+))$")
+          | .single // .double // .bare // empty
+    '
+}
+
+valid_timezone() {
+    [[ "$1" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] \
+        && [ -f "/usr/share/zoneinfo/$1" ]
+}
+
+alias_command() {
+    local name="$1" alias_name="${2-$1}" captured definition zone temp_alias
+    check_name "$name" || return 1
+    check_alias_name "$alias_name" || return 1
+    command -v jq >/dev/null || return 1
+    if ! captured=$(probe_alias "$alias_name"); then
+        echo "Warning: Could not query shell alias; backup unchanged" >&2
+        return 0
+    fi
+    [ "$(printf '%s' "$captured" | jq -r '.missing // false')" != true ] || return 0
+    definition=$(printf '%s' "$captured" | jq -r '.definition') || return 1
+    zone=$(alias_timezone "$definition") || return 1
+    if ! valid_timezone "$zone"; then zone=""; fi
+    mkdir -p -m 700 "$ACCOUNTS_DIR"
+    temp_alias=$(mktemp "$ACCOUNTS_DIR/.alias.XXXXXX") || return 1
+    if ! jq -n --arg name "$alias_name" --argjson captured "$captured" --arg zone "$zone" \
+        '{aliasName: $name, definition: $captured.definition, env: (if $zone == "" then {} else {TZ: $zone} end)}' \
+        > "$temp_alias" || ! chmod 600 "$temp_alias" \
+        || ! mv -f "$temp_alias" "$ACCOUNTS_DIR/${name}.alias"; then
+        rm -f "$temp_alias"
+        return 1
+    fi
+}
+
+# Intentionally independent of check_ready, passwords, credentials and shell
+# startup. stdout is a machine-readable API: one validated zone or nothing.
+timezone_command() {
+    local name="$1" zone
+    if [ -z "$name" ]; then name=$(active_account); fi
+    check_name "$name" >/dev/null 2>&1 || return 1
+    zone=$(jq -ser 'select(length == 1) | .[0].env.TZ | select(type == "string")
+        | select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\z"))' \
+        "$ACCOUNTS_DIR/${name}.alias" 2>/dev/null) || return 1
+    valid_timezone "$zone" || return 1
+    printf '%s\n' "$zone"
 }
 
 # Match executable names, not command arguments mentioning Claude paths.
@@ -693,7 +805,7 @@ apply_surge() {
 active_account() {
     if [ -f "$ACTIVE_FILE" ]; then
         local name=$(cat "$ACTIVE_FILE")
-        if [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
+        if check_name "$name" >/dev/null 2>&1 && [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
             echo "$name"
         fi
     fi
@@ -759,12 +871,23 @@ show_current() {
 
 # Function to save the current account as <name>
 save_command() {
-    local name="$1"
-    check_name "$name"
+    local name="${1:-}"
+    local alias_name="${1:-}"
+    check_name "$name" || return 1
+    shift
+    if [ "$#" -gt 0 ]; then
+        if [ "$#" -ne 2 ] || [ "$1" != --alias ]; then
+            echo "Error: Usage: ccacc save <name> [--alias <alias-name>]" >&2
+            return 1
+        fi
+        alias_name="$2"
+    fi
+    check_alias_name "$alias_name"
     check_ready
     ask_password
 
     save_account "$name"
+    alias_command "$name" "$alias_name"
     echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
 
@@ -886,6 +1009,7 @@ delete_command() {
     rm -f "$ACCOUNTS_DIR/${name}.json"
     delete_backup "$name" credentials
     rm -f "$ACCOUNTS_DIR/${name}.surge"
+    rm -f "$ACCOUNTS_DIR/${name}.alias"
     rm -rf "${ACCOUNTS_DIR:?}/${name:?}"
     echo -e "${GREEN}Deleted account: ${name}${NC}"
 }
@@ -900,7 +1024,16 @@ main() {
             show_current
             ;;
         save)
-            save_command "$2"
+            shift
+            save_command "$@"
+            ;;
+        alias)
+            [ "$#" -ge 2 ] && [ "$#" -le 3 ] || return 1
+            alias_command "$2" "${3-$2}"
+            ;;
+        timezone)
+            [ "$#" -le 2 ] || return 1
+            timezone_command "${2:-}"
             ;;
         use)
             use_command "$2"

@@ -7,6 +7,64 @@ Built with ❤️ by JUAN MACKIE
 
 -------------
 
+## ccacc account aliases and timezones
+
+`ccacc` switches official Claude Code accounts separately from `ccswap` profiles.
+Run it with `bash ./ccacc` from this checkout, or install it as an executable on
+your PATH. The account commands require `jq` and `openssl`.
+
+```bash
+ccacc save personal                         # Also back up the personal shell alias, if present
+ccacc save work --alias work-claude         # Select a different alias to back up
+ccacc alias work work-claude                # Back up the alias without saving credentials
+ccacc timezone work                        # Print the saved timezone
+ccacc timezone                             # Default to the active saved account
+```
+
+Alias backup queries the alias builtin in a new login/interactive Bash or Zsh
+using `$SHELL` (Bash when unset). The shell's normal startup files run during
+that query; the captured alias body is never evaluated or executed. Shell
+startup/logout output is ignored. Missing aliases and failed probes leave any
+existing backup unchanged and succeed, so an optional alias cannot prevent an
+account save. Unsupported shells are skipped with a warning.
+
+Backups are JSON in `~/.claude/accounts/<account>.alias`, written atomically with
+mode `600`. They contain `aliasName`, the original `definition`, and `env` with
+only a validated literal `TZ` when available. For example:
+
+```json
+{
+  "aliasName": "work-claude",
+  "definition": "TZ='Asia/Tokyo' claude",
+  "env": {"TZ": "Asia/Tokyo"}
+}
+```
+
+TZ extraction supports leading shell assignments, optionally following `env`
+or the known `_op_agent env` wrapper,
+with bare, single-quoted, or double-quoted literal timezone values. Variables,
+command substitutions, invalid zones, and TZ text in later command arguments
+are ignored. Zones must use safe timezone-name characters and exist as files
+under `/usr/share/zoneinfo`. Other environment values are not copied to `env`;
+the full alias definition remains in the private backup.
+
+`ccacc timezone` reads metadata only: it never starts a shell, asks for a master
+password, accesses credentials, stops processes, or changes account state. It
+prints one validated timezone and a newline on success. Missing or invalid TZ
+returns nonzero with no stdout. Applying that timezone belongs to your shell
+integration. `ccacc rm <account>` also removes that account's alias backup;
+alias metadata alone does not make an account appear in `ls` or `current`.
+
+Run the fixture-only regressions from the repository root:
+
+```bash
+uv run tests/test_ccacc_alias_timezone.py
+uv run tests/test_mcp_preservation.py
+```
+
+These use isolated HOME directories, fake shell startup/alias definitions, and
+mocked process control, Keychain and Surge. They never switch a real account.
+
 ## Windows Installation
 
 ### Method 1: System32 (Easiest)

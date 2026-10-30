@@ -1,6 +1,7 @@
 #!/bin/bash
 # Companion to ccacc. Source from Bash; generated hooks support Bash and Zsh.
-# Public API: ccacc_install_shell_hook ABSOLUTE_CCACC ACCOUNT VALIDATED_TIMEZONE
+# Public API: ccacc_install_shell_hook / ccacc_preflight_shell_hook
+# Arguments: ABSOLUTE_CCACC ACCOUNT VALIDATED_TIMEZONE
 # Requires probe_alias claude (JSON), valid_timezone ZONE, and jq from the caller.
 # Captured aliases are parsed as literal simple commands, never evaluated.
 
@@ -191,9 +192,10 @@ ccacc_install_shell_hook() (
     # Subshell contains umask, temporaries and parser variables, not the user's
     # shell. Never source an rc file or evaluate an alias in this process.
     local script=${1:-} account=${2:-} zone=${3:-} private probe original='' missing=0
-    local quoted_script rc path tmp stage startup_directory index=0
+    local quoted_script rc path tmp stage startup_directory index=0 check_only=${4:-}
     local -a rcs stages _ccacc_raw _ccacc_value
     umask 077
+    [ "$#" -le 4 ] && { [ -z "$check_only" ] || [ "$check_only" = --validate-only ]; } || return 1
     command -v jq >/dev/null 2>&1 || { _ccacc_shell_error 'jq is required'; return 1; }
     [[ "$account" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && valid_timezone "$zone" || {
         _ccacc_shell_error 'account name and a valid saved account timezone are required'; return 1;
@@ -287,6 +289,9 @@ ccacc_install_shell_hook() (
             _ccacc_shell_error 'unsupported Claude alias; use literal assignments, env, or _op_agent env with a claude executable and literal arguments'; return 1;
         }
     fi
+    # Let account operations reject unsupported aliases and unsafe paths before
+    # passwords, process shutdown or credential changes.
+    [ "$check_only" != --validate-only ] || return 0
     mkdir -p -m 700 "$private" && chmod 700 "$private" || return 1
     tmp=$(mktemp -d "$private/.install.XXXXXXXX") || return 1
     trap 'rm -rf "$tmp"' EXIT
@@ -336,3 +341,7 @@ HOOK
     printf 'In your current shell, run: source %s\n' "$(_ccacc_shell_quote "$private/hook.sh")"
     printf 'New interactive terminals load it automatically.\n'
 )
+
+ccacc_preflight_shell_hook() {
+    ccacc_install_shell_hook "$@" --validate-only
+}

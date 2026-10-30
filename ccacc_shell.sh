@@ -256,6 +256,9 @@ ccacc_install_shell_hook() (
         _ccacc_shell_path "$rc" file && [ -d "${rc%/*}" ] || {
             _ccacc_shell_error 'startup file or its parent is unsafe or missing'; return 1;
         }
+        [ -w "${rc%/*}" ] && { [ ! -e "$rc" ] || [ -w "$rc" ]; } || {
+            _ccacc_shell_error 'startup file and its parent must be writable'; return 1;
+        }
         _ccacc_shell_rc "$rc" || { _ccacc_shell_error 'malformed startup file or managed block'; return 1; }
     done
     if [ -f "$private/managed.json" ]; then

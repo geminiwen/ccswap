@@ -91,6 +91,27 @@ class ShellHookTests(unittest.TestCase):
                                       for p in self.home.rglob("*") if p.is_file()})
             self.assertFalse(self.private.exists())
 
+    def test_read_only_startup_rejected_during_preflight(self):
+        rc = self.home / ".bashrc"
+        rc.write_text("# existing startup configuration\n")
+        rc.chmod(0o444)
+        if os.access(rc, os.W_OK):
+            self.skipTest("Current user can write mode-0444 files")
+        self.probe.write_text('{"definition":"claude"}')
+        before = {p.relative_to(self.home): p.read_bytes()
+                  for p in self.home.rglob("*") if p.is_file()}
+        result = self.shell(
+            f"source {shlex.quote(str(LIBRARY))}\n"
+            'probe_alias() { cat "$HOME/probe.json"; }\n'
+            'valid_timezone() { [ "$1" = Australia/Sydney ]; }\n'
+            f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))} account Australia/Sydney\n",
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(before, {p.relative_to(self.home): p.read_bytes()
+                                  for p in self.home.rglob("*") if p.is_file()})
+        self.assertFalse(self.private.exists())
+
     def launch(self, shell="bash", check=True, args="'user arg' '$(touch should-not-exist)'", prefix=""):
         # eval is only the test caller's second parse, necessary because aliases
         # are expanded when a command is read, before source in the same -c.

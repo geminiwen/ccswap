@@ -23,6 +23,8 @@ KEYCHAIN_SERVICE="Claude Code-credentials"
 DEVICE_KEY_SERVICE="Claude Code-device-keys"
 DEVICE_KEY_FILE="$CONFIG_DIR/.device-keys.json"
 ACCOUNTS_DIR="$CONFIG_DIR/accounts"
+# Hidden names cannot pass check_name, keeping metadata separate from account stashes.
+ALIASES_DIR="$ACCOUNTS_DIR/.aliases"
 ACTIVE_FILE="$ACCOUNTS_DIR/.active"
 CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
 MASTER_PASSWORD=""
@@ -244,13 +246,16 @@ alias_command() {
     [ "$(printf '%s' "$captured" | jq -r '.missing // false')" != true ] || return 0
     definition=$(printf '%s' "$captured" | jq -r '.definition') || return 1
     zone=$(alias_timezone "$definition") || return 1
-    if ! valid_timezone "$zone"; then zone=""; fi
-    mkdir -p -m 700 "$ACCOUNTS_DIR"
-    temp_alias=$(mktemp "$ACCOUNTS_DIR/.alias.XXXXXX") || return 1
+    if ! valid_timezone "$zone"; then
+        # Dynamic aliases cannot supply a literal TZ; retain only validated saved metadata.
+        zone=$(timezone_command "$name") || zone=""
+    fi
+    mkdir -p -m 700 "$ACCOUNTS_DIR" "$ALIASES_DIR"
+    temp_alias=$(mktemp "$ALIASES_DIR/.alias.XXXXXX") || return 1
     if ! jq -n --arg name "$alias_name" --argjson captured "$captured" --arg zone "$zone" \
         '{aliasName: $name, definition: $captured.definition, env: (if $zone == "" then {} else {TZ: $zone} end)}' \
         > "$temp_alias" || ! chmod 600 "$temp_alias" \
-        || ! mv -f "$temp_alias" "$ACCOUNTS_DIR/${name}.alias"; then
+        || ! mv -f "$temp_alias" "$ALIASES_DIR/${name}.json"; then
         rm -f "$temp_alias"
         return 1
     fi
@@ -264,7 +269,7 @@ timezone_command() {
     check_name "$name" >/dev/null 2>&1 || return 1
     zone=$(jq -ser 'select(length == 1) | .[0].env.TZ | select(type == "string")
         | select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\z"))' \
-        "$ACCOUNTS_DIR/${name}.alias" 2>/dev/null) || return 1
+        "$ALIASES_DIR/${name}.json" 2>/dev/null) || return 1
     valid_timezone "$zone" || return 1
     printf '%s\n' "$zone"
 }
@@ -1009,7 +1014,7 @@ delete_command() {
     rm -f "$ACCOUNTS_DIR/${name}.json"
     delete_backup "$name" credentials
     rm -f "$ACCOUNTS_DIR/${name}.surge"
-    rm -f "$ACCOUNTS_DIR/${name}.alias"
+    rm -f "$ALIASES_DIR/${name}.json"
     rm -rf "${ACCOUNTS_DIR:?}/${name:?}"
     echo -e "${GREEN}Deleted account: ${name}${NC}"
 }

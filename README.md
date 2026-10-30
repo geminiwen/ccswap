@@ -28,9 +28,10 @@ startup/logout output is ignored. Missing aliases and failed probes leave any
 existing backup unchanged and succeed, so an optional alias cannot prevent an
 account save. Unsupported shells are skipped with a warning.
 
-Backups are JSON in `~/.claude/accounts/<account>.alias`, written atomically with
+Backups are JSON in `~/.claude/accounts/.aliases/<account>.json`, written atomically with
 mode `600`. They contain `aliasName`, the original `definition`, and `env` with
-only a validated literal `TZ` when available. For example:
+only a validated `TZ` when available. The hidden `.aliases` directory cannot be
+an account name and stays separate from account history stashes. For example:
 
 ```json
 {
@@ -45,7 +46,9 @@ or the known `_op_agent env` wrapper,
 with bare, single-quoted, or double-quoted literal timezone values. Variables,
 command substitutions, invalid zones, and TZ text in later command arguments
 are ignored. Zones must use safe timezone-name characters and exist as files
-under `/usr/share/zoneinfo`. Other environment values are not copied to `env`;
+under `/usr/share/zoneinfo`. A new valid literal TZ replaces the saved TZ. If a
+captured alias has no valid literal TZ, its definition is updated while any
+existing validated TZ is preserved. Other environment values are not copied to `env`;
 the full alias definition remains in the private backup.
 
 `ccacc timezone` reads metadata only: it never starts a shell, asks for a master

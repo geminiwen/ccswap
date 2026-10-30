@@ -21,6 +21,8 @@ class AliasTimezoneTests(unittest.TestCase):
         self.home = self.fixture / "home"
         self.accounts = self.home / ".claude/accounts"
         self.accounts.mkdir(parents=True)
+        self.alias_metadata = self.accounts / ".aliases"
+        self.alias_metadata.mkdir()
         self.bin = self.fixture / "bin"
         self.bin.mkdir()
         self.log = self.fixture / "forbidden.log"
@@ -79,10 +81,14 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         self.assertFalse(self.log.exists())
         return result
 
+    def metadata_path(self, name="example"):
+        return self.alias_metadata / (name + ".json")
+
     def metadata(self, name="example"):
-        return json.loads((self.accounts / (name + ".alias")).read_text())
+        return json.loads(self.metadata_path(name).read_text())
 
     def test_bash_and_zsh_capture_exact_definition_without_execution(self):
+        self.alias_metadata.rmdir()
         definition = ('TZ="Asia/Tokyo" CLAUDE_CONFIG_DIR="$HOME/fixture dir" '
                       'claude "don\'t change" "$(touch \'$HOME/executed\')"; '
                       'touch "$HOME/executed"\n')
@@ -93,15 +99,16 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
                 self.run_cli("alias", "example", "quoted-alias")
                 self.assertEqual(self.metadata(), {"aliasName": "quoted-alias", "definition": definition,
                                                   "env": {"TZ": "Asia/Tokyo"}})
-                self.assertEqual((self.accounts / "example.alias").stat().st_mode & 0o777, 0o600)
+                self.assertEqual((self.alias_metadata / "example.json").stat().st_mode & 0o777, 0o600)
+                self.assertEqual(self.alias_metadata.stat().st_mode & 0o777, 0o700)
                 self.assertFalse((self.home / "executed").exists())
 
     def test_missing_alias_does_not_create_or_delete_backup(self):
         for shell in ("bash", "zsh"):
             self.env["SHELL"] = str(self.bin / shell)
             self.run_cli("alias", "missing")
-            self.assertFalse((self.accounts / "missing.alias").exists())
-            backup = self.accounts / "example.alias"
+            self.assertFalse((self.alias_metadata / "missing.json").exists())
+            backup = self.alias_metadata / "example.json"
             backup.write_text("fixture-unchanged")
             backup.chmod(0o640)
             self.run_cli("alias", "example", "missing")
@@ -131,6 +138,7 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         }
         for definition, zone in cases.items():
             with self.subTest(definition=definition):
+                self.metadata_path().unlink(missing_ok=True)
                 self.define("example", definition)
                 self.run_cli("alias", "example")
                 self.assertEqual(self.metadata()["env"], {"TZ": zone} if zone else {})
@@ -151,21 +159,78 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         (self.accounts / ".active").write_text("../outside\n")
         self.assertEqual(self.run_cli("timezone", success=False).stdout, "")
 
+    def test_dynamic_alias_preserves_saved_timezone_without_execution(self):
+        (self.home / ".claude.json").write_text("{}")
+        self.define("emocode", "TZ=Australia/Sydney claude")
+        self.run_cli("alias", "emocode")
+        dynamic = 'TZ="$(_claude_timezone)" claude "$HOME/fixture"'
+        with self.aliases.open("a") as handle:
+            handle.write('_claude_timezone() { touch "$HOME/executed"; printf UTC; }\n')
+        self.define("claude", dynamic)
+        self.define("dynamic", dynamic + " --verbose")
+        self.run_cli("alias", "emocode", "claude")
+        self.assertEqual(self.metadata("emocode"), {
+            "aliasName": "claude", "definition": dynamic, "env": {"TZ": "Australia/Sydney"}})
+        self.run_harness('main save emocode --alias dynamic')
+        self.assertEqual(self.metadata("emocode"), {
+            "aliasName": "dynamic", "definition": dynamic + " --verbose",
+            "env": {"TZ": "Australia/Sydney"}})
+        self.assertEqual(self.run_cli("timezone", "emocode").stdout, "Australia/Sydney\n")
+        self.assertFalse((self.home / "executed").exists())
+
+    def test_use_roundtrip_keeps_alias_metadata_separate_from_dotted_account_stash(self):
+        (self.home / ".claude.json").write_text("{}")
+        for name, zone in (("foo", "UTC"), ("foo.alias", "Australia/Sydney")):
+            (self.accounts / (name + ".json")).write_text("{}")
+            self.define(name, "TZ=" + zone + " claude")
+            self.run_cli("alias", name)
+        history = self.home / ".claude/history.jsonl"
+        history.write_text("foo history\n")
+        (self.accounts / ".active").write_text("foo\n")
+        self.run_harness('''
+stop_claude() { :; }
+note_device_keys() { :; }
+load_account() { :; }
+main use foo.alias
+''')
+        self.assertEqual((self.accounts / "foo/history.jsonl").read_text(), "foo history\n")
+        self.assertFalse(history.exists())
+        history.write_text("foo.alias history\n")
+        self.run_harness('''
+stop_claude() { :; }
+note_device_keys() { :; }
+load_account() { :; }
+main use foo
+''')
+        self.assertEqual(history.read_text(), "foo history\n")
+        self.assertEqual((self.accounts / "foo.alias/history.jsonl").read_text(), "foo.alias history\n")
+        self.assertEqual(self.metadata("foo")["env"], {"TZ": "UTC"})
+        self.assertEqual(self.metadata("foo.alias")["env"], {"TZ": "Australia/Sydney"})
+        self.run_cli("rm", "foo", stdin="y\n")
+        self.assertFalse(self.metadata_path("foo").exists())
+        self.assertTrue((self.accounts / "foo.alias.json").exists())
+        self.assertEqual((self.accounts / "foo.alias/history.jsonl").read_text(), "foo.alias history\n")
+        self.assertEqual(self.metadata("foo.alias")["env"], {"TZ": "Australia/Sydney"})
+
     def test_timezone_rejects_corrupt_or_invalid_metadata_without_stdout(self):
+        self.define("example", 'TZ="$(_claude_timezone)" claude')
         for content in ('{bad', 'null', '[]', '{"env":{"TZ":23}}',
                         '{"env":{"TZ":"UTC\\n"}}', '{"env":{"TZ":"Invalid/Zone"}}',
                         '{"env":{"TZ":"../UTC"}}', '{"env":{"TZ":"$(touch nope)"}}',
                         '{"env":{"TZ":"UTC"}} {"env":{"TZ":"UTC"}}'):
-            (self.accounts / "example.alias").write_text(content)
+            (self.alias_metadata / "example.json").write_text(content)
             self.assertEqual(self.run_cli("timezone", "example", success=False).stdout, "")
+            self.run_cli("alias", "example")
+            self.assertEqual(self.metadata()["env"], {})
 
     def test_invalid_names_never_probe_or_write(self):
-        for name in ("../escape", "-flag", "bad/name", "$(touch nope)", "has space", ""):
+        for name in (".aliases", "../escape", "-flag", "bad/name", "$(touch nope)", "has space", ""):
             self.run_cli("alias", name, success=False)
             self.run_cli("alias", "example", name, success=False)
             self.assertEqual(self.run_cli("timezone", name, success=False).stdout, "")
         self.assertFalse(self.probes.exists())
-        self.assertEqual(list(self.accounts.iterdir()), [])
+        self.assertEqual(list(self.accounts.iterdir()), [self.alias_metadata])
+        self.assertEqual(list(self.alias_metadata.iterdir()), [])
 
     def test_metadata_is_not_an_account_and_dotted_names_remain_valid(self):
         (self.home / ".claude.json").write_text("{}")
@@ -175,7 +240,7 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         (self.accounts / ".active").write_text("example\n")
         self.assertIn("(not saved)", self.run_cli("current").stdout)
         self.run_cli("rm", "example", success=False, stdin="y\n")
-        self.assertTrue((self.accounts / "example.alias").exists())
+        self.assertTrue((self.alias_metadata / "example.json").exists())
         (self.accounts / "example.alias.json").write_text("{}")
         self.run_cli("alias", "example.alias", "example")
         (self.accounts / ".active").write_text("example.alias\n")
@@ -187,14 +252,15 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         (self.home / ".claude.json").write_text("{}")
         for name in ("example", "other"):
             (self.accounts / (name + ".json")).write_text("{}")
-            (self.accounts / (name + ".alias")).write_text("fixture-metadata")
+            (self.alias_metadata / (name + ".json")).write_text("fixture-metadata")
             (self.accounts / (name + ".surge")).write_text("{}")
             (self.accounts / (name + ".credentials.enc")).write_text("fixture-encrypted")
             (self.accounts / name).mkdir()
         (self.accounts / ".active").write_text("example\n")
         self.run_cli("rm", "example", stdin="y\n")
         self.assertEqual(sorted(path.name for path in self.accounts.iterdir()),
-                         ["other", "other.alias", "other.credentials.enc", "other.json", "other.surge"])
+                         [".aliases", "other", "other.credentials.enc", "other.json", "other.surge"])
+        self.assertEqual(sorted(path.name for path in self.alias_metadata.iterdir()), ["other.json"])
 
     def test_save_default_explicit_alias_and_argument_compatibility(self):
         (self.home / ".claude.json").write_text("{}")
@@ -208,16 +274,16 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         self.run_harness('main save example --alias missing')
         self.assertEqual(self.metadata()["aliasName"], "wrapper")
         self.run_harness('main save missing')
-        self.assertFalse((self.accounts / "missing.alias").exists())
+        self.assertFalse((self.alias_metadata / "missing.json").exists())
         self.run_harness('main save example --alias', success=False)
         self.run_harness('main save example --alias ""', success=False)
         self.run_harness('main save', success=False)
 
     def test_probe_failure_preserves_backup(self):
-        (self.accounts / "example.alias").write_text("fixture-unchanged")
+        (self.alias_metadata / "example.json").write_text("fixture-unchanged")
         self.executable("bash", "#!/bin/bash\nprintf 'startup only\\n'\nexit 2\n")
         self.run_cli("alias", "example")
-        self.assertEqual((self.accounts / "example.alias").read_text(), "fixture-unchanged")
+        self.assertEqual((self.alias_metadata / "example.json").read_text(), "fixture-unchanged")
 
     def test_aliases_named_command_and_builtin_are_never_invoked(self):
         definition = 'touch "$HOME/executed"'

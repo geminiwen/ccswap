@@ -73,6 +73,24 @@ class ShellHookTests(unittest.TestCase):
     def private(self):
         return self.home / ".ccacc-shell"
 
+    def test_preflight_validates_without_writing_or_launching(self):
+        for definition, success in (("claude --retained", True), ("claude $(unsafe)", False)):
+            self.probe.write_text(json.dumps({"definition": definition}))
+            before = {p.relative_to(self.home): (p.read_bytes(), p.stat().st_mtime_ns)
+                      for p in self.home.rglob("*") if p.is_file()}
+            result = self.shell(
+                f"source {shlex.quote(str(LIBRARY))}\n"
+                'probe_alias() { cat "$HOME/probe.json"; }\n'
+                'valid_timezone() { [ "$1" = Australia/Sydney ]; }\n'
+                f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))} account Australia/Sydney\n",
+                check=False,
+            )
+            self.assertEqual(result.returncode == 0, success)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(before, {p.relative_to(self.home): (p.read_bytes(), p.stat().st_mtime_ns)
+                                      for p in self.home.rglob("*") if p.is_file()})
+            self.assertFalse(self.private.exists())
+
     def launch(self, shell="bash", check=True, args="'user arg' '$(touch should-not-exist)'", prefix=""):
         # eval is only the test caller's second parse, necessary because aliases
         # are expanded when a command is read, before source in the same -c.

@@ -25,6 +25,7 @@ DEVICE_KEY_FILE="$CONFIG_DIR/.device-keys.json"
 ACCOUNTS_DIR="$CONFIG_DIR/accounts"
 # Hidden names cannot pass check_name, keeping metadata separate from account stashes.
 ALIASES_DIR="$ACCOUNTS_DIR/.aliases"
+TIMEZONES_DIR="$ACCOUNTS_DIR/.timezones"
 ACTIVE_FILE="$ACCOUNTS_DIR/.active"
 CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
 MASTER_PASSWORD=""
@@ -89,13 +90,16 @@ Usage: $SCRIPT_NAME [COMMAND] [OPTIONS]
 Commands:
   ls                    List saved accounts
   current               Show the current Claude account
-  save <name> [--alias <alias-name>]
+  save <name> [--alias <alias-name>] [--timezone <ZONE>]
                         Back up the current account and its same-named shell alias
   alias <name> [alias-name]
                         Back up an existing shell alias (optional, never executed)
   timezone [name]       Print the saved TZ only (defaults to the active account)
+  timezone <name> <ZONE>
+                        Set the account timezone without accessing credentials
   use <name>            Back up the active account, then switch to <name>
-  new <name>            Back up the active account, then start <name> like a fresh install
+  new <name> [--alias <alias-name>] [--timezone <ZONE>]
+                        Back up the active account, then start <name> like a fresh install
                         (logged out, new IDs; run 'claude /login' next)
   surge <name>          Choose the Surge policies <name> uses (e.g. its own exit for the Claude group)
   rm <name>             Delete a saved account and its saved history
@@ -110,7 +114,9 @@ An account is everything cccleaner would wipe:
 Login backups are encrypted with one master password, asked once per save/use/new.
 Folders are moved, not copied, so switching is instant.
 With Surge installed, save/new ask which Surge policies the account uses and use applies them;
-without Surge nothing is asked.
+without Surge no policy selection is asked.
+Save/new require a timezone: explicit --timezone, existing saved TZ, literal alias TZ,
+then a timezone prompt. An unanswered prompt fails before account changes.
 
 Left alone: CLAUDE_CONFIG_DIR, suffixed keychain items, the shared Cowork device keys,
 mcpOAuth, unrelated credential fields, mcpServers, settings and the Claude desktop app.
@@ -235,7 +241,7 @@ valid_timezone() {
 }
 
 alias_command() {
-    local name="$1" alias_name="${2-$1}" captured definition zone temp_alias
+    local name="$1" alias_name="${2-$1}" captured
     check_name "$name" || return 1
     check_alias_name "$alias_name" || return 1
     command -v jq >/dev/null || return 1
@@ -244,6 +250,11 @@ alias_command() {
         return 0
     fi
     [ "$(printf '%s' "$captured" | jq -r '.missing // false')" != true ] || return 0
+    write_alias_backup "$name" "$alias_name" "$captured"
+}
+
+write_alias_backup() {
+    local name="$1" alias_name="$2" captured="$3" definition zone temp_alias
     definition=$(printf '%s' "$captured" | jq -r '.definition') || return 1
     zone=$(alias_timezone "$definition") || return 1
     if ! valid_timezone "$zone"; then
@@ -267,11 +278,96 @@ timezone_command() {
     local name="$1" zone
     if [ -z "$name" ]; then name=$(active_account); fi
     check_name "$name" >/dev/null 2>&1 || return 1
+    # Raw private metadata is exactly one zone, optionally followed by one newline.
+    if zone=$(jq -Rser 'select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\n?\\z"))
+        | rtrimstr("\n")' "$TIMEZONES_DIR/$name" 2>/dev/null) && valid_timezone "$zone"; then
+        printf '%s\n' "$zone"
+        return 0
+    fi
     zone=$(jq -ser 'select(length == 1) | .[0].env.TZ | select(type == "string")
         | select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\z"))' \
         "$ALIASES_DIR/${name}.json" 2>/dev/null) || return 1
     valid_timezone "$zone" || return 1
     printf '%s\n' "$zone"
+}
+
+set_timezone() {
+    local name="$1" zone="$2" temp_timezone
+    check_name "$name" >&2 || return 1
+    valid_timezone "$zone" || { echo "Error: Invalid timezone" >&2; return 1; }
+    mkdir -p -m 700 "$ACCOUNTS_DIR" "$TIMEZONES_DIR" || return 1
+    chmod 700 "$TIMEZONES_DIR" || return 1
+    temp_timezone=$(mktemp "$TIMEZONES_DIR/.timezone.XXXXXX") || return 1
+    if ! printf '%s\n' "$zone" > "$temp_timezone" || ! chmod 600 "$temp_timezone" \
+        || ! mv -f "$temp_timezone" "$TIMEZONES_DIR/$name"; then
+        rm -f "$temp_timezone"
+        return 1
+    fi
+}
+
+# Preflight only: validate every flag and resolve the required TZ before writes,
+# passwords or account changes. Reuse the captured alias rather than probing twice.
+prepare_account_metadata() {
+    local name="${1:-}" requested_zone="" alias_seen="" zone_seen="" zone
+    check_name "$name" || return 1
+    shift
+    PREPARED_ALIAS_NAME="$name"
+    PREPARED_ALIAS=""
+    PREPARED_TIMEZONE=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --alias)
+                [ "$#" -ge 2 ] && [ -z "$alias_seen" ] || {
+                    echo "Error: --alias requires one value and may appear only once" >&2; return 1;
+                }
+                PREPARED_ALIAS_NAME="$2"
+                check_alias_name "$PREPARED_ALIAS_NAME" || return 1
+                alias_seen=yes
+                ;;
+            --timezone)
+                [ "$#" -ge 2 ] && [ -z "$zone_seen" ] || {
+                    echo "Error: --timezone requires one value and may appear only once" >&2; return 1;
+                }
+                requested_zone="$2"
+                valid_timezone "$requested_zone" || { echo "Error: Invalid timezone" >&2; return 1; }
+                zone_seen=yes
+                ;;
+            *) echo "Error: Expected --alias <alias-name> or --timezone <ZONE>" >&2; return 1 ;;
+        esac
+        shift 2
+    done
+    command -v jq >/dev/null || return 1
+    if ! PREPARED_ALIAS=$(probe_alias "$PREPARED_ALIAS_NAME"); then
+        echo "Warning: Could not query shell alias; backup unchanged" >&2
+        PREPARED_ALIAS=""
+    elif [ "$(printf '%s' "$PREPARED_ALIAS" | jq -r '.missing // false')" = true ]; then
+        PREPARED_ALIAS=""
+    fi
+    zone="$requested_zone"
+    if [ -z "$zone" ]; then zone=$(timezone_command "$name") || zone=""; fi
+    if [ -z "$zone" ] && [ -n "$PREPARED_ALIAS" ]; then
+        zone=$(alias_timezone "$(printf '%s' "$PREPARED_ALIAS" | jq -r '.definition')") || return 1
+        if ! valid_timezone "$zone"; then zone=""; fi
+    fi
+    while [ -z "$zone" ]; do
+        printf 'Timezone for %s (e.g. Australia/Sydney or UTC): ' "$name" >&2
+        if ! IFS= read -r zone || [ -z "$zone" ]; then
+            echo "Error: Timezone required; use --timezone <ZONE>" >&2
+            return 1
+        fi
+        if ! valid_timezone "$zone"; then
+            echo "Error: Invalid timezone" >&2
+            zone=""
+        fi
+    done
+    PREPARED_TIMEZONE="$zone"
+}
+
+save_prepared_metadata() {
+    set_timezone "$1" "$PREPARED_TIMEZONE" || return 1
+    if [ -n "$PREPARED_ALIAS" ]; then
+        write_alias_backup "$1" "$PREPARED_ALIAS_NAME" "$PREPARED_ALIAS" || return 1
+    fi
 }
 
 # Match executable names, not command arguments mentioning Claude paths.
@@ -877,22 +973,12 @@ show_current() {
 # Function to save the current account as <name>
 save_command() {
     local name="${1:-}"
-    local alias_name="${1:-}"
-    check_name "$name" || return 1
-    shift
-    if [ "$#" -gt 0 ]; then
-        if [ "$#" -ne 2 ] || [ "$1" != --alias ]; then
-            echo "Error: Usage: ccacc save <name> [--alias <alias-name>]" >&2
-            return 1
-        fi
-        alias_name="$2"
-    fi
-    check_alias_name "$alias_name"
+    prepare_account_metadata "$@" || return 1
     check_ready
     ask_password
+    save_prepared_metadata "$name" || return 1
 
     save_account "$name"
-    alias_command "$name" "$alias_name"
     echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
 
@@ -934,17 +1020,19 @@ use_command() {
 
 # Function to start a new account like a fresh install: logged out, new IDs, no history
 new_command() {
-    local name="$1"
-    check_name "$name"
-    check_ready
+    local name="${1:-}"
+    check_name "$name" || return 1
 
     if [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
         echo -e "${RED}Error: Account '${name}' already exists${NC}"
         return 1
     fi
+    prepare_account_metadata "$@" || return 1
+    check_ready
 
     local active=$(active_account)
     ask_password
+    save_prepared_metadata "$name" || return 1
     stop_claude || return 1
     note_device_keys
     backup_active
@@ -1015,6 +1103,7 @@ delete_command() {
     delete_backup "$name" credentials
     rm -f "$ACCOUNTS_DIR/${name}.surge"
     rm -f "$ALIASES_DIR/${name}.json"
+    rm -f "$TIMEZONES_DIR/$name"
     rm -rf "${ACCOUNTS_DIR:?}/${name:?}"
     echo -e "${GREEN}Deleted account: ${name}${NC}"
 }
@@ -1037,14 +1126,19 @@ main() {
             alias_command "$2" "${3-$2}"
             ;;
         timezone)
-            [ "$#" -le 2 ] || return 1
-            timezone_command "${2:-}"
+            [ "$#" -le 3 ] || return 1
+            if [ "$#" -eq 3 ]; then
+                set_timezone "$2" "$3"
+            else
+                timezone_command "${2:-}"
+            fi
             ;;
         use)
             use_command "$2"
             ;;
         new)
-            new_command "$2"
+            shift
+            new_command "$@"
             ;;
         surge)
             surge_command "$2"

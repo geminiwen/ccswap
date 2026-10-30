@@ -44,6 +44,7 @@ stop_claude() { :; }
 note_device_keys() { :; }
 setup_surge() { :; }
 apply_surge() { :; }
+probe_alias() { printf '{"missing":true}\n'; }
 MASTER_PASSWORD=fixture-master
 '''
 
@@ -141,7 +142,7 @@ load_account legacy
             fixture, state = run(r'''
 save_account original
 printf 'original\n' > "$ACTIVE_FILE"
-new_command fresh
+new_command fresh --timezone UTC
 ''')
             assert json.loads(state.read_text()) == {k: v for k, v in BASE.items() if k != 'claudeAiOauth'}
             assert not (fixture / 'home/.claude/accounts/fresh.credentials.enc').exists()

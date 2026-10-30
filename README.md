@@ -16,17 +16,34 @@ your PATH. The account commands require `jq` and `openssl`.
 ```bash
 ccacc save personal                         # Also back up the personal shell alias, if present
 ccacc save work --alias work-claude         # Select a different alias to back up
+ccacc save work --timezone Australia/Sydney # Choose the timezone explicitly
+ccacc new personal --timezone Europe/London # Require a timezone before resetting login
 ccacc alias work work-claude                # Back up the alias without saving credentials
 ccacc timezone work                        # Print the saved timezone
 ccacc timezone                             # Default to the active saved account
+ccacc timezone work Australia/Sydney        # Set timezone metadata only
 ```
+
+`save <name>` and `new <name>` accept `--alias <alias-name>` and `--timezone <ZONE>`
+in either order. Their timezone priority is an explicit `--timezone`, an existing
+valid saved timezone, a literal TZ from the selected shell alias, then a prompt.
+There is no default timezone. Invalid input is prompted again; an empty choice
+or EOF fails before passwords, credentials, process shutdown or active-account
+changes. Invalid, missing, duplicate and unknown flags fail before any writes.
+
+Resolved timezones are stored independently as one zone per private
+`~/.claude/accounts/.timezones/<account>` file (mode `600`, directory `700`).
+An account can have a timezone without an alias backup. The setter
+`ccacc timezone <account> <ZONE>` validates and writes only this metadata; it
+does not require an existing saved account, Claude config, password or shell probe.
 
 Alias backup queries the alias builtin in a new login/interactive Bash or Zsh
 using `$SHELL` (Bash when unset). The shell's normal startup files run during
 that query; the captured alias body is never evaluated or executed. Shell
 startup/logout output is ignored. Missing aliases and failed probes leave any
-existing backup unchanged and succeed, so an optional alias cannot prevent an
-account save. Unsupported shells are skipped with a warning.
+existing alias backup unchanged. Unsupported shells are skipped with a warning.
+An absent alias creates no alias-definition backup; save/new can still proceed
+with a saved timezone, `--timezone`, or a valid prompted choice.
 
 Backups are JSON in `~/.claude/accounts/.aliases/<account>.json`, written atomically with
 mode `600`. They contain `aliasName`, the original `definition`, and `env` with
@@ -46,17 +63,20 @@ or the known `_op_agent env` wrapper,
 with bare, single-quoted, or double-quoted literal timezone values. Variables,
 command substitutions, invalid zones, and TZ text in later command arguments
 are ignored. Zones must use safe timezone-name characters and exist as files
-under `/usr/share/zoneinfo`. A new valid literal TZ replaces the saved TZ. If a
-captured alias has no valid literal TZ, its definition is updated while any
+under `/usr/share/zoneinfo`. A new valid literal TZ replaces `env.TZ` in the alias
+backup; the independent timezone selection keeps priority for queries and saves.
+If a captured alias has no valid literal TZ, its definition is updated while any
 existing validated TZ is preserved. Other environment values are not copied to `env`;
 the full alias definition remains in the private backup.
 
-`ccacc timezone` reads metadata only: it never starts a shell, asks for a master
+`ccacc timezone` reads valid independent timezone metadata first, then falls back
+to a valid TZ in the captured alias backup. It never starts a shell, asks for a master
 password, accesses credentials, stops processes, or changes account state. It
 prints one validated timezone and a newline on success. Missing or invalid TZ
 returns nonzero with no stdout. Applying that timezone belongs to your shell
-integration. `ccacc rm <account>` also removes that account's alias backup;
-alias metadata alone does not make an account appear in `ls` or `current`.
+integration. `ccacc rm <account>` also removes that account's alias backup and
+independent timezone metadata; metadata alone does not make an account appear
+in `ls` or `current`.
 
 Run the fixture-only regressions from the repository root:
 

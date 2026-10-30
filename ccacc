@@ -1,10 +1,11 @@
 #!/bin/bash
 # ccacc – Claude Code official account switcher for macOS/Linux
-# Everything cccleaner wipes follows the account instead: the whole keychain item
+# Claude login and account history follow the account: only claudeAiOauth from
 # "Claude Code-credentials" (or ~/.claude/.credentials.json on Linux), the account-bound keys of
 # ~/.claude.json, the history/state folders under ~/.claude and the Claude CLI cache.
 # Keychain items with a suffix (other CLAUDE_CONFIG_DIRs, Orca accounts), the shared Cowork
-# device keys and the Claude desktop app are never touched.
+# device keys and the Claude desktop app are never touched. MCP OAuth and other
+# unrelated credential fields remain shared and are never restored from account backups.
 # Login backups are files encrypted with one master password (AES-256-CBC, PBKDF2)
 # Make it executable: chmod +x ccacc
 # Move to PATH: sudo mv ccacc /usr/local/bin/
@@ -96,7 +97,7 @@ Commands:
   -v, --version         Show version information
 
 An account is everything cccleaner would wipe:
-  - the whole keychain item "Claude Code-credentials" (macOS) or ~/.claude/.credentials.json (Linux)
+  - only claudeAiOauth from "Claude Code-credentials" (macOS) or ~/.claude/.credentials.json (Linux)
   - the account-bound keys of ~/.claude.json (IDs, oauthAccount, caches, counters, projects, ...)
   - ~/.claude history/state folders (projects, file-history, statsig, telemetry, history.jsonl, ...)
   - ~/Library/Caches/claude-cli-nodejs
@@ -106,7 +107,9 @@ With Surge installed, save/new ask which Surge policies the account uses and use
 without Surge nothing is asked.
 
 Left alone: CLAUDE_CONFIG_DIR, suffixed keychain items, the shared Cowork device keys,
-mcpServers, settings and the Claude desktop app. Quit Claude Code before switching.
+mcpOAuth, unrelated credential fields, mcpServers, settings and the Claude desktop app.
+Switching stops all Claude Code
+processes owned by the current user, including those using another config dir.
 
 Examples:
   $SCRIPT_NAME save personal
@@ -154,18 +157,50 @@ check_name() {
     fi
 }
 
-# Function to make sure Claude Code is closed: it keeps the old account in memory,
-# may write it back, and keeps writing history into the folders being moved
-confirm_not_running() {
-    if pgrep -f '(^|/)claude( |$)' > /dev/null 2>&1; then
-        echo -e "${YELLOW}Warning: Claude Code is running; quit it first, or it may write the old account and history back${NC}"
-        read -p "Switch anyway? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            echo "Cancelled"
-            exit 1
-        fi
+# Match executable names, not command arguments mentioning Claude paths.
+claude_process_ids() {
+    local processes current_uid
+    current_uid=$(id -u) || return 1
+    processes=$(ps -axo pid=,uid=,comm=) || return 1
+    printf '%s\n' "$processes" | awk -v uid="$current_uid" '
+        $2 == uid && ($3 == "claude" || $0 ~ /\/claude$/ ||
+            $0 ~ /\/\.local\/share\/claude\/versions\/[0-9][^\/[:space:]]*$/) { print $1 }
+    '
+}
+
+# Stop every current-user Claude Code instance before saving or moving account state.
+# Other config dirs (including emocode) are included; the desktop app is not.
+stop_claude() {
+    local pids pid signal attempt
+    if ! pids=$(claude_process_ids); then
+        echo -e "${RED}Error: Could not inspect Claude Code processes; account not switched${NC}"
+        return 1
     fi
+    [ -n "$pids" ] || return 0
+
+    echo -e "${YELLOW}Stopping all Claude Code processes for the current user${NC}"
+    for signal in TERM KILL; do
+        for pid in $pids; do
+            kill -"$signal" "$pid" 2>/dev/null || true
+        done
+        for attempt in 1 2 3 4 5; do
+            if ! pids=$(claude_process_ids); then
+                echo -e "${RED}Error: Could not verify Claude Code shutdown; account not switched${NC}"
+                return 1
+            fi
+            [ -n "$pids" ] || return 0
+            sleep 1
+        done
+        # Refresh the process list before escalating, including any restarted instances.
+        if ! pids=$(claude_process_ids); then
+            echo -e "${RED}Error: Could not verify Claude Code shutdown; account not switched${NC}"
+            return 1
+        fi
+        [ -n "$pids" ] || return 0
+    done
+
+    echo -e "${RED}Error: Claude Code is still running; account not switched${NC}"
+    return 1
 }
 
 # Function to point out Cowork device keys: Claude Code keeps them under one fixed keychain name
@@ -198,9 +233,35 @@ keychain_read() {
 }
 
 keychain_write() {
-    # Fed through `security -i` so the secret never shows up in the process list
-    local hex=$(printf '%s' "$3" | od -An -v -tx1 | tr -d ' \n')
-    printf 'add-generic-password -U -a "%s" -s "%s" -X "%s"\n' "$2" "$1" "$hex" | security -i > /dev/null
+    # security -i truncates long input lines. Pass data through stdin to the native
+    # API instead, without exposing secrets in argv or replacing an existing item's ACL.
+    if ! printf '%s' "$3" | jq -Rsc --arg service "$1" --arg account "$2" \
+        '{service: $service, account: $account, secret: .}' \
+        | osascript -l JavaScript -e '
+            ObjC.import("Foundation");
+            ObjC.import("Security");
+            function run() {
+                const input = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+                const text = $.NSString.alloc.initWithDataEncoding(input, $.NSUTF8StringEncoding);
+                const value = JSON.parse(ObjC.unwrap(text));
+                const object = function (ref) { return ObjC.castRefToObject(ref); };
+                const query = $.NSMutableDictionary.alloc.init;
+                query.setObjectForKey(object($.kSecClassGenericPassword), object($.kSecClass));
+                query.setObjectForKey($(value.service), object($.kSecAttrService));
+                query.setObjectForKey($(value.account), object($.kSecAttrAccount));
+                const attributes = $.NSMutableDictionary.alloc.init;
+                attributes.setObjectForKey($(value.secret).dataUsingEncoding($.NSUTF8StringEncoding),
+                                           object($.kSecValueData));
+                let status = $.SecItemUpdate(query, attributes);
+                if (status === -25300) {
+                    query.addEntriesFromDictionary(attributes);
+                    status = $.SecItemAdd(query, null);
+                }
+                if (status !== 0) throw new Error("Keychain write failed (OSStatus " + status + ")");
+            }
+        ' > /dev/null 2>/dev/null; then
+        return 1
+    fi
 
     [ "$(keychain_read "$1" "$2")" = "$3" ]
 }
@@ -235,12 +296,43 @@ delete_credentials() {
     left=$(read_credentials) && [ -z "$left" ]
 }
 
-# Function to replace Claude Code's whole credentials entry: delete it, then write the backup (if any)
-replace_credentials() {
-    delete_credentials || return 1
+# Extract only the Claude login, including from older backups containing MCP OAuth.
+# Empty credentials mean logged out; malformed data must fail before any write.
+claude_login_only() {
+    local content="$1"
+    [ -n "$content" ] || content='{}'
+    printf '%s' "$content" | jq -cse '
+        if length != 1 or (.[0] | type) != "object" then error("invalid credentials")
+        else .[0] |
+            if .claudeAiOauth == null then {}
+            elif (.claudeAiOauth | type) != "object" then error("invalid Claude login")
+            else {claudeAiOauth} end
+        end
+    ' 2>/dev/null
+}
 
-    if [ -n "$1" ]; then
-        write_credentials "$1"
+# Keep live MCP OAuth and all unrelated fields; switch only the Claude login.
+# Updating in place also retains the existing Keychain access rules.
+replace_credentials() {
+    local login current merged
+    if ! login=$(claude_login_only "$1") \
+        || ! current=$(read_credentials); then
+        echo -e "${RED}Error: Could not read the Claude login; credentials unchanged${NC}"
+        return 1
+    fi
+    [ -n "$current" ] || current='{}'
+    if ! merged=$(printf '%s\n%s\n' "$current" "$login" | jq -cse '
+        if length != 2 or (.[0] | type) != "object" then error("invalid credentials")
+        else (.[0] | del(.claudeAiOauth)) + .[1] end
+    ' 2>/dev/null); then
+        echo -e "${RED}Error: Invalid current credentials; credentials unchanged${NC}"
+        return 1
+    fi
+
+    if [ "$merged" = '{}' ]; then
+        delete_credentials
+    else
+        write_credentials "$merged"
     fi
 }
 
@@ -310,6 +402,14 @@ write_backup() {
     local name="$1"
     local kind="$2"
     local content="$3"
+
+    if [ "$kind" = credentials ]; then
+        if ! content=$(claude_login_only "$content"); then
+            echo -e "${RED}Error: Invalid credentials; backup unchanged${NC}"
+            return 1
+        fi
+        [ "$content" != '{}' ] || content=''
+    fi
 
     if [ -z "$content" ]; then
         delete_backup "$name" "$kind"
@@ -434,7 +534,7 @@ unstash_paths() {
     done
 }
 
-# Function to back up the current account (credentials + account-bound keys) as <name>.
+# Function to back up the current account (Claude login + account-bound keys) as <name>.
 # Folders stay in place while the account is active; they are only moved when switching away
 save_account() {
     local name="$1"
@@ -693,7 +793,7 @@ use_command() {
     fi
 
     ask_password
-    confirm_not_running
+    stop_claude || return 1
     note_device_keys
     backup_active
     load_account "$name"
@@ -717,11 +817,11 @@ new_command() {
 
     local active=$(active_account)
     ask_password
-    confirm_not_running
+    stop_claude || return 1
     note_device_keys
     backup_active
 
-    if ! delete_credentials || ! reset_account_state; then
+    if ! replace_credentials '' || ! reset_account_state; then
         echo -e "${RED}Error: Failed to start a new account${NC}"
         return 1
     fi

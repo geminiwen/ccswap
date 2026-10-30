@@ -55,7 +55,8 @@ _ccacc_shell_words() {
                     '$'|'`') return 1 ;;
                     '\')
                         i=$((i+1)); [ "$i" -lt "${#input}" ] || return 1
-                        next=${input:i:1}; raw=$raw$next
+                        next=${input:i:1}; [ "$next" != $'\n' ] || return 1
+                        raw=$raw$next
                         case "$next" in '$'|'`'|'"'|'\') value=$value$next ;; *) value=$value\\$next ;; esac
                         ;;
                     *) value=$value$char ;;
@@ -190,7 +191,7 @@ ccacc_install_shell_hook() (
     # Subshell contains umask, temporaries and parser variables, not the user's
     # shell. Never source an rc file or evaluate an alias in this process.
     local script=${1:-} account=${2:-} zone=${3:-} private probe original='' missing=0
-    local quoted_script rc path tmp stage index=0
+    local quoted_script rc path tmp stage startup_directory index=0
     local -a rcs stages _ccacc_raw _ccacc_value
     umask 077
     command -v jq >/dev/null 2>&1 || { _ccacc_shell_error 'jq is required'; return 1; }
@@ -208,8 +209,35 @@ ccacc_install_shell_hook() (
     for path in "$private/managed.json" "$private/original-alias.json" "$private/hook.sh"; do
         _ccacc_shell_path "$path" file || { _ccacc_shell_error 'unsafe private hook target'; return 1; }
     done
+    # Refresh shell context on every install, even when the saved original
+    # alias must stay untouched. In Zsh, .zshenv can set ZDOTDIR without export.
+    probe=$(probe_alias claude) || { _ccacc_shell_error 'alias probe failed'; return 1; }
+    printf '%s' "$probe" | jq -se 'length == 1 and (.[0] | type == "object" and (
+        (.missing == true and (has("definition") | not)) or
+        ((has("missing") | not) and (.definition | type == "string") and
+         (.definition | length > 0) and ((.definition | contains("\u0000")) | not))))' >/dev/null || {
+        _ccacc_shell_error 'malformed alias probe'; return 1;
+    }
     case "${SHELL##*/}" in
-        zsh) rcs=("${ZDOTDIR:-$HOME}/.zshrc") ;;
+        zsh)
+            if printf '%s' "$probe" | jq -se '.[0] | has("startupDirectory")' >/dev/null; then
+                printf '%s' "$probe" | jq -se '.[0].startupDirectory | select(type == "string")
+                    | length > 0 and (contains("\u0000") | not) and
+                      (contains("\n") | not) and (contains("\r") | not)' >/dev/null || {
+                    _ccacc_shell_error 'malformed probed Zsh startup directory'; return 1;
+                }
+                startup_directory=$(printf '%s' "$probe" | jq -srj '.[0].startupDirectory') || return 1
+            else startup_directory=${ZDOTDIR:-$HOME}; fi
+            case "$startup_directory" in *$'\n'*|*$'\r'*)
+                _ccacc_shell_error 'malformed Zsh startup directory'; return 1 ;;
+            esac
+            _ccacc_shell_path "$startup_directory" dir && [ -d "$startup_directory" ] || {
+                _ccacc_shell_error 'Zsh startup directory is unsafe or missing'; return 1;
+            }
+            # .zlogin runs after .zshrc in interactive login shells, so both
+            # files need the hook at the end to override earlier fixed aliases.
+            rcs=("$startup_directory/.zshrc" "$startup_directory/.zlogin")
+            ;;
         bash)
             rcs=("$HOME/.bashrc")
             # Bash reads the first existing login file, even if it is empty.
@@ -241,7 +269,6 @@ ccacc_install_shell_hook() (
         [ ! -e "$private/original-alias.json" ] && [ ! -e "$private/hook.sh" ] || {
             _ccacc_shell_error 'orphaned private hook files require manual review'; return 1;
         }
-        probe=$(probe_alias claude) || { _ccacc_shell_error 'alias probe failed'; return 1; }
         if printf '%s' "$probe" | jq -se 'length == 1 and (.[0] | type == "object" and .missing == true and (has("definition") | not))' >/dev/null; then missing=1
         else original=$probe; fi
     fi

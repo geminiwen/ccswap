@@ -63,7 +63,7 @@ class ShellHookTests(unittest.TestCase):
         ))
         return self.shell(
             f"set -e\nsource {shlex.quote(str(LIBRARY))}\n"
-            'probe_alias() { [ "$1" = claude ] || return 1; cat "$HOME/probe.json"; }\n'
+            'probe_alias() { [ "$1" = claude ] || return 1; printf "probe\\n" >> "$HOME/probe.calls"; cat "$HOME/probe.json"; }\n'
             'valid_timezone() { case "$1" in Australia/Sydney|Asia/Tokyo) return 0;; *) return 1;; esac; }\n'
             f"ccacc_install_shell_hook {shlex.quote(str(self.ccacc))} account {shlex.quote(zone)}\n",
             check=check,
@@ -218,7 +218,139 @@ class ShellHookTests(unittest.TestCase):
     def test_zsh_default_rc(self):
         self.install(shell="zsh")
         self.assertTrue((self.home / ".zshrc").exists())
+        self.assertTrue((self.home / ".zlogin").exists())
         self.assertFalse((self.home / ".bashrc").exists())
+
+    def test_zsh_effective_startup_directory_overrides_environment_and_refreshes(self):
+        inherited = self.home / "inherited directory"
+        inherited.mkdir()
+        self.env["ZDOTDIR"] = str(inherited)
+        original = "KEEP=original claude --retained"
+        for name, definition in (("effective first", original), ("effective second", "__ccacc_launch")):
+            dot = self.home / name
+            dot.mkdir()
+            self.install(shell="zsh", raw_probe=json.dumps({
+                "definition": definition, "startupDirectory": str(dot),
+            }))
+            for filename in (".zshrc", ".zlogin"):
+                self.assertTrue((dot / filename).exists())
+                self.assertFalse((inherited / filename).exists())
+        self.assertEqual((self.home / "probe.calls").read_text().count("probe\n"), 2)
+        self.assertEqual(json.loads((self.private / "original-alias.json").read_text())["definition"], original)
+
+    def test_zsh_login_override_repeated_source_and_unchanged_files(self):
+        dot = self.home / "login dot's"
+        dot.mkdir()
+        self.env["ZDOTDIR"] = str(dot)
+        prefixes = {
+            ".zshrc": b"# zsh caf\xc3\xa9\nexport UNRELATED=retained",
+            ".zlogin": b"# later login alias\nalias claude='BROWSER=open TZ=Old claude --bad-login'\n",
+        }
+        for filename, content in prefixes.items():
+            path = dot / filename
+            path.write_bytes(content)
+            path.chmod(0o640)
+        self.install("KEEP=original claude --retained", shell="zsh")
+        snapshots = {}
+        for filename, content in prefixes.items():
+            path = dot / filename
+            self.assertTrue(path.read_bytes().startswith(content))
+            self.assertEqual(path.read_bytes().count(b"# >>> ccacc shell hook >>>"), 1)
+            self.assertTrue(path.read_bytes().endswith(b"# <<< ccacc shell hook <<<\n"))
+            os.utime(path, ns=(2_000_000_000, 2_000_000_000))
+            snapshots[path] = (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
+        self.install("__ccacc_launch", shell="zsh", zone="Asia/Tokyo")
+        for path, (content, mtime, inode) in snapshots.items():
+            self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(path.stat().st_mtime_ns, mtime)
+            self.assertEqual(path.stat().st_ino, inode)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+        source = 'source "$ZDOTDIR/.zshrc"\nsource "$ZDOTDIR/.zlogin"\n' * 2
+        self.shell(source, "zsh")
+        self.assertFalse(self.log.exists())
+        self.assertFalse((self.home / "timezone.calls").exists())
+        self.zone.write_text("Asia/Tokyo\n")
+        self.shell(source + "eval 'claude --login'\n", "zsh")
+        calls = self.log.read_text()
+        for expected in ("BROWSER=false", "TZ=Asia/Tokyo", "KEEP=original", "ARG=--retained", "ARG=--login"):
+            self.assertEqual(calls.count(expected), 1)
+        self.assertNotIn("--bad-login", calls)
+
+    def test_zsh_unexported_zdotdir_real_fixture_login(self):
+        dot = self.home / "unexported dot's"
+        dot.mkdir()
+        (self.home / ".zshenv").write_text("ZDOTDIR=" + shlex.quote(str(dot)) + "\n")
+        (dot / ".zshrc").write_text("# isolated interactive fixture\n")
+        (dot / ".zlogin").write_text("alias claude='BROWSER=open TZ=Old claude --bad-login'\n")
+        # -d skips optional global rc files. The isolated HOME/environment
+        # direct all user startup reads to these fixtures.
+        def login(code):
+            result = subprocess.run([shutil.which("zsh"), "-d", "-ilc", code], env=self.env,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            return result
+        result = login('[[ ${(t)ZDOTDIR} != *export* ]] || exit 11\n'
+                       'command jq -cn --arg directory "$ZDOTDIR" '
+                       "'{missing:true,startupDirectory:$directory}'")
+        self.assertNotIn("ZDOTDIR", self.env)
+        self.assertEqual(json.loads(result.stdout)["startupDirectory"], str(dot))
+        self.install(shell="zsh", raw_probe=result.stdout)
+        self.assertFalse((self.home / ".zshrc").exists())
+        self.assertFalse((self.home / ".zlogin").exists())
+        login("claude --fixture\n")
+        self.assertIn("BROWSER=false", self.log.read_text())
+        self.assertIn("TZ=Australia/Sydney", self.log.read_text())
+        self.assertIn("ARG=--fixture", self.log.read_text())
+        self.assertNotIn("--bad-login", self.log.read_text())
+
+    def test_invalid_probed_zsh_startup_directory_does_not_mutate(self):
+        linked = self.home / "linked"
+        linked.symlink_to(self.bin, target_is_directory=True)
+        for directory in (None, 3, "", "relative", str(self.home) + "\n", str(self.home) + "\x00",
+                          str(linked), str(self.home / "absent")):
+            result = self.install(shell="zsh", check=False, raw_probe=json.dumps({
+                "missing": True, "startupDirectory": directory,
+            }))
+            self.assertNotEqual(result.returncode, 0, repr(directory))
+            self.assertFalse(self.private.exists())
+            self.assertFalse((self.home / ".zshrc").exists())
+            self.assertFalse((self.home / ".zlogin").exists())
+        self.install("KEEP=original claude --retained", shell="zsh")
+        paths = (self.home / ".zshrc", self.home / ".zlogin", self.private / "hook.sh",
+                 self.private / "managed.json", self.private / "original-alias.json")
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino) for path in paths}
+        result = self.install(shell="zsh", check=False, raw_probe=json.dumps({
+            "definition": "__ccacc_launch", "startupDirectory": "relative",
+        }))
+        self.assertNotEqual(result.returncode, 0)
+        for path, expected in before.items():
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino), expected)
+
+    def test_unsafe_zlogin_leaves_zshrc_and_private_state_untouched(self):
+        rc = self.home / ".zshrc"
+        rc.write_bytes(b"# unchanged zshrc\n")
+        login = self.home / ".zlogin"
+        login.symlink_to(rc)
+        self.assertNotEqual(self.install(shell="zsh", check=False).returncode, 0)
+        self.assertEqual(rc.read_bytes(), b"# unchanged zshrc\n")
+        self.assertFalse(self.private.exists())
+
+    def test_double_quoted_backslash_newline_rejected_before_mutation(self):
+        paths = (self.home / ".bashrc", self.home / ".bash_profile")
+        for path in paths:
+            path.write_bytes(b"# original without trailing newline")
+            path.chmod(0o640)
+            os.utime(path, ns=(3_000_000_000, 3_000_000_000))
+        for definition in ('claude "first\\\nsecond"', 'KEEP="first\\\nsecond" claude',
+                           'claude first\\\nsecond'):
+            result = self.install(definition, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsupported", result.stderr)
+            self.assertFalse(self.private.exists())
+            for path in paths:
+                self.assertEqual(path.read_bytes(), b"# original without trailing newline")
+                self.assertEqual(path.stat().st_mtime_ns, 3_000_000_000)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
 
     def test_unsupported_aliases_leave_rc_and_files_untouched(self):
         rc = self.home / ".bashrc"

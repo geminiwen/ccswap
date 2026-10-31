@@ -26,6 +26,7 @@ and Zsh and requires a regular absolute installation path without symlink
 components. It also works when `ccacc` is not executable: run `bash /path/to/ccacc`.
 
 ```bash
+ccacc install                              # Install once, before any account setup
 ccacc save personal                         # Choose timezone on first setup; optionally back up its alias
 ccacc save work --alias work-claude         # Select a different alias to back up
 ccacc save work --timezone Australia/Sydney # Choose the timezone explicitly
@@ -34,8 +35,6 @@ ccacc alias work work-claude                # Back up the alias without saving c
 ccacc timezone work                        # Print the saved timezone
 ccacc timezone                             # Default to the active saved account
 ccacc timezone work Australia/Sydney        # Set timezone metadata only
-ccacc configure-shell work                  # Install/repair the hook using saved TZ
-ccacc configure-shell                       # Default to the active saved account
 ```
 
 `save <name>` and `new <name>` accept `--alias <alias-name>` and `--timezone <ZONE>`
@@ -47,9 +46,9 @@ There is no default or automatic detection from aliases, environment `TZ`, syste
 settings or account names. Invalid input, an empty choice or EOF fails immediately
 before passwords, credentials, process shutdown, active-account changes or metadata
 writes. Invalid, missing, duplicate and unknown flags also fail before any writes.
-Save/new/use also validate the supported shell, adjacent companion, startup paths,
-managed blocks and original Claude alias without writes before accessing passwords,
-stopping processes or changing credentials. `use` requires a valid saved timezone;
+Save/new/use first check the existing shell installation without writing it, before
+any timezone prompts, passwords, metadata, process shutdown or credential changes.
+Missing, corrupt or stale installations fail with `ccacc install` instructions. `use` requires a valid saved timezone;
 set one with `ccacc timezone <account> <ZONE>` before switching an older account.
 
 Resolved timezones are stored independently as one zone per private
@@ -63,7 +62,7 @@ using `$SHELL` (Bash when unset). The shell's normal startup files run during
 that query; the captured alias body is never evaluated or executed. Shell
 startup/logout output is ignored. Missing aliases and failed probes leave any
 existing alias backup unchanged. `ccacc alias` skips unsupported shells with a warning;
-save/new/use fail if their required shell configuration cannot be prepared.
+save/new/use fail if their required shell installation is invalid.
 An absent alias creates no alias-definition backup; save/new can still proceed
 with a saved timezone, `--timezone`, or a valid prompted choice.
 
@@ -93,15 +92,25 @@ returns nonzero with no stdout. `ccacc rm <account>` also removes that account's
 independent timezone metadata; metadata alone does not make an account appear
 in `ls` or `current`.
 
-After a successful `save`, `new`, or `use` (including an already-active account),
-ccacc installs the dynamic Claude shell hook. The workflow is: read the existing
-alias, store the selected account timezone, install the hook, then **source the
-printed hook path once in your current shell**. A child `ccacc` process cannot
-update its calling shell. New interactive terminals load the hook automatically.
-`configure-shell [account]` repeats installation without passwords, credential
-access, process shutdown, or account switching; it validates the saved TZ first.
-Missing companions and installation failures return nonzero with an error, so an
-account operation may have completed even if its subsequent hook installation failed.
+Run `ccacc install` explicitly, then **source the printed hook path once in your
+current shell**. Installation requires only `jq`, Bash or Zsh, the adjacent companion
+and safe startup paths. It works on a fresh HOME with no Claude config, account,
+active marker, timezone, master password or credentials. It never asks for a timezone;
+choose and save each account timezone when first running `save` or `new`.
+A child `ccacc` process cannot update its calling shell. New interactive terminals
+load the hook automatically. `configure-shell [account]` is a deprecated explicit
+alias for `install`; its optional account argument is ignored.
+
+`save`, `new` and `use` (including an already-active account) only check the hook,
+private record, required original-alias backup and managed source entries in the
+actual startup files. They never install or repair hook configuration. Valid
+installations work with read-only startup files. Moved deployments, changed Zsh
+startup directories, shadowed Bash login files, missing entries and modified hook
+bytes require an explicit `ccacc install`. Existing valid version-1 records are
+recognized without writes; explicit installation upgrades their records.
+Zsh checks initialize a shell to discover its effective startup directory; Bash
+checks read its known startup paths directly. Hook bytes are validated before
+the Zsh startup probe can source them.
 
 The hook reads `ccacc timezone` on every Claude launch, so switching the active
 account updates TZ in an already-sourced shell. It also sets `BROWSER=false`.
@@ -116,7 +125,7 @@ The generated hook and original-alias record are private (directory `700`, files
 `600`). Installation adds one managed source block at the end of Bash's `.bashrc`
 and selected login file, or Zsh's `.zshrc` and `.zlogin`. Zsh's actual initialized
 `${ZDOTDIR:-$HOME}` is used even when `.zshenv` sets `ZDOTDIR` without exporting it.
-Repeat installation preserves unchanged startup-file bytes and mtimes. Sourcing
+Repeat installation preserves unchanged startup/hook/record bytes, mtimes and inodes. Sourcing
 the hook defines the launcher without starting Claude.
 
 Run the fixture-only regressions from the repository root:

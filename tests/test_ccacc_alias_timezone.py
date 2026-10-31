@@ -71,8 +71,7 @@ exec /bin/{shell} {'--noprofile --norc' if shell == 'bash' else '-f'} -c '. "$AL
     def run_harness(self, body, stdin="", success=True):
         mocks = '''
 ask_password() { MASTER_PASSWORD=fixture-only; }
-configure_shell_preflight() { :; }
-configure_shell_command() { :; }
+require_shell_hook() { :; }
 save_account() { printf '{"userID":"fixture-id"}' > "$ACCOUNTS_DIR/$1.json"; }
 setup_surge() { :; }
 apply_surge() { :; }

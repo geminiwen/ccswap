@@ -40,8 +40,7 @@ keychain_write() {
     printf '%s' "$3" > "$STATE"
 }
 ask_password() { :; }
-configure_shell_preflight() { :; }
-configure_shell_command() { :; }
+require_shell_hook() { :; }
 stop_claude() { :; }
 note_device_keys() { :; }
 setup_surge() { :; }

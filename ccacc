@@ -97,8 +97,9 @@ Commands:
   timezone [name]       Print the saved TZ only (defaults to the active account)
   timezone <name> <ZONE>
                         Set the account timezone without accessing credentials
+  install               Install/repair the dynamic Claude shell hook (no account needed)
   configure-shell [name]
-                        Install the dynamic Claude shell hook using the saved TZ
+                        Deprecated explicit alias for install; account is ignored
   use <name>            Back up the active account, then switch to <name>
   new <name> [--alias <alias-name>] [--timezone <ZONE>]
                         Back up the active account, then start <name> like a fresh install
@@ -117,6 +118,7 @@ Login backups are encrypted with one master password, asked once per save/use/ne
 Folders are moved, not copied, so switching is instant.
 With Surge installed, save/new ask which Surge policies the account uses and use applies them;
 without Surge no policy selection is asked.
+Run '$SCRIPT_NAME install' once before save/new/use; these commands only check setup.
 Save/new reuse a valid saved timezone or accept explicit --timezone <ZONE>.
 First setup requires a numbered timezone choice or custom IANA entry, with no default.
 Invalid or unanswered choices fail before account changes. Aliases never choose TZ.
@@ -127,6 +129,7 @@ Switching stops all Claude Code
 processes owned by the current user, including those using another config dir.
 
 Examples:
+  $SCRIPT_NAME install
   $SCRIPT_NAME save personal
   $SCRIPT_NAME new work
   $SCRIPT_NAME use personal
@@ -328,35 +331,26 @@ load_shell_companion() {
     }
     # The library defines functions only; sourcing it never launches Claude.
     . "$library" || { echo "Error: Could not load shell companion: $library" >&2; return 1; }
-    declare -F ccacc_install_shell_hook >/dev/null && declare -F ccacc_preflight_shell_hook >/dev/null || {
-        echo "Error: Invalid ccacc_shell.sh companion: installer or preflight API is missing" >&2; return 1;
+    declare -F ccacc_install_shell_hook >/dev/null && declare -F ccacc_check_shell_hook >/dev/null || {
+        echo "Error: Invalid ccacc_shell.sh companion: installer or installed-check API is missing" >&2; return 1;
     }
 }
 
-# Complete library validation without writes, before passwords or account moves.
-configure_shell_preflight() {
-    local name="$1" zone="$2" SHELL="${SHELL:-/bin/bash}"
+# Read-only installation check before prompts, passwords or account changes.
+require_shell_hook() {
+    local SHELL="${SHELL:-/bin/bash}"
     load_shell_companion || return 1
-    if ! ccacc_preflight_shell_hook "$CCACC_ABSOLUTE_SCRIPT" "$name" "$zone"; then
-        echo "Error: Shell configuration preflight failed; account unchanged" >&2
+    if ! ccacc_check_shell_hook "$CCACC_ABSOLUTE_SCRIPT"; then
+        echo "Error: Shell hook is not installed correctly; run '$SCRIPT_NAME install' first; account unchanged" >&2
         return 1
     fi
 }
 
-# Metadata and startup files only: deliberately bypass check_ready and passwords.
+# Explicit bootstrap: no account, timezone, config or credentials are required.
 configure_shell_command() {
-    local name="${1:-}" zone SHELL="${SHELL:-/bin/bash}"
-    if [ -z "$name" ]; then name=$(active_account); fi
-    check_name "$name" >&2 || return 1
-    zone=$(timezone_command "$name") || {
-        echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME timezone $name <ZONE>' first" >&2
-        return 1
-    }
+    local SHELL="${SHELL:-/bin/bash}"
     load_shell_companion || return 1
-    if ! ccacc_install_shell_hook "$CCACC_ABSOLUTE_SCRIPT" "$name" "$zone"; then
-        echo "Error: Shell hook installation failed; run '$SCRIPT_NAME configure-shell $name' after fixing the error" >&2
-        return 1
-    fi
+    ccacc_install_shell_hook "$CCACC_ABSOLUTE_SCRIPT"
 }
 
 # Preflight only: validate every flag and resolve the required TZ before writes,
@@ -1013,8 +1007,8 @@ show_current() {
 # Function to save the current account as <name>
 save_command() {
     local name="${1:-}"
+    require_shell_hook || return 1
     prepare_account_metadata "$@" || return 1
-    configure_shell_preflight "$name" "$PREPARED_TIMEZONE" || return 1
     check_ready
     ask_password
     save_prepared_metadata "$name" || return 1
@@ -1022,7 +1016,6 @@ save_command() {
     save_account "$name" || return 1
     echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
-    configure_shell_command "$name" || return 1
 
     if [ ! -f "$ACCOUNTS_DIR/${name}.surge" ]; then
         setup_surge "$name"
@@ -1032,7 +1025,8 @@ save_command() {
 
 # Function to switch to a saved account
 use_command() {
-    local name="$1" zone
+    local name="${1:-}" zone
+    require_shell_hook || return 1
     check_name "$name" || return 1
     if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
         echo -e "${RED}Error: Account '${name}' not found${NC}"
@@ -1044,14 +1038,12 @@ use_command() {
         echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME timezone $name <ZONE>' first" >&2
         return 1
     }
-    configure_shell_preflight "$name" "$zone" || return 1
     check_ready
 
     local active=$(active_account)
     if [ "$active" = "$name" ]; then
         echo -e "${YELLOW}'${name}' is already active${NC}"
-        configure_shell_command "$name"
-        return $?
+        return 0
     fi
 
     ask_password
@@ -1063,13 +1055,13 @@ use_command() {
     unstash_paths "$name"
     echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Switched to Claude account: ${name} ($(current_email))${NC}"
-    configure_shell_command "$name" || return 1
     apply_surge "$name"
 }
 
 # Function to start a new account like a fresh install: logged out, new IDs, no history
 new_command() {
     local name="${1:-}"
+    require_shell_hook || return 1
     check_name "$name" || return 1
 
     if [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
@@ -1077,7 +1069,6 @@ new_command() {
         return 1
     fi
     prepare_account_metadata "$@" || return 1
-    configure_shell_preflight "$name" "$PREPARED_TIMEZONE" || return 1
     check_ready
 
     local active=$(active_account)
@@ -1096,7 +1087,6 @@ new_command() {
     echo "$name" > "$ACTIVE_FILE"
 
     echo -e "${GREEN}Started new Claude account: ${name}${NC}"
-    configure_shell_command "$name" || return 1
 
     # Before the login, so it already goes out through the account's own exit
     setup_surge "$name"
@@ -1184,9 +1174,14 @@ main() {
                 timezone_command "${2:-}"
             fi
             ;;
+        install)
+            [ "$#" -eq 1 ] || { echo "Error: install accepts no arguments" >&2; return 1; }
+            configure_shell_command
+            ;;
         configure-shell)
             [ "$#" -le 2 ] || { echo "Error: configure-shell accepts at most one account" >&2; return 1; }
-            configure_shell_command "${2:-}"
+            echo "Warning: configure-shell is deprecated; use '$SCRIPT_NAME install' (account argument ignored)" >&2
+            configure_shell_command
             ;;
         use)
             use_command "$2"

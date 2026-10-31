@@ -56,7 +56,7 @@ class ShellHookTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
-    def install(self, definition=None, shell="bash", check=True, raw_probe=None, zone="Australia/Sydney"):
+    def install(self, definition=None, shell="bash", check=True, raw_probe=None):
         self.env["SHELL"] = f"/bin/{shell}"
         self.probe.write_text(raw_probe if raw_probe is not None else json.dumps(
             {"missing": True} if definition is None else {"definition": definition}
@@ -64,8 +64,7 @@ class ShellHookTests(unittest.TestCase):
         return self.shell(
             f"set -e\nsource {shlex.quote(str(LIBRARY))}\n"
             'probe_alias() { [ "$1" = claude ] || return 1; printf "probe\\n" >> "$HOME/probe.calls"; cat "$HOME/probe.json"; }\n'
-            'valid_timezone() { case "$1" in Australia/Sydney|Asia/Tokyo) return 0;; *) return 1;; esac; }\n'
-            f"ccacc_install_shell_hook {shlex.quote(str(self.ccacc))} account {shlex.quote(zone)}\n",
+            f"ccacc_install_shell_hook {shlex.quote(str(self.ccacc))}\n",
             check=check,
         )
 
@@ -81,8 +80,7 @@ class ShellHookTests(unittest.TestCase):
             result = self.shell(
                 f"source {shlex.quote(str(LIBRARY))}\n"
                 'probe_alias() { cat "$HOME/probe.json"; }\n'
-                'valid_timezone() { [ "$1" = Australia/Sydney ]; }\n'
-                f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))} account Australia/Sydney\n",
+                f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))}\n",
                 check=False,
             )
             self.assertEqual(result.returncode == 0, success)
@@ -103,8 +101,7 @@ class ShellHookTests(unittest.TestCase):
         result = self.shell(
             f"source {shlex.quote(str(LIBRARY))}\n"
             'probe_alias() { cat "$HOME/probe.json"; }\n'
-            'valid_timezone() { [ "$1" = Australia/Sydney ]; }\n'
-            f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))} account Australia/Sydney\n",
+            f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))}\n",
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
@@ -298,7 +295,7 @@ class ShellHookTests(unittest.TestCase):
             self.assertTrue(path.read_bytes().endswith(b"# <<< ccacc shell hook <<<\n"))
             os.utime(path, ns=(2_000_000_000, 2_000_000_000))
             snapshots[path] = (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino)
-        self.install("__ccacc_launch", shell="zsh", zone="Asia/Tokyo")
+        self.install("__ccacc_launch", shell="zsh")
         for path, (content, mtime, inode) in snapshots.items():
             self.assertEqual(path.read_bytes(), content)
             self.assertEqual(path.stat().st_mtime_ns, mtime)
@@ -452,12 +449,11 @@ class ShellHookTests(unittest.TestCase):
         self.assertNotEqual(self.install(check=False).returncode, 0)
         self.assertEqual((self.home / ".bashrc").read_bytes(), before)
 
-    def test_unknown_shell_missing_zdotdir_invalid_install_timezone(self):
+    def test_unknown_shell_and_missing_zdotdir(self):
         self.assertNotEqual(self.install(shell="fish", check=False).returncode, 0)
         self.assertFalse(self.private.exists())
         self.env["ZDOTDIR"] = str(self.home / "absent")
         self.assertNotEqual(self.install(shell="zsh", check=False).returncode, 0)
-        self.assertNotEqual(self.install(zone="", check=False).returncode, 0)
         self.assertFalse(self.private.exists())
 
 

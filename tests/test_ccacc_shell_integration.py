@@ -160,7 +160,7 @@ apply_surge() { :; }
                 _, rcs = self.startup(shell, definition, zdotdir=shell == "zsh")
                 self.assertEqual(self.probe()["definition"], definition)
                 result = self.cli("configure-shell")
-                self.assertIn("sydney (Australia/Sydney)", result.stdout)
+                self.assertIn("Claude shell hook installed.", result.stdout)
                 self.assertIn("In your current shell, run: source", result.stdout)
                 self.assertIn("New interactive terminals", result.stdout)
                 self.assertFalse(self.launches.exists())
@@ -242,24 +242,27 @@ apply_surge() { :; }
                 self.assertEqual(before, {path.relative_to(self.home): path.read_bytes()
                                           for path in self.home.rglob("*") if path.is_file()})
 
-    def test_save_new_use_and_same_account_use_install_hook(self):
-        self.startup("bash", "TZ=UTC claude --model fixture")
-        result = self.harness("main save sydney --timezone Australia/Sydney")
-        self.assertIn("Claude shell hook installed", result.stdout)
-        original = (self.home / ".ccacc-shell/original-alias.json").read_bytes()
-        hook = self.home / ".ccacc-shell/hook.sh"
-        hook.unlink()  # Show the same-account fast path actually repairs setup.
-        result = self.harness("main use sydney")
-        self.assertIn("already active", result.stdout)
-        self.assertIn("Claude shell hook installed", result.stdout)
-        self.assertTrue(hook.exists())
-        self.harness("main use tokyo")
-        self.assertEqual((self.accounts / ".active").read_text(), "tokyo\n")
-        self.harness("main new fresh --timezone Australia/Sydney")
-        self.assertEqual(self.cli("timezone", "fresh").stdout, "Australia/Sydney\n")
-        self.assertEqual((self.accounts / ".active").read_text(), "fresh\n")
-        self.assertEqual((self.home / ".ccacc-shell/original-alias.json").read_bytes(), original)
-        self.assertFalse(self.launches.exists())
+    def test_installed_operations_are_read_only_even_with_readonly_startup(self):
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                if shell == "zsh":
+                    self.reset_fixture()
+                _, rcs = self.startup(shell, "TZ=UTC claude --model fixture", zdotdir=shell == "zsh")
+                self.cli("install")
+                paths = list(rcs) + list((self.home / ".ccacc-shell").iterdir())
+                for path in rcs:
+                    path.chmod(0o444)
+                before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths}
+                # Already-active use must neither ask for a password nor write hook files.
+                self.harness('ask_password() { return 97; }; use_command sydney')
+                for command in ("save sydney --timezone Australia/Sydney", "use sydney", "use tokyo",
+                                "new fresh --timezone Australia/Sydney"):
+                    result = self.harness("main " + command)
+                    self.assertNotIn("hook installed", result.stdout)
+                    self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                                      for p in paths}, before)
+                self.assertEqual(self.cli("timezone", "fresh").stdout, "Australia/Sydney\n")
+                self.assertFalse(self.launches.exists())
 
     def test_missing_library_and_unsupported_shell_fail_before_account_operations(self):
         self.startup("bash", "TZ=UTC claude")
@@ -293,45 +296,146 @@ apply_surge() { :; }
                                              path.stat().st_mode & 0o777)
                 for path in self.home.rglob("*") if path.is_file()}
 
-    def test_full_preflight_is_read_only_and_blocks_unsupported_alias_before_switch(self):
-        self.startup("bash", "TZ=UTC claude --model fixture")
+    def test_fresh_install_without_any_claude_state_and_idempotence(self):
+        shutil.rmtree(self.home / ".claude")
+        (self.home / ".claude.json").unlink()
+        self.assertEqual(list(self.home.iterdir()), [])
+        self.env["TZ"] = "Invalid/Not_A_Zone"
+        self.cli("help")
+        self.cli("--version")
+        self.cli("timezone", success=False)
+        self.cli("install")
+        self.assertFalse((self.home / ".claude").exists())
+        self.assertFalse((self.home / ".claude.json").exists())
         before = self.home_snapshot()
-        self.harness("configure_shell_preflight tokyo Asia/Tokyo")
+        inodes = {p: p.stat().st_ino for p in self.home.rglob("*") if p.is_file()}
+        self.cli("install")
         self.assertEqual(self.home_snapshot(), before)
-        self.assertFalse((self.home / ".ccacc-shell").exists())
-        # The original body is data even when it contains command substitution.
-        (self.home / ".bashrc").write_text(
-            "builtin alias " + shlex.quote('claude=TZ="$(touch should-not-run)" claude') + "\n")
-        credentials = self.home / ".claude/.credentials.json"
-        credentials.write_text("fixture credential sentinel")
-        before = self.home_snapshot()
-        for command in ("use tokyo", "save next --timezone UTC", "new next --timezone UTC"):
-            result = self.harness("main " + command, success=False)
-            self.assertIn("unsupported Claude alias", result.stderr)
-            self.assertIn("preflight failed; account unchanged", result.stderr)
-            self.assertEqual(self.home_snapshot(), before)
-            self.assertFalse((self.home / "operations").exists())
-            self.assertFalse((self.home / ".ccacc-shell").exists())
-        self.cli("configure-shell", "tokyo", success=False)
+        self.assertEqual({p: p.stat().st_ino for p in inodes}, inodes)
+        self.harness("require_shell_hook")
         self.assertEqual(self.home_snapshot(), before)
+        self.cli("timezone", success=False)
+        self.assertFalse(self.launches.exists())
 
-    def test_configure_shell_rejects_missing_or_invalid_tz_without_credentials(self):
-        self.startup("bash")
-        for name in ("missing", "sydney"):
-            if name == "sydney":
-                (self.accounts / ".timezones/sydney").write_text("Invalid/Zone\n")
-            result = self.cli("configure-shell", name, success=False)
-            self.assertIn("No valid saved timezone", result.stderr)
-            self.assertFalse((self.home / ".ccacc-shell").exists())
-        self.cli("configure-shell", "sydney", "extra", success=False)
+    def test_missing_or_corrupt_install_blocks_direct_and_cli_operations(self):
+        self.startup("bash", "TZ=UTC claude --model fixture")
+        # Inputs deliberately omit TZ: rejection must precede the setup menu.
+        commands = ("save_command next", "new_command next", "use_command sydney",
+                    "use_command tokyo", "main save next", "main new next", "main use sydney",
+                    "main use tokyo")
+        def blocked():
+            before = self.home_snapshot()
+            for command in commands:
+                result = self.harness(command, success=False)
+                self.assertIn("ccacc install", result.stderr)
+                self.assertNotIn("Choose timezone", result.stderr)
+                self.assertEqual(self.home_snapshot(), before)
+                self.assertFalse((self.home / "operations").exists())
+            for args in (("save", "next"), ("new", "next"), ("use", "sydney"), ("use", "tokyo")):
+                self.cli(*args, success=False)
+                self.assertEqual(self.home_snapshot(), before)
+        blocked()
+        self.cli("install")
+        private = self.home / ".ccacc-shell"
+        corruptions = (
+            (private / "hook.sh", None),
+            (private / "hook.sh", b"# corrupt\n"),
+            (private / "managed.json", None),
+            (private / "managed.json", b"{}"),
+            (private / "managed.json", b'{"version":2,"originalMissing":true}'),
+            (private / "original-alias.json", None),
+            (private / "original-alias.json", b'{"definition":"claude --changed"}'),
+            (private / "original-alias.json", b'{"definition":7}'),
+            (private / "original-alias.json", b'{"definition":"claude"}\x00'),
+            (self.home / ".bashrc", b"# missing entry\n"),
+            (self.home / ".bash_profile", b"# missing login entry\n"),
+        )
+        for path, content in corruptions:
+            with self.subTest(path=path, content=content):
+                saved = path.read_bytes()
+                if content is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(content)
+                blocked()
+                path.write_bytes(saved)
+        record_path = private / "managed.json"
+        saved_record = record_path.read_bytes()
+        record = json.loads(saved_record)
+        for key, value in (("script", "/stale/ccacc"), ("shell", "zsh"),
+                           ("startupFiles", [str(self.home / ".profile")])):
+            record_path.write_text(json.dumps(dict(record, **{key: value})))
+            blocked()
+        record_path.write_bytes(saved_record)
+        rc = self.home / ".bashrc"
+        saved = rc.read_bytes()
+        for content in (saved + b"alias claude=false\n", saved + saved,
+                        saved.replace(b"hook.sh", b"other.sh")):
+            rc.write_bytes(content)
+            blocked()
+        rc.write_bytes(saved)
+        # A higher-priority Bash login file makes the old entry stale.
+        (self.home / ".bash_profile").rename(self.home / ".profile")
+        (self.home / ".bash_profile").write_text("# shadows .profile\n")
+        blocked()
+
+    def test_legacy_valid_install_is_recognized_and_explicitly_migrated(self):
+        self.startup("bash", "TZ=UTC claude --model fixture")
+        self.cli("install")
+        private = self.home / ".ccacc-shell"
+        (private / "managed.json").write_text('{"version":1,"originalMissing":false}\n')
+        before = self.home_snapshot()
+        self.harness("require_shell_hook")
+        self.assertEqual(self.home_snapshot(), before)
+        preserved = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                     for p in (self.home / ".bashrc", self.home / ".bash_profile", private / "hook.sh")}
+        self.cli("install")
+        self.assertEqual(json.loads((private / "managed.json").read_text())["version"], 2)
+        self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                          for p in preserved}, preserved)
+
+    def test_corrupt_hook_is_not_sourced_by_zsh_installed_check(self):
+        self.startup("zsh", "TZ=UTC claude", zdotdir=True)
+        self.cli("install")
+        hook = self.home / ".ccacc-shell/hook.sh"
+        hook.write_text('printf executed > "$HOME/hook-executed"\n')
+        before = self.home_snapshot()
+        self.harness("use_command sydney", success=False)
+        self.assertEqual(self.home_snapshot(), before)
+        self.assertFalse((self.home / "hook-executed").exists())
+        self.assertFalse((self.home / "operations").exists())
+
+    def test_check_uses_actual_zsh_startup_paths_and_deployment(self):
+        self.startup("zsh", "TZ=UTC claude", zdotdir=True)
+        self.cli("install")
+        before = self.home_snapshot()
+        self.harness("require_shell_hook")
+        self.assertEqual(self.home_snapshot(), before)
+        # The later login entry is required even when .zshrc still loads the hook.
+        login = self.home / "zsh settings/.zlogin"
+        saved_login = login.read_bytes()
+        login.write_text("# missing login entry\n")
+        self.harness("use_command sydney", success=False)
+        self.assertFalse((self.home / "operations").exists())
+        login.write_bytes(saved_login)
+        changed = self.home / "different zsh directory"
+        changed.mkdir()
+        (self.home / ".zshenv").write_text("ZDOTDIR=" + shlex.quote(str(changed)) + "\n")
+        result = self.harness("use_command sydney", success=False)
+        self.assertIn("ccacc install", result.stderr)
+        self.assertFalse((self.home / "operations").exists())
 
     def test_alias_content_stays_out_of_external_jq_arguments(self):
         secret = "fixture-secret-never-an-argv-value"
         definition = f"TOKEN={secret} TZ=Asia/Tokyo claude --model fixture"
-        self.startup("zsh", definition, zdotdir=True)
+        startup, _ = self.startup("zsh", definition, zdotdir=True)
+        for filename in (".zshrc", ".zlogin"):
+            with (startup / filename).open("a") as rc:
+                rc.write("builtin alias " + shlex.quote("work-claude=" + definition) + "\n")
         self.assertEqual(self.probe()["definition"], definition)
         # Exercise raw alias backup through real core paths with an explicit timezone.
-        self.harness("main save captured --alias claude --timezone UTC")
+        self.cli("install")
+        self.harness("main save captured --alias work-claude --timezone UTC")
         backup = json.loads((self.accounts / ".aliases/captured.json").read_text())
         self.assertEqual(backup["definition"], definition)
         self.assertNotIn("env", backup)

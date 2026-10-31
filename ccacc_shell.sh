@@ -1,8 +1,8 @@
 #!/bin/bash
 # Companion to ccacc. Source from Bash; generated hooks support Bash and Zsh.
-# Public API: ccacc_install_shell_hook / ccacc_preflight_shell_hook
-# Arguments: ABSOLUTE_CCACC ACCOUNT VALIDATED_TIMEZONE
-# Requires probe_alias claude (JSON), valid_timezone ZONE, and jq from the caller.
+# Public API: ccacc_install_shell_hook / ccacc_check_shell_hook
+# Arguments: ABSOLUTE_CCACC
+# Requires probe_alias claude (JSON) and jq from the caller.
 # Captured aliases are parsed as literal simple commands, never evaluated.
 
 _ccacc_shell_error() { printf 'ccacc shell hook: %s\n' "$*" >&2; }
@@ -188,18 +188,60 @@ _ccacc_shell_replace() {
     mv -f "$1" "$2"
 }
 
-ccacc_install_shell_hook() (
+_ccacc_shell_hook_text() {
+    quoted_script=$(_ccacc_shell_quote "$script")
+    cat <<HOOK
+# Managed by ccacc. Account timezone is resolved on every launch.
+unalias claude 2>/dev/null || :
+function __ccacc_launch { (
+    __ccacc_tz=\$(command bash $quoted_script timezone) || {
+        printf '%s\\n' 'ccacc: cannot read the active account timezone; configure it before launching Claude' >&2
+        return 1
+    }
+    case "\$__ccacc_tz" in
+        ''|/*|*..*|*[!A-Za-z0-9_+/-]*)
+            printf '%s\\n' 'ccacc: invalid or missing active account timezone' >&2; return 1 ;;
+    esac
+    if [ ! -f "/usr/share/zoneinfo/\$__ccacc_tz" ] && [ ! -f "/var/db/timezone/zoneinfo/\$__ccacc_tz" ]; then
+        printf '%s\\n' 'ccacc: unknown active account timezone' >&2; return 1
+    fi
+    $_ccacc_command
+) }
+alias claude='__ccacc_launch'
+HOOK
+}
+
+_ccacc_shell_probe_context() {
+    if [ "$check_only" = --installed ] && [ "${SHELL##*/}" = bash ]; then
+        probe='{"missing":true}'
+    else
+        probe=$(probe_alias claude) || { _ccacc_shell_error 'alias probe failed'; return 1; }
+    fi
+    printf '%s' "$probe" | jq -se 'length == 1 and (.[0] | type == "object" and (
+        (.missing == true and (has("definition") | not)) or
+        ((has("missing") | not) and (.definition | type == "string") and
+         (.definition | length > 0) and ((.definition | contains("\u0000")) | not))))' >/dev/null || {
+        _ccacc_shell_error 'malformed alias probe'; return 1;
+    }
+}
+
+_ccacc_shell_check_text() {
+    [ -f "$private/hook.sh" ] && _ccacc_shell_read "$private/hook.sh" || {
+        _ccacc_shell_error 'installed hook is missing or unreadable'; return 1;
+    }
+    expected=$(_ccacc_shell_hook_text; printf '.')
+    [ "$_ccacc_content." = "$expected" ] || { _ccacc_shell_error 'installed hook does not match its records'; return 1; }
+}
+
+_ccacc_shell_hook() (
     # Subshell contains umask, temporaries and parser variables, not the user's
     # shell. Never source an rc file or evaluate an alias in this process.
-    local script=${1:-} account=${2:-} zone=${3:-} private probe original='' missing=0
-    local quoted_script rc path tmp stage startup_directory index=0 check_only=${4:-}
+    local script=${1:-} check_only=${2:-} private probe definition original='' missing=0 expected actual record
+    local quoted_script rc path tmp stage startup_directory index=0
     local -a rcs stages _ccacc_raw _ccacc_value
     umask 077
-    [ "$#" -le 4 ] && { [ -z "$check_only" ] || [ "$check_only" = --validate-only ]; } || return 1
+    [ "$#" -le 2 ] && { [ -z "$check_only" ] || [ "$check_only" = --validate-only ] || [ "$check_only" = --installed ]; } || return 1
     command -v jq >/dev/null 2>&1 || { _ccacc_shell_error 'jq is required'; return 1; }
-    [[ "$account" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && valid_timezone "$zone" || {
-        _ccacc_shell_error 'account name and a valid saved account timezone are required'; return 1;
-    }
     _ccacc_shell_path "$script" file && [ -f "$script" ] || {
         _ccacc_shell_error 'ccacc must be an absolute regular file with no symlink components'; return 1;
     }
@@ -211,15 +253,53 @@ ccacc_install_shell_hook() (
     for path in "$private/managed.json" "$private/original-alias.json" "$private/hook.sh"; do
         _ccacc_shell_path "$path" file || { _ccacc_shell_error 'unsafe private hook target'; return 1; }
     done
-    # Refresh shell context on every install, even when the saved original
-    # alias must stay untouched. In Zsh, .zshenv can set ZDOTDIR without export.
-    probe=$(probe_alias claude) || { _ccacc_shell_error 'alias probe failed'; return 1; }
-    printf '%s' "$probe" | jq -se 'length == 1 and (.[0] | type == "object" and (
-        (.missing == true and (has("definition") | not)) or
-        ((has("missing") | not) and (.definition | type == "string") and
-         (.definition | length > 0) and ((.definition | contains("\u0000")) | not))))' >/dev/null || {
-        _ccacc_shell_error 'malformed alias probe'; return 1;
-    }
+    if [ ! -f "$private/managed.json" ] && [ "$check_only" != --installed ]; then
+        _ccacc_shell_probe_context || return 1
+    fi
+    if [ -f "$private/managed.json" ]; then
+        jq -se 'length == 1 and (.[0] | type == "object" and
+            ((.version == 1 and keys == ["originalMissing", "version"]) or .version == 2) and
+            (.originalMissing | type == "boolean"))' "$private/managed.json" >/dev/null || {
+            _ccacc_shell_error 'malformed private hook record'; return 1;
+        }
+        if jq -se '.[0].originalMissing' "$private/managed.json" >/dev/null; then missing=1
+        else
+            [ -f "$private/original-alias.json" ] || { _ccacc_shell_error 'original alias backup is missing'; return 1; }
+            _ccacc_shell_read "$private/original-alias.json" || {
+                _ccacc_shell_error 'unreadable or malformed original alias backup'; return 1;
+            }
+            original=$_ccacc_content
+        fi
+    else
+        [ "$check_only" != --installed ] || { _ccacc_shell_error 'installation record is missing'; return 1; }
+        [ ! -e "$private/original-alias.json" ] && [ ! -e "$private/hook.sh" ] || {
+            _ccacc_shell_error 'orphaned private hook files require manual review'; return 1;
+        }
+        if printf '%s' "$probe" | jq -se 'length == 1 and (.[0] | type == "object" and .missing == true and (has("definition") | not))' >/dev/null; then missing=1
+        else original=$probe; fi
+    fi
+    if [ "$missing" = 1 ]; then
+        [ ! -e "$private/original-alias.json" ] || { _ccacc_shell_error 'unexpected original alias backup'; return 1; }
+        _ccacc_shell_command claude || return 1
+    else
+        printf '%s' "$original" | jq -se 'length == 1 and (.[0] | type == "object" and (.definition | type == "string") and (.definition | length > 0) and ((.definition | contains("\u0000")) | not))' >/dev/null || {
+            _ccacc_shell_error 'malformed alias probe or backup'; return 1;
+        }
+        # Sentinel preserves trailing newlines so malformed commands cannot be
+        # accepted accidentally after command substitution strips them.
+        definition=$(printf '%s' "$original" | jq -srj '.[0].definition'; printf '.') || return 1
+        definition=${definition%.}
+        _ccacc_shell_command "$definition" || {
+            _ccacc_shell_error 'unsupported Claude alias; use literal assignments, env, or _op_agent env with a claude executable and literal arguments'; return 1;
+        }
+    fi
+    if [ "$check_only" = --installed ]; then
+        _ccacc_shell_check_text || return 1
+    fi
+    # Existing Zsh hooks are verified before startup context can source them.
+    if [ -f "$private/managed.json" ]; then
+        _ccacc_shell_probe_context || return 1
+    fi
     case "${SHELL##*/}" in
         zsh)
             if printf '%s' "$probe" | jq -se '.[0] | has("startupDirectory")' >/dev/null; then
@@ -256,70 +336,47 @@ ccacc_install_shell_hook() (
         _ccacc_shell_path "$rc" file && [ -d "${rc%/*}" ] || {
             _ccacc_shell_error 'startup file or its parent is unsafe or missing'; return 1;
         }
-        [ -w "${rc%/*}" ] && { [ ! -e "$rc" ] || [ -w "$rc" ]; } || {
-            _ccacc_shell_error 'startup file and its parent must be writable'; return 1;
-        }
+        if [ "$check_only" != --installed ]; then
+            [ -w "${rc%/*}" ] && { [ ! -e "$rc" ] || [ -w "$rc" ]; } || {
+                _ccacc_shell_error 'startup file and its parent must be writable'; return 1;
+            }
+        fi
         _ccacc_shell_rc "$rc" || { _ccacc_shell_error 'malformed startup file or managed block'; return 1; }
     done
-    if [ -f "$private/managed.json" ]; then
-        jq -se 'length == 1 and (.[0] | type == "object" and .version == 1 and (.originalMissing | type == "boolean"))' "$private/managed.json" >/dev/null || {
-            _ccacc_shell_error 'malformed private hook record'; return 1;
-        }
-        if jq -se '.[0].originalMissing' "$private/managed.json" >/dev/null; then missing=1
-        else
-            [ -f "$private/original-alias.json" ] || { _ccacc_shell_error 'original alias backup is missing'; return 1; }
-            original=$(cat "$private/original-alias.json") || return 1
+    # Version 2 binds the record to this deployment and actual startup paths.
+    # Version 1 is recognized by exact hook/source bytes and migrated only on install.
+    record=$(jq -cn --arg script "$script" --arg shell "${SHELL##*/}" \
+        --arg first "${rcs[0]}" --arg second "${rcs[1]}" --argjson missing "$([ "$missing" = 1 ] && printf true || printf false)" \
+        '{version:2,originalMissing:$missing,script:$script,shell:$shell,startupFiles:[$first,$second]}') || return 1
+    if [ "$check_only" = --installed ]; then
+        if jq -e '.version == 2' "$private/managed.json" >/dev/null; then
+            printf '%s' "$record" | jq -e --slurpfile saved "$private/managed.json" '. == $saved[0]' >/dev/null || {
+                _ccacc_shell_error 'installation record does not match this script or startup paths'; return 1;
+            }
         fi
-    else
-        [ ! -e "$private/original-alias.json" ] && [ ! -e "$private/hook.sh" ] || {
-            _ccacc_shell_error 'orphaned private hook files require manual review'; return 1;
-        }
-        if printf '%s' "$probe" | jq -se 'length == 1 and (.[0] | type == "object" and .missing == true and (has("definition") | not))' >/dev/null; then missing=1
-        else original=$probe; fi
+        for rc in "${rcs[@]}"; do
+            [ -f "$rc" ] && _ccacc_shell_read "$rc" || return 1
+            actual=$_ccacc_content
+            _ccacc_shell_rc "$rc" || return 1
+            [ "$actual" = "$_ccacc_content" ] || {
+                _ccacc_shell_error 'required managed source entry is missing, stale or misplaced'; return 1;
+            }
+        done
+        return 0
     fi
-    if [ "$missing" = 1 ]; then
-        [ ! -e "$private/original-alias.json" ] || { _ccacc_shell_error 'unexpected original alias backup'; return 1; }
-        _ccacc_shell_command claude || return 1
-    else
-        printf '%s' "$original" | jq -se 'length == 1 and (.[0] | type == "object" and (.definition | type == "string") and (.definition | length > 0) and ((.definition | contains("\u0000")) | not))' >/dev/null || {
-            _ccacc_shell_error 'malformed alias probe or backup'; return 1;
-        }
-        # Sentinel preserves trailing newlines so malformed commands cannot be
-        # accepted accidentally after command substitution strips them.
-        probe=$(printf '%s' "$original" | jq -srj '.[0].definition'; printf '.') || return 1
-        probe=${probe%.}
-        _ccacc_shell_command "$probe" || {
-            _ccacc_shell_error 'unsupported Claude alias; use literal assignments, env, or _op_agent env with a claude executable and literal arguments'; return 1;
-        }
-    fi
-    # Let account operations reject unsupported aliases and unsafe paths before
-    # passwords, process shutdown or credential changes.
     [ "$check_only" != --validate-only ] || return 0
     mkdir -p -m 700 "$private" && chmod 700 "$private" || return 1
     tmp=$(mktemp -d "$private/.install.XXXXXXXX") || return 1
     trap 'rm -rf "$tmp"' EXIT
-    quoted_script=$(_ccacc_shell_quote "$script")
-    cat > "$tmp/hook.sh" <<HOOK
-# Managed by ccacc. Account timezone is resolved on every launch.
-unalias claude 2>/dev/null || :
-function __ccacc_launch { (
-    __ccacc_tz=\$(command bash $quoted_script timezone) || {
-        printf '%s\\n' 'ccacc: cannot read the active account timezone; configure it before launching Claude' >&2
-        return 1
-    }
-    case "\$__ccacc_tz" in
-        ''|/*|*..*|*[!A-Za-z0-9_+/-]*)
-            printf '%s\\n' 'ccacc: invalid or missing active account timezone' >&2; return 1 ;;
-    esac
-    if [ ! -f "/usr/share/zoneinfo/\$__ccacc_tz" ] && [ ! -f "/var/db/timezone/zoneinfo/\$__ccacc_tz" ]; then
-        printf '%s\\n' 'ccacc: unknown active account timezone' >&2; return 1
+    _ccacc_shell_hook_text > "$tmp/hook.sh" || return 1
+    printf '%s\n' "$record" > "$tmp/managed.json" || return 1
+    if [ "$missing" = 0 ]; then
+        if [ -f "$private/original-alias.json" ]; then
+            printf '%s' "$original" > "$tmp/original-alias.json" || return 1
+        else
+            printf '%s\n' "$original" > "$tmp/original-alias.json" || return 1
+        fi
     fi
-    $_ccacc_command
-) }
-alias claude='__ccacc_launch'
-HOOK
-    printf '{"version":1,"originalMissing":%s}\n' "$([ "$missing" = 1 ] && printf true || printf false)" > "$tmp/managed.json" || return 1
-    if [ "$missing" = 0 ]; then printf '%s\n' "$original" > "$tmp/original-alias.json" || return 1; fi
     for rc in "${rcs[@]}"; do
         _ccacc_shell_rc "$rc" || return 1
         stage="$tmp/rc.$index"
@@ -340,11 +397,12 @@ HOOK
         _ccacc_shell_replace "${stages[$index]}" "$rc" || return 1
         index=$((index+1))
     done
-    printf 'Claude shell hook installed for %s (%s).\n' "$account" "$zone"
+    printf 'Claude shell hook installed.\n'
     printf 'In your current shell, run: source %s\n' "$(_ccacc_shell_quote "$private/hook.sh")"
     printf 'New interactive terminals load it automatically.\n'
 )
 
-ccacc_preflight_shell_hook() {
-    ccacc_install_shell_hook "$@" --validate-only
-}
+ccacc_install_shell_hook() { _ccacc_shell_hook "$@"; }
+ccacc_check_shell_hook() { _ccacc_shell_hook "$1" --installed; }
+# Compatibility for explicit installer preflight callers; never an installed check.
+ccacc_preflight_shell_hook() { _ccacc_shell_hook "$1" --validate-only; }

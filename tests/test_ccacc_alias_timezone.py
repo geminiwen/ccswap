@@ -120,7 +120,7 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
 stop_claude() { :; }
 note_device_keys() { :; }
 load_account() { :; }
-main use foo.alias --yes
+main use foo.alias
 ''')
         self.assertEqual((self.accounts / "foo/history.jsonl").read_text(), "foo history\n")
         self.assertFalse(history.exists())
@@ -129,7 +129,7 @@ main use foo.alias --yes
 stop_claude() { :; }
 note_device_keys() { :; }
 load_account() { :; }
-main use foo --yes
+main use foo
 ''')
         self.assertEqual(history.read_text(), "foo history\n")
         self.assertEqual((self.accounts / "foo.alias/history.jsonl").read_text(), "foo.alias history\n")

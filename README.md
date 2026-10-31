@@ -122,24 +122,44 @@ ccacc use work --no-yolo
 ccacc use work --yolo
 ```
 
-`--yes` is still accepted as a compatibility no-op; it is no longer required,
-never selects a profile and never enables YOLO. On a terminal, use separately asks
-`YOLO? (y/N)` unless `--yolo` or `--no-yolo` is explicit. No/blank/EOF chooses normal
-permissions; Ctrl-C cancels before account changes. Noninteractive use defaults
-to normal permissions. YOLO adds `--dangerously-skip-permissions` to hooked Claude
+On a terminal, use asks `YOLO? (y/N)` unless `--yolo` or `--no-yolo` is explicit
+(or `alwaysYOLO` is set, see below). No/blank/EOF chooses normal permissions;
+Ctrl-C cancels before account changes. Noninteractive use defaults to normal
+permissions. The old `--yes` option has been removed and is rejected as an unknown
+option. YOLO adds `--dangerously-skip-permissions` to hooked Claude
 launches while that profile is active; caller-supplied flags are still forwarded.
 The choice belongs to the current selection, not the profile backup. Successful
 save/new clear it, and unnamed sessions always use normal permissions.
 
 Choosing the already-active profile changes its launch mode without reloading an
 older backup. A clean logged-out unnamed session can use a saved profile directly;
-unsaved login or unowned history/session files must be saved first, even with
-`--yes`. An otherwise clean unnamed session may retain an empty sessions registry
+unsaved login or unowned history/session files must be saved first. An otherwise clean unnamed session may retain an empty sessions registry
 directory; any entries, including hidden files or links, still require saving.
 Switching stops Claude Code processes owned by the current user, including
 those using other config directories; it leaves those other directories' credentials
 and files unchanged. Fully quit Claude.app and its browser-extension helpers
 before cleanup; ccacc warns and refuses cleanup while those owners remain live.
+
+## Settings
+
+ccacc optionally reads `~/.ccacc/settings.json`. It never creates or edits this
+file. The file must contain one JSON object; unknown keys are ignored.
+
+```json
+{
+  "alwaysYOLO": true
+}
+```
+
+| Key | Type | Effect |
+| --- | --- | --- |
+| `alwaysYOLO` | boolean | When `true`, every `ccacc use` without `--yolo` or `--no-yolo` turns YOLO on without asking, on a terminal or not, and says so on stderr. `--no-yolo` still wins. Missing or `false` keeps the `YOLO? (y/N)` behaviour. |
+
+YOLO means hooked Claude launches skip permission prompts, so enable this only if
+you accept that for every account you switch to. `use` reads the file before any
+picker, password prompt, process stop or account change. If the file exists but
+cannot be read, is not valid JSON, is not an object, or `alwaysYOLO` is not a
+boolean, `use` fails with an error naming the file and changes nothing.
 
 ## Backup boundaries
 

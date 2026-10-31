@@ -117,14 +117,14 @@ apply_surge() { :; }
         self.seed()
         result = self.fixture.harness(r'''
 ask_password() { IFS= read -r password; printf '%s\n' "$password" > "$HOME/password-input"; }
-main use tokyo --yes
+main use tokyo
 ''', stdin="fixture-password\n")
         self.assertNotIn("YOLO", result.stderr)
         self.assertEqual((self.home / "password-input").read_text(), "fixture-password\n")
         self.assertFalse(self.record()["yolo"])
-        self.fixture.harness("main use tokyo --yes --yolo", stdin="")
+        self.fixture.harness("main use tokyo --yolo", stdin="")
         self.assertTrue(self.record()["yolo"])
-        self.fixture.harness("main use tokyo --yes --no-yolo", stdin="")
+        self.fixture.harness("main use tokyo --no-yolo", stdin="")
         self.assertFalse(self.record()["yolo"])
 
     def test_failed_use_keeps_previous_mode_and_cleans_staging(self):
@@ -134,10 +134,10 @@ main use tokyo --yes
                 (self.accounts / ".active").write_text("sydney\n")
                 self.seed()
                 before = self.mode.read_bytes(), self.mode.stat().st_mtime_ns, self.mode.stat().st_ino
-                self.fixture.harness(f"{failure}() {{ return 91; }}; main use tokyo --yes --no-yolo", success=False)
+                self.fixture.harness(f"{failure}() {{ return 91; }}; main use tokyo --no-yolo", success=False)
                 self.assertEqual((self.mode.read_bytes(), self.mode.stat().st_mtime_ns, self.mode.stat().st_ino), before)
                 self.assertEqual(list(self.accounts.glob(".launch-mode.????????")), [])
-        for body in ("main use missing --yolo", "main use tokyo --bad", "main use tokyo --yes --yolo --no-yolo"):
+        for body in ("main use missing --yolo", "main use tokyo --bad", "main use tokyo --yolo --no-yolo"):
             self.seed()
             before = self.mode.read_bytes()
             self.fixture.harness(body, success=False)
@@ -145,7 +145,7 @@ main use tokyo --yes
         self.seed()
         before = self.mode.read_bytes()
         (self.accounts / ".timezones/tokyo").write_text("Invalid/Zone\n")
-        self.fixture.harness("main use tokyo --yes --no-yolo", success=False)
+        self.fixture.harness("main use tokyo --no-yolo", success=False)
         self.assertEqual(self.mode.read_bytes(), before)
 
     def test_staging_failure_precedes_password_process_and_account_mutation(self):
@@ -153,7 +153,7 @@ main use tokyo --yes
         before = self.mode.read_bytes()
         self.fixture.harness(r'''
 chmod() { return 91; }
-main use tokyo --yes --no-yolo
+main use tokyo --no-yolo
 ''', success=False)
         self.assertEqual(self.mode.read_bytes(), before)
         self.assertFalse((self.home / "operations").exists())
@@ -179,7 +179,7 @@ main use tokyo --yes --no-yolo
         before = self.mode.read_bytes()
         self.fixture.harness(r'''
 mv() { if [ "$3" = "$LAUNCH_MODE_FILE" ]; then return 91; fi; command mv "$@"; }
-main use tokyo --yes --no-yolo
+main use tokyo --no-yolo
 ''', success=False)
         self.assertEqual(self.mode.read_bytes(), before)
         self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")

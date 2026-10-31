@@ -300,7 +300,7 @@ apply_surge() { :; }
                 before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths}
                 # Already-active use must neither ask for a password nor write hook files.
                 self.harness('ask_password() { return 97; }; use_command sydney')
-                for command in ("save sydney --timezone Australia/Sydney", "use sydney", "use tokyo --yes",
+                for command in ("save sydney --timezone Australia/Sydney", "use sydney", "use tokyo",
                                 "new"):
                     result = self.harness("main " + command)
                     self.assertNotIn("hook installed", result.stdout)

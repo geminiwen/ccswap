@@ -294,14 +294,14 @@ class ProfilePickerTests(unittest.TestCase):
                 self.assertLess(menu.index("YOLO?"), menu.index("Backed up outgoing"))
                 self.case.assert_report(menu)
                 self.case.assert_switched()
-                self.case.run_body("main use sydney --yes --no-yolo")
+                self.case.run_body("main use sydney --no-yolo")
                 self.case.ops.unlink()
 
     def test_q_escape_ctrl_c_and_eof_cancel_without_side_effects(self):
         for keys in (b"q", b"\x1b", b"\x03", b"\x04"):
             with self.subTest(keys=keys):
                 before = self.case.snapshot()
-                status, menu, stdout = self.run_pty(["--yes", "--yolo"], keys)
+                status, menu, stdout = self.run_pty(["--yolo"], keys)
                 self.assertEqual(status, 130 if keys == b"\x03" else 1, menu + stdout)
                 self.assertNotIn("YOLO?", menu)
                 self.assertEqual(self.case.snapshot(), before)
@@ -315,22 +315,14 @@ class ProfilePickerTests(unittest.TestCase):
         self.assertEqual(self.case.snapshot(), before)
         self.assertEqual(self.case.operations(), [])
 
-    def test_yes_requires_real_selection_and_keeps_yolo_prompt(self):
-        status, menu, _ = self.run_pty(["--yes"], b"j\r", yolo=b"n\n")
-        self.assertEqual(status, 0, menu)
-        self.assertNotIn("Confirm outgoing backup", menu)
-        self.assertIn("YOLO?", menu)
-        self.case.assert_switched()
-
     def test_picker_stdout_is_name_only(self):
         status, menu, stdout = self.run_pty(body="pick_saved_account", keys=b"j\r")
         self.assertEqual(status, 0, menu)
         self.assertEqual(stdout, "tokyo\n")
         self.assertEqual(self.case.operations(), [])
 
-    def test_no_name_launch_flags_and_yes_in_either_order(self):
-        for args, expected in ((["--yolo"], True), (["--yolo", "--yes"], True),
-                               (["--yes", "--yolo"], True), (["--no-yolo", "--yes"], False)):
+    def test_no_name_launch_flags_skip_yolo_prompt(self):
+        for args, expected in ((["--yolo"], True), (["--no-yolo"], False)):
             with self.subTest(args=args):
                 status, menu, _ = self.run_pty(args, b"\r")
                 self.assertEqual(status, 0, menu)
@@ -362,8 +354,8 @@ class ProfilePickerTests(unittest.TestCase):
                 self.assertEqual(self.case.operations(), [])
                 recovery.rmdir()
 
-    def test_nonterminal_never_consumes_password_stdin_including_yes(self):
-        for args in ("", "--yes", "--yolo --yes", "--yes --no-yolo"):
+    def test_nonterminal_never_consumes_password_stdin(self):
+        for args in ("", "--yolo", "--no-yolo"):
             with self.subTest(args=args):
                 before = self.case.snapshot()
                 result = self.case.run_body("if main use " + args + "; then exit 99; fi\n"
@@ -439,9 +431,9 @@ class ProfilePickerTests(unittest.TestCase):
         self.assertNotIn("account19", menu)
 
     def test_invalid_arguments_fail_before_any_read_boundary(self):
-        for args in ("--yes --yes", "--yolo --yolo", "--no-yolo --no-yolo", "--yolo --no-yolo",
-                     "--unknown", "--yes --no-yolo --yolo", "--yes ''", "--yolo ../bad",
-                     "--yes tokyo extra", "--no-yolo tokyo --unknown"):
+        for args in ("--yes", "--yolo --yolo", "--no-yolo --no-yolo", "--yolo --no-yolo",
+                     "--unknown", "--no-yolo --yolo", "--no-yolo ''", "--yolo ../bad",
+                     "--yolo tokyo extra", "--no-yolo tokyo --unknown"):
             with self.subTest(args=args):
                 before = self.case.snapshot()
                 self.case.run_body('require_shell_hook() { printf hook >> "$OPS"; }; '
@@ -450,12 +442,12 @@ class ProfilePickerTests(unittest.TestCase):
                 self.assertEqual(self.case.operations(), [])
 
     def test_explicit_target_accepts_options_on_either_side_without_menu(self):
-        for args in ("--yes tokyo --no-yolo", "--no-yolo --yes tokyo", "tokyo --yes --no-yolo"):
+        for args in ("tokyo --no-yolo", "--no-yolo tokyo"):
             with self.subTest(args=args):
                 result = self.case.run_body("main use " + args)
                 self.assertNotIn("Choose saved profile", result.stderr)
                 self.assertEqual((self.accounts / ".active").read_text(), "tokyo\n")
-                self.case.run_body("main use sydney --yes --no-yolo")
+                self.case.run_body("main use sydney --no-yolo")
                 self.case.ops.unlink()
 
 

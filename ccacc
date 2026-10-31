@@ -34,6 +34,8 @@ ACTIVE_FILE="$ACCOUNTS_DIR/.active"
 LAUNCH_MODE_FILE="$ACCOUNTS_DIR/.launch-mode"
 CLEANUP_RECOVERY_DIR="$ACCOUNTS_DIR/.cleanup-recovery"
 CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
+# Optional user settings; ccacc only reads this file and never creates it.
+SETTINGS_FILE="$HOME/.ccacc/settings.json"
 MASTER_PASSWORD=""
 SURGE_CLI=""
 
@@ -111,7 +113,7 @@ Commands:
   save <name> [--timezone <ZONE>]
                         Back up the current account (new name or the active one)
   timezone [name]       Print the current session TZ or a named account's saved TZ
-  use [name] [--yes] [--yolo|--no-yolo]
+  use [name] [--yolo|--no-yolo]
                         Pick a saved account, back up outgoing data, choose launch mode
   new
                         Confirm prior backup, optionally choose TZ, then clean/logout
@@ -132,11 +134,12 @@ without Surge no policy selection is asked.
 Install/reinstall with: $INSTALL_COMMAND
 Only use requires the installed shell hook; save/new never install or repair it.
 Switching away from a saved account automatically backs it up and reports saved contents.
-Named noninteractive use needs no --yes; --yes remains a compatibility no-op.
---yes never enables YOLO. Saved timezone and Surge choices stay unchanged.
+Named noninteractive use needs no confirmation. Saved timezone and Surge choices stay unchanged.
 Without a name, use requires a terminal: arrows or j/k move, Return selects,
-q, Esc, Ctrl-C or EOF cancel. --yes never automatically selects a profile.
+q, Esc, Ctrl-C or EOF cancel.
 Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
+With {"alwaysYOLO": true} in ~/.ccacc/settings.json, every use without --yolo/--no-yolo
+enables YOLO without asking. An invalid settings file makes use fail before any change.
 New offers a timezone for the unnamed session; blank or EOF leaves TZ unset.
 Save refuses an existing name unless it is the active profile; run 'ccacc use <name>'
 or 'ccacc rm <name>' first. Save uses --timezone, then the active profile's saved zone,
@@ -1199,6 +1202,25 @@ profile_exists() {
     return 1
 }
 
+# Print the alwaysYOLO setting (true/false). A missing file or key means false.
+# Fail closed: an unreadable or malformed file, or a non-boolean value, is an error.
+read_always_yolo() {
+    local value
+    if [ ! -e "$SETTINGS_FILE" ] && [ ! -L "$SETTINGS_FILE" ]; then
+        printf 'false\n'
+        return 0
+    fi
+    if value=$(jq -sr 'if length == 1 and (.[0] | type) == "object"
+            and ((.[0] | has("alwaysYOLO") | not) or (.[0].alwaysYOLO | type) == "boolean")
+        then .[0].alwaysYOLO // false else error("invalid") end' "$SETTINGS_FILE" 2>/dev/null) \
+        && { [ "$value" = true ] || [ "$value" = false ]; }; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+    echo "Error: Invalid settings file $SETTINGS_FILE; expected a readable JSON object whose optional alwaysYOLO is true or false; account unchanged" >&2
+    return 1
+}
+
 # Shared by discovery and the final selected-target check; never reads credentials.
 valid_saved_account() {
     check_name "$1" >/dev/null 2>&1 && [ -f "$ACCOUNTS_DIR/$1.json" ] \
@@ -1364,17 +1386,15 @@ pick_saved_account() (
 
 # Function to switch to a saved account
 use_command() (
-    local name='' name_seen=false zone active mode=false answer='' staged_mode='' mode_option='' yes_seen=false status
+    local name='' name_seen=false zone active mode=false answer='' staged_mode='' mode_option='' status
+    local always_yolo
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --yes)
-                [ "$yes_seen" = false ] || { echo "Error: Duplicate --yes" >&2; return 1; }
-                yes_seen=true ;;
             --yolo|--no-yolo)
                 [ -z "$mode_option" ] || { echo "Error: Duplicate or conflicting launch mode options" >&2; return 1; }
                 mode_option="$1"
                 if [ "$1" = --yolo ]; then mode=true; fi ;;
-            -*) echo "Error: Unknown use option '$1'; expected --yes, --yolo or --no-yolo" >&2; return 1 ;;
+            -*) echo "Error: Unknown use option '$1'; expected --yolo or --no-yolo" >&2; return 1 ;;
             *)
                 [ "$name_seen" = false ] || { echo "Error: use accepts at most one account name" >&2; return 1; }
                 check_name "$1" >&2 || return 1
@@ -1382,6 +1402,8 @@ use_command() (
         esac
         shift
     done
+    # Settings are read before any picker, password, process stop or account change.
+    always_yolo=$(read_always_yolo) || return 1
     require_shell_hook || return 1
     cleanup_is_complete || return 1
     trap 'exit 130' INT
@@ -1417,7 +1439,11 @@ use_command() (
     }
     validate_unnamed_session && cleanup_file_is_writable "$UNNAMED_SESSION_FILE" || return 1
     trap '[ -z "$staged_mode" ] || rm -f "$staged_mode"' EXIT
-    if [ -z "$mode_option" ] && [ -t 0 ] && [ -t 2 ]; then
+    if [ -z "$mode_option" ] && [ "$always_yolo" = true ]; then
+        # An explicit opt-in: applies to terminal and noninteractive use alike.
+        mode=true
+        echo "YOLO enabled by alwaysYOLO in $SETTINGS_FILE (use --no-yolo to override)" >&2
+    elif [ -z "$mode_option" ] && [ -t 0 ] && [ -t 2 ]; then
         printf 'YOLO? (y/N) ' >&2
         if { IFS= read -r answer < /dev/tty; } 2>/dev/null; then
             case "$answer" in y|Y|[yY][eE][sS]) mode=true ;; esac

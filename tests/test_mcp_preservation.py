@@ -164,11 +164,11 @@ printf 'fixture-original-latest\n' > "$CONFIG_DIR/history.jsonl"
 use_command original
 [ "$(jq -r '.claudeAiOauth.accessToken' "$STATE")" = fixture-original-refreshed ]
 [ "$(jq -r '.numStartups' "$CLAUDE_JSON")" = 42 ]
-use_command other --yes
+use_command other
 jq '.mcpOAuth.extra = {accessToken:"fixture-new-shared"} | .claudeAiOauth.accessToken = "fixture-other-refreshed"' "$STATE" > "$FIXTURE/refreshed.json"
 cp "$FIXTURE/refreshed.json" "$STATE"
 printf 'fixture-other-latest\n' > "$CONFIG_DIR/history.jsonl"
-use_command original --yes
+use_command original
 [ "$(jq -r '.numStartups' "$CLAUDE_JSON")" = 42 ]
 [ "$(cat "$CONFIG_DIR/history.jsonl")" = fixture-original-latest ]
 [ "$(cat "$ACCOUNTS_DIR/other/history.jsonl")" = fixture-other-latest ]

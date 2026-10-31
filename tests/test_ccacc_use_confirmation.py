@@ -233,7 +233,7 @@ class UseConfirmationTests(unittest.TestCase):
                 config.update(caches)
                 config_path.write_text(json.dumps(config))
                 (self.accounts / "tokyo.json").write_text(json.dumps({"userID": "target-id", **incoming}))
-                self.run_body("main use tokyo --yes --no-yolo")
+                self.run_body("main use tokyo --no-yolo")
                 saved = json.loads((self.accounts / "sydney.json").read_text())
                 switched = json.loads(config_path.read_text())
                 for key, value in caches.items():
@@ -243,7 +243,7 @@ class UseConfirmationTests(unittest.TestCase):
                     else:
                         self.assertNotIn(key, switched)
                 self.assertEqual(switched["mcpServers"], config["mcpServers"])
-                self.run_body("main use sydney --yes --no-yolo")
+                self.run_body("main use sydney --no-yolo")
                 restored = json.loads(config_path.read_text())
                 for key, value in caches.items():
                     self.assertEqual(restored[key], value)
@@ -284,20 +284,15 @@ printf '%s\n' "$remaining"
         self.assertEqual(self.operations().count("password"), 1)
         self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
 
-    def test_explicit_yes_is_compatibility_noop(self):
-        result = self.run_body("main use tokyo --yes")
-        self.assertNotIn("Confirm outgoing backup", result.stderr)
-        self.assert_report(result.stderr)
-        self.assert_switched()
-        self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
-
-    def test_yes_still_prompts_for_yolo_on_terminal(self):
-        status, stderr, _ = self.run_pty(["tokyo", "--yes"], yolo_answer=b"n\n")
-        self.assertEqual(status, 0, stderr)
-        self.assertNotIn("Confirm outgoing backup", stderr)
-        self.assertIn("YOLO? (y/N)", stderr)
-        self.assert_switched()
-        self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
+    def test_removed_yes_option_is_rejected_without_changes(self):
+        for args in ("tokyo --yes", "--yes tokyo", "tokyo --yes --no-yolo"):
+            with self.subTest(args=args):
+                before = self.snapshot()
+                result = self.run_body("main use " + args, success=False)
+                self.assertIn("Unknown use option '--yes'; expected --yolo or --no-yolo", result.stderr)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(self.operations(), [])
+                self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
 
     def test_logged_out_named_profile_reports_no_encrypted_login_backup(self):
         self.credentials.write_text('{"mcpOAuth":{"shared":"shared-secret"}}')
@@ -417,18 +412,99 @@ main use tokyo --no-yolo
             self.assertEqual(self.operations().count(operation), 1)
         self.assertNotIn("surge", self.operations())
 
+    def write_settings(self, content):
+        settings = self.home / ".ccacc/settings.json"
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text(content)
+        return settings
+
+    def launch_yolo(self):
+        return json.loads((self.accounts / ".launch-mode").read_text())["yolo"]
+
+    def test_always_yolo_skips_prompt_on_terminal_and_noninteractive(self):
+        self.write_settings('{"alwaysYOLO": true, "unrelatedFutureKey": {"ignored": 1}}')
+        # run_pty fails if the YOLO prompt appears without an answer to send.
+        status, stderr, _ = self.run_pty(["tokyo"])
+        self.assertEqual(status, 0, stderr)
+        self.assertNotIn("YOLO?", stderr)
+        self.assertIn("YOLO enabled by alwaysYOLO in " + str(self.home / ".ccacc/settings.json"), stderr)
+        self.assert_switched()
+        self.assertIs(self.launch_yolo(), True)
+        self.run_body("main use sydney --no-yolo")
+        result = self.run_body("main use tokyo")
+        self.assertNotIn("YOLO?", result.stderr)
+        self.assertIs(self.launch_yolo(), True)
+
+    def test_explicit_no_yolo_overrides_always_yolo(self):
+        self.write_settings('{"alwaysYOLO": true}')
+        status, stderr, _ = self.run_pty(["tokyo", "--no-yolo"])
+        self.assertEqual(status, 0, stderr)
+        self.assertNotIn("YOLO", stderr)
+        self.assertIs(self.launch_yolo(), False)
+        self.run_body("main use sydney --no-yolo")
+        self.assertIs(self.launch_yolo(), False)
+
+    def test_false_or_absent_always_yolo_keeps_prompt(self):
+        for content in (None, "{}", '{"alwaysYOLO": false}', '{"other": true}'):
+            with self.subTest(content=content):
+                if content is not None:
+                    self.write_settings(content)
+                status, stderr, _ = self.run_pty(["tokyo"], yolo_answer=b"n\n")
+                self.assertEqual(status, 0, stderr)
+                self.assertIn("YOLO? (y/N)", stderr)
+                self.assertIs(self.launch_yolo(), False)
+                self.run_body("main use sydney --no-yolo")
+                self.ops.unlink()
+                self.run_body("main use tokyo")
+                self.assertIs(self.launch_yolo(), False)
+                self.run_body("main use sydney --no-yolo")
+                self.ops.unlink()
+
+    def test_invalid_settings_abort_use_before_any_change(self):
+        settings = self.home / ".ccacc/settings.json"
+        cases = ["", "{", "[]", "null", "true", '{"alwaysYOLO": "true"}', '{"alwaysYOLO": null}',
+                 '{"alwaysYOLO": 1}', "{} {}", "directory", "unreadable", "dangling"]
+        for case in cases:
+            with self.subTest(case=case):
+                if settings.is_symlink() or settings.is_file():
+                    settings.unlink()
+                elif settings.is_dir():
+                    settings.rmdir()
+                settings.parent.mkdir(exist_ok=True)
+                if case == "directory":
+                    settings.mkdir()
+                elif case == "dangling":
+                    settings.symlink_to(self.home / "missing-settings.json")
+                else:
+                    settings.write_text('{"alwaysYOLO": true}' if case == "unreadable" else case)
+                before = self.snapshot()
+                if case == "unreadable":
+                    mode = settings.stat().st_mode & 0o777
+                    settings.chmod(0)
+                try:
+                    for args in ("tokyo", "tokyo --yolo", "tokyo --no-yolo", "sydney"):
+                        result = self.run_body("main use " + args, success=False)
+                        self.assertIn("Invalid settings file " + str(settings), result.stderr)
+                        self.assertNotIn("YOLO?", result.stderr)
+                        self.assertEqual(self.operations(), [])
+                finally:
+                    if case == "unreadable":
+                        settings.chmod(mode)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
+
     def test_options_in_either_order_and_explicit_yolo(self):
-        for args, expected in (("--yes --no-yolo", False), ("--no-yolo --yes", False),
-                               ("--yes --yolo", True), ("--yolo --yes", True)):
+        for args, expected in (("tokyo --no-yolo", False), ("--no-yolo tokyo", False),
+                               ("tokyo --yolo", True), ("--yolo tokyo", True)):
             with self.subTest(args=args):
-                self.run_body("main use tokyo " + args)
+                self.run_body("main use " + args)
                 self.assertEqual(json.loads((self.accounts / ".launch-mode").read_text())["yolo"], expected)
-                self.run_body("main use sydney --yes --no-yolo")
+                self.run_body("main use sydney --no-yolo")
 
     def test_bad_options_fail_before_any_system_boundary(self):
-        for args in ("tokyo --yes --yes", "tokyo --yolo --yolo", "tokyo --no-yolo --no-yolo",
-                     "tokyo --yes --yolo --no-yolo", "tokyo --no-yolo --yes --yolo",
-                     "tokyo --yes --unknown", "tokyo extra", "tokyo ''"):
+        for args in ("tokyo --yolo --yolo", "tokyo --no-yolo --no-yolo",
+                     "tokyo --yolo --no-yolo", "tokyo --no-yolo --yolo",
+                     "tokyo --unknown", "tokyo --yes", "tokyo extra", "tokyo ''"):
             with self.subTest(args=args):
                 before = self.snapshot()
                 self.run_body('require_shell_hook() { printf hook >> "$OPS"; }; main use ' + args, success=False)

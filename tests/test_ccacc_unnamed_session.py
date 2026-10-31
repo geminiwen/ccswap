@@ -287,7 +287,7 @@ main new
             else:
                 entry.write_bytes(b"synthetic-unowned-session-data")
             before = self.snapshot()
-            self.run_body("main use kept --yes --no-yolo", success=False)
+            self.run_body("main use kept --no-yolo", success=False)
             self.assertEqual(self.snapshot(), before)
             if entry.is_dir():
                 entry.rmdir()
@@ -295,13 +295,13 @@ main new
                 entry.unlink()
         sessions.chmod(0o000)
         try:
-            self.run_body("main use kept --yes --no-yolo", success=False)
+            self.run_body("main use kept --no-yolo", success=False)
             self.assertFalse(self.active.exists())
         finally:
             sessions.chmod(0o700)
         sessions.rmdir()
         sessions.symlink_to(self.fixture.fixture, target_is_directory=True)
-        self.run_body("main use kept --yes --no-yolo", success=False)
+        self.run_body("main use kept --no-yolo", success=False)
         self.assertFalse(self.active.exists())
         self.assertNotIn("password", self.operations())
 
@@ -968,7 +968,7 @@ main new
         self.saved_active()
         self.run_body("main new")
         self.login("unsaved@example.invalid")
-        for options in ("", " --yes --no-yolo"):
+        for options in ("", " --no-yolo"):
             before = self.snapshot()
             operations = self.operations()
             result = self.run_body("main use kept" + options, success=False)
@@ -999,7 +999,7 @@ main new
         history.mkdir()
         (history / "unsaved").write_text("must save first")
         before = self.snapshot()
-        for options in ("", " --yes --no-yolo"):
+        for options in ("", " --no-yolo"):
             result = self.run_body("main use kept" + options, success=False)
             self.assertNotIn("Confirm outgoing backup", result.stderr)
             self.assertEqual(self.snapshot(), before)

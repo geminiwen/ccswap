@@ -6,7 +6,7 @@ login, account-bound configuration, history and session files together.
 ## Requirements
 
 - macOS only. Claude logins are read from and written to the macOS keychain
-  (`security`, `osascript`); the installer and every command except `help` and
+  with `/usr/bin/security`; the installer and every command except `help` and
   `--version` refuse other platforms.
 - Bash (the system Bash 3.2 works), `curl` and `jq`; account backups also
   require `openssl`.
@@ -168,6 +168,14 @@ boolean, `use` fails with an error naming the file and changes nothing.
 | `save <name>` | Creates a new profile or refreshes the active one; other existing names are refused. Only `claudeAiOauth` goes into `<name>.credentials.enc`; account-bound `~/.claude.json` fields go into `<name>.json`. Save also records the independently chosen timezone and optional Surge policies. Live directories stay in place. |
 | `use <name>` | Updates the outgoing login/config backup, moves its account directories into `~/.claude/accounts/<outgoing>/`, and restores the target's saved login/config and directory stash. Saved timezone and Surge choices stay unchanged. |
 | `new` | Never auto-saves login/config or creates a named profile. After confirmation it logs out and resets account state. If the active saved identity matches the current identity, archive paths move into its stash; unmatched/unnamed paths are cleared. |
+
+ccacc writes the `Claude Code-credentials` keychain item the same way Claude Code
+does: through `/usr/bin/security` with hex data on `security -i`'s standard input,
+so the secret never appears in process arguments. The item keeps the access
+settings Claude Code expects, so switching does not cause extra "security wants to
+use your confidential information" prompts. Only a large item (roughly 1,900 bytes
+or more, which no longer fits one `security -i` command line) is passed as an
+argument instead, as Claude Code also does, with a warning.
 
 Only the credentials backup is encrypted (AES-256-CBC with PBKDF2). Profile JSON
 and stashed files, including session JSON and `.key` bytes, are stored as files

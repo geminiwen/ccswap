@@ -498,38 +498,36 @@ keychain_read() {
     printf '%s' "$secret"
 }
 
+# security -i reads each command into a fixed line buffer. Measured on macOS
+# (Darwin 27): lines of up to 4095 characters store intact, longer ones are
+# silently truncated. Stay well below that.
+SECURITY_INTERACTIVE_MAX_LINE=4000
+
+# Write the item exactly as Claude Code does, through /usr/bin/security with -U
+# and hex data. Items written by security keep its "apple-tool:" partition, so
+# later security reads (ccacc's and Claude Code's) do not raise keychain
+# prompts; writing through another program (e.g. osascript's SecItemUpdate)
+# changes the partition and makes every following security read prompt.
 keychain_write() {
-    # security -i truncates long input lines. Pass data through stdin to the native
-    # API instead, without exposing secrets in argv or replacing an existing item's ACL.
-    if ! printf '%s' "$3" | jq -Rsc --arg service "$1" --arg account "$2" \
-        '{service: $service, account: $account, secret: .}' \
-        | osascript -l JavaScript -e '
-            ObjC.import("Foundation");
-            ObjC.import("Security");
-            function run() {
-                const input = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
-                const text = $.NSString.alloc.initWithDataEncoding(input, $.NSUTF8StringEncoding);
-                const value = JSON.parse(ObjC.unwrap(text));
-                const object = function (ref) { return ObjC.castRefToObject(ref); };
-                const query = $.NSMutableDictionary.alloc.init;
-                query.setObjectForKey(object($.kSecClassGenericPassword), object($.kSecClass));
-                query.setObjectForKey($(value.service), object($.kSecAttrService));
-                query.setObjectForKey($(value.account), object($.kSecAttrAccount));
-                const attributes = $.NSMutableDictionary.alloc.init;
-                attributes.setObjectForKey($(value.secret).dataUsingEncoding($.NSUTF8StringEncoding),
-                                           object($.kSecValueData));
-                let status = $.SecItemUpdate(query, attributes);
-                if (status === -25300) {
-                    query.addEntriesFromDictionary(attributes);
-                    status = $.SecItemAdd(query, null);
-                }
-                if (status !== 0) throw new Error("Keychain write failed (OSStatus " + status + ")");
-            }
-        ' > /dev/null 2>/dev/null; then
-        return 1
+    local service="$1" account="$2" secret="$3" hex line LC_ALL=C
+    [ -n "$secret" ] || return 1
+    # Names are double-quoted for the security -i parser; refuse anything it could misread.
+    case "$service$account" in
+        *'"'*|*'\'*|*$'\n'*|*$'\r'*)
+            echo "Error: Unsupported keychain service or account name" >&2; return 1 ;;
+    esac
+    hex=$(printf '%s' "$secret" | xxd -p | tr -d '\n') && [ -n "$hex" ] || return 1
+    line="add-generic-password -U -a \"$account\" -s \"$service\" -X $hex"
+    if [ "${#line}" -le "$SECURITY_INTERACTIVE_MAX_LINE" ]; then
+        # The secret travels on stdin only, never in argv.
+        printf '%s\n' "$line" | security -i > /dev/null 2>&1 || return 1
+    else
+        # Too long for security -i: fall back to argv, as Claude Code does.
+        echo "Warning: keychain item too large for 'security -i'; passing it to security as an argument (briefly visible in local process listings)" >&2
+        security add-generic-password -U -a "$account" -s "$service" -X "$hex" > /dev/null 2>&1 || return 1
     fi
 
-    [ "$(keychain_read "$1" "$2")" = "$3" ]
+    [ "$(keychain_read "$service" "$account")" = "$secret" ]
 }
 
 # Functions to read/write/delete Claude Code's default credentials in the macOS keychain.
@@ -1891,7 +1889,7 @@ delete_command() (
     echo -e "${GREEN}Deleted account: ${name}${NC}"
 )
 
-# ccacc relies on the macOS keychain (security, osascript); refuse anything else.
+# ccacc relies on the macOS keychain (/usr/bin/security); refuse anything else.
 require_macos() {
     local platform
     platform=$(uname -s 2>/dev/null) || platform=''

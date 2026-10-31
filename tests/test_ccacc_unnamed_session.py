@@ -360,6 +360,27 @@ main new
         self.assertEqual(restored["settings"], config["settings"])
         self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"], self.shared["mcpOAuth"])
 
+    def test_new_resets_onboarding_and_use_restores_saved_state(self):
+        self.saved_active()
+        for completed in (True, False):
+            with self.subTest(completed=completed):
+                config = json.loads(self.config.read_text())
+                config["hasCompletedOnboarding"] = completed
+                self.config.write_text(json.dumps(config))
+                self.run_body("main save kept --timezone UTC")
+                saved = (self.accounts / "kept.json").read_bytes()
+                self.assertIs(json.loads(saved)["hasCompletedOnboarding"], completed)
+                self.run_body("main new")
+                self.assertIs(json.loads(self.config.read_text())["hasCompletedOnboarding"], False)
+                self.assertEqual((self.accounts / "kept.json").read_bytes(), saved)
+                self.run_body("main use kept")
+                self.assertIs(json.loads(self.config.read_text())["hasCompletedOnboarding"], completed)
+        config = json.loads(self.config.read_text())
+        config.pop("hasCompletedOnboarding")
+        self.config.write_text(json.dumps(config))
+        self.run_body("main new")
+        self.assertIs(json.loads(self.config.read_text())["hasCompletedOnboarding"], False)
+
     def test_saved_account_uuid_can_prove_history_ownership_without_user_id(self):
         self.saved_active()
         config = json.loads(self.config.read_text())

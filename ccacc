@@ -41,7 +41,7 @@ SURGE_CLI=""
 # Everything else (mcpServers, settings, ...) stays shared between accounts
 ACCOUNT_KEYS='[
     "userID", "userId", "anonymousId", "machineID",
-    "oauthAccount", "chromeExtension", "hasShownOpus45Notice",
+    "oauthAccount", "chromeExtension", "hasShownOpus45Notice", "hasCompletedOnboarding",
     "cachedChangelog", "cachedStatsigGates", "cachedDynamicConfigs", "cachedGrowthBookFeatures",
     "cachedGrowthBookFeaturesAt", "metricsStatusCache", "clientDataCache", "clientDataCacheSlots",
     "cachedArtifactRoster", "cachedUsageUtilization",
@@ -776,6 +776,7 @@ reset_account_state() {
         | reset("skillUsage"; {}) | reset("toolUsage"; {})
         | zero("pluginUsage") | zero("agentLastUsed") | zero("feedbackSurveyState") | zero("tipLifetimeShownCounts")
         | if has("tipsHistory") then .tipsHistory |= with_entries(.value = 0) else . end
+        | .hasCompletedOnboarding = false
         | . + $ids
     ' "$CLAUDE_JSON" > "$temp_config"; then
         rm -f "$temp_config"

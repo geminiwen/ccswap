@@ -26,6 +26,7 @@ ACCOUNTS_DIR="$CONFIG_DIR/accounts"
 # Hidden names cannot pass check_name, keeping metadata separate from account stashes.
 ALIASES_DIR="$ACCOUNTS_DIR/.aliases"
 TIMEZONES_DIR="$ACCOUNTS_DIR/.timezones"
+PENDING_TIMEZONE_FILE="$ACCOUNTS_DIR/.pending-timezone"
 ACTIVE_FILE="$ACCOUNTS_DIR/.active"
 CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
 MASTER_PASSWORD=""
@@ -57,6 +58,7 @@ ACCOUNT_PATHS=(
     "backups|$CONFIG_DIR/backups"
     "debug|$CONFIG_DIR/debug"
     "file-history|$CONFIG_DIR/file-history"
+    "feedback-drafts|$CONFIG_DIR/feedback/drafts"
     "paste-cache|$CONFIG_DIR/paste-cache"
     "plans|$CONFIG_DIR/plans"
     "projects|$CONFIG_DIR/projects"
@@ -101,9 +103,9 @@ Commands:
   configure-shell [name]
                         Deprecated explicit alias for install; account is ignored
   use <name>            Back up the active account, then switch to <name>
-  new <name> [--alias <alias-name>] [--timezone <ZONE>]
-                        Back up the active account, then start <name> like a fresh install
-                        (logged out, new IDs; run 'claude /login' next)
+  new [--timezone <ZONE>]
+                        Confirm prior backup, then clean to an unnamed logged-out session
+                        (logged out; run 'claude /login', then 'ccacc save <name>')
   surge <name>          Choose the Surge policies <name> uses (e.g. its own exit for the Claude group)
   rm <name>             Delete a saved account and its saved history
   help                  Show this help message
@@ -114,12 +116,13 @@ An account is everything cccleaner would wipe:
   - the account-bound keys of ~/.claude.json (IDs, oauthAccount, caches, counters, projects, ...)
   - ~/.claude history/state folders (projects, file-history, statsig, telemetry, history.jsonl, ...)
   - ~/Library/Caches/claude-cli-nodejs
-Login backups are encrypted with one master password, asked once per save/use/new.
+Login backups use one master password for save/use. New never saves credentials.
 Folders are moved, not copied, so switching is instant.
-With Surge installed, save/new ask which Surge policies the account uses and use applies them;
+With Surge installed, save asks which policies the account uses and use applies them;
 without Surge no policy selection is asked.
 Run '$SCRIPT_NAME install' once before save/new/use; these commands only check setup.
-Save/new reuse a valid saved timezone or accept explicit --timezone <ZONE>.
+Save reuses a named or pending timezone; new requires an explicit fresh-session choice.
+An already-clean pending session can reuse its selected timezone. Both accept --timezone <ZONE>.
 First setup requires a numbered timezone choice or custom IANA entry, with no default.
 Invalid or unanswered choices fail before account changes. Aliases never choose TZ.
 
@@ -131,7 +134,9 @@ processes owned by the current user, including those using another config dir.
 Examples:
   $SCRIPT_NAME install
   $SCRIPT_NAME save personal
-  $SCRIPT_NAME new work
+  $SCRIPT_NAME new --timezone UTC
+  claude /login
+  $SCRIPT_NAME save work
   $SCRIPT_NAME use personal
 
 EOF
@@ -257,15 +262,40 @@ write_alias_backup() {
 
 # Intentionally independent of check_ready, passwords, credentials and shell
 # startup. stdout is a machine-readable API: one validated zone or nothing.
-timezone_command() {
-    local name="$1" zone
-    if [ -z "$name" ]; then name=$(active_account); fi
-    check_name "$name" >/dev/null 2>&1 || return 1
-    # Raw private metadata is exactly one zone, optionally followed by one newline.
+read_timezone_file() {
+    local zone
+    # Exactly one saved zone, optionally followed by one newline.
     zone=$(jq -Rser 'select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\n?\\z"))
-        | rtrimstr("\n")' "$TIMEZONES_DIR/$name" 2>/dev/null) || return 1
+        | rtrimstr("\n")' "$1" 2>/dev/null) || return 1
     valid_timezone "$zone" || return 1
     printf '%s\n' "$zone"
+}
+
+timezone_command() {
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        name=$(active_account)
+        if [ -z "$name" ]; then
+            read_timezone_file "$PENDING_TIMEZONE_FILE"
+            return $?
+        fi
+    fi
+    check_name "$name" >/dev/null 2>&1 || return 1
+    read_timezone_file "$TIMEZONES_DIR/$name"
+}
+
+# A pending zone belongs to an explicitly selected unnamed login session.
+set_pending_timezone() {
+    local zone="$1" temporary
+    valid_timezone "$zone" || return 1
+    _ccacc_shell_path "$PENDING_TIMEZONE_FILE" file || return 1
+    mkdir -p -m 700 "$ACCOUNTS_DIR" || return 1
+    temporary=$(mktemp "$ACCOUNTS_DIR/.pending.XXXXXXXX") || return 1
+    if ! printf '%s\n' "$zone" > "$temporary" || ! chmod 600 "$temporary" \
+        || ! mv -f "$temporary" "$PENDING_TIMEZONE_FILE"; then
+        rm -f "$temporary"
+        return 1
+    fi
 }
 
 # An explicit first-setup choice only; never infer a zone from the environment,
@@ -387,6 +417,9 @@ prepare_account_metadata() {
     command -v jq >/dev/null || return 1
     zone="$requested_zone"
     if [ -z "$zone" ]; then zone=$(timezone_command "$name") || zone=""; fi
+    if [ -z "$zone" ] && [ ! -e "$TIMEZONES_DIR/$name" ] && [ -z "$(active_account)" ]; then
+        zone=$(read_timezone_file "$PENDING_TIMEZONE_FILE") || zone=""
+    fi
     if [ -z "$zone" ]; then zone=$(choose_timezone "$name") || return 1; fi
     PREPARED_TIMEZONE="$zone"
     if ! PREPARED_ALIAS=$(probe_alias "$PREPARED_ALIAS_NAME"); then
@@ -418,7 +451,7 @@ claude_process_ids() {
 # Stop every current-user Claude Code instance before saving or moving account state.
 # Other config dirs (including emocode) are included; the desktop app is not.
 stop_claude() {
-    local pids pid signal attempt
+    local pids pid signal attempt status guard=${1:-}
     if ! pids=$(claude_process_ids); then
         echo -e "${RED}Error: Could not inspect Claude Code processes; account not switched${NC}"
         return 1
@@ -428,6 +461,16 @@ stop_claude() {
     echo -e "${YELLOW}Stopping all Claude Code processes for the current user${NC}"
     for signal in TERM KILL; do
         for pid in $pids; do
+            if [ "$guard" = --guard-ancestors ]; then
+                [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+                [ "$pid" -gt 1 ] || return 1
+                status=0
+                cleanup_process_is_ancestor "$pid" || status=$?
+                [ "$status" -eq 1 ] || {
+                    echo "Error: Cleanup process ancestry is unsafe or unverifiable; exit Claude and rerun" >&2
+                    return 1
+                }
+            fi
             kill -"$signal" "$pid" 2>/dev/null || true
         done
         for attempt in 1 2 3 4 5; do
@@ -717,13 +760,33 @@ reset_account_state() {
         def reset($key; $value): if has($key) then .[$key] = $value else . end;
         def zero($key): if has($key) then .[$key] |= zero_leaves else . end;
 
-        del(.oauthAccount, .chromeExtension, .hasShownOpus45Notice, .userId,
+        del(.oauthAccount, .chromeExtension, .hasShownOpus45Notice, .userId, .user_id,
+            .promoStartupStatusCache, .githubWebConnectionStatusCache, .apiCreditLinkStatusCache,
+            .groveChoiceSeenAt, .cachedExperimentFeatures, .cachedExperimentData,
+            .cachedExtraUsageDisabledReason, .cachedChromeExtensionInstalled,
+            .additionalModelCostsCache, .modelAccessCache, .orgModelDefaultCache,
+            .autoCompactWindowsCache, .additionalModelOptionsAnsweredAt,
+            .seenNotifications, .announcementImpressions, .tipsHistoryByCommand,
+            .promoStartupSeenCount, .rcLongTurnNudgeSeenCount, .rcLongTurnNudgeSeenKey,
+            .bridgeOauthDeadExpiresAt, .bridgeOauthDeadFailCount,
+            .claudeAiMcpEverConnected, .hasRemoteEnvironment, .mcpNeedsAuthNoticed,
+            .hasAvailableSubscription, .penguinModeOrgEnabled,
             .cachedChangelog, .cachedStatsigGates, .cachedDynamicConfigs, .cachedGrowthBookFeatures,
             .cachedGrowthBookFeaturesAt, .metricsStatusCache, .clientDataCache, .clientDataCacheSlots,
             .additionalModelOptionsCache, .overageCreditGrantCache,
             .firstStartTime, .lastShownEmergencyTip, .companion, .lastOnboardingVersion, .lastReleaseNotesSeen,
             .githubRepoPaths, .replBridgePlaceholders)
-        | .projects = {}
+        # Retain reusable project MCP definitions/selections while dropping
+        # account history, trust and empty records. Explicit false is a choice.
+        | .projects = ((.projects // {}) | with_entries(
+            .value |= (if type == "object" then with_entries(select(.key as $key | [
+                "mcpServers", "disabledMcpServers", "enabledMcpServers",
+                "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers"
+            ] | index($key))) else {} end)
+            | .value |= with_entries(select(.value |
+                type == "boolean" or ((type == "object" or type == "array") and length > 0)
+            ))
+        ) | with_entries(select(.value != {})))
         | reset("groveConfigCache"; {}) | reset("passesEligibilityCache"; {}) | reset("s1mAccessCache"; {})
         | reset("changelogLastFetched"; 0) | reset("lastPlanModeUse"; 0) | reset("passesUpsellSeenCount"; 0)
         | reset("passesLastSeenRemaining"; 0) | reset("numStartups"; 0) | reset("btwUseCount"; 0)
@@ -1009,12 +1072,13 @@ save_command() {
     local name="${1:-}"
     require_shell_hook || return 1
     prepare_account_metadata "$@" || return 1
-    check_ready
-    ask_password
+    check_ready || return 1
+    ask_password || return 1
     save_prepared_metadata "$name" || return 1
 
     save_account "$name" || return 1
-    echo "$name" > "$ACTIVE_FILE"
+    printf '%s\n' "$name" > "$ACTIVE_FILE" || return 1
+    rm -f "$PENDING_TIMEZONE_FILE" || return 1
     echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
 
     if [ ! -f "$ACCOUNTS_DIR/${name}.surge" ]; then
@@ -1058,40 +1122,191 @@ use_command() {
     apply_surge "$name"
 }
 
-# Function to start a new account like a fresh install: logged out, new IDs, no history
+# Cleanup never signals a PID taken from a config record. Ancestors and
+# unverifiable process snapshots must block cleanup rather than kill the caller.
+cleanup_process_is_ancestor() {
+    local candidate="$1" current=$$ parent
+    while [ "$current" -gt 1 ]; do
+        [ "$candidate" != "$current" ] || return 0
+        parent=$(ps -p "$current" -o ppid= 2>/dev/null) || return 2
+        parent=${parent//[[:space:]]/}
+        [[ "$parent" =~ ^[0-9]+$ ]] && [ "$parent" != "$current" ] || return 2
+        current=$parent
+    done
+    return 1
+}
+
+cleanup_stop_processes() {
+    stop_claude --guard-ancestors
+}
+
+cleanup_runtime_is_safe() {
+    local processes status pids pid
+    processes=$(ps -ax -o pid=,comm=,args= 2>/dev/null) && [ -n "$processes" ] || return 1
+    status=0
+    printf '%s\n' "$processes" | awk '
+        NF < 2 || $1 !~ /^[0-9]+$/ { invalid = 1 }
+        {
+            command = $2; sub(/^.*\//, "", command)
+            if (command == "claude" || command == "Claude" || command ~ /^claude-(daemon|bridge|background)$/ ||
+                $0 ~ /\/Claude[.]app\// || $0 ~ /\/\.claude\/(daemon|jobs|sessions|ide)\// ||
+                (command ~ /^(node|bun|deno)$/ && $0 ~ /(\/\.claude\/|@anthropic-ai\/claude-code)/)) live = 1
+        }
+        END { if (invalid) exit 2; if (live) exit 0; exit 1 }
+    ' || status=$?
+    [ "$status" -eq 1 ] || return 1
+    if [ -f "$CLAUDE_JSON" ]; then
+        pids=$(jq -r '(.replBridgePlaceholders // {}) | to_entries[] | .value.pid
+            | if type == "number" and . > 0 and floor == . then . else error("unverifiable bridge PID") end' "$CLAUDE_JSON") || return 1
+        for pid in $pids; do
+            # A successful full snapshot must prove each recorded owner absent.
+            if printf '%s\n' "$processes" | awk -v pid="$pid" '$1 == pid { found = 1 } END { exit !found }'; then return 1; fi
+        done
+    fi
+}
+
+cleanup_path_is_safe() {
+    local path="$1" kind=file
+    [ ! -d "$path" ] || kind=dir
+    _ccacc_shell_path "$path" "$kind"
+}
+
+# A saved name is history ownership only when its saved identity matches the
+# current account. A stale marker must never overwrite another profile stash.
+cleanup_matching_active() {
+    local active
+    active=$(active_account)
+    [ -n "$active" ] && [ -f "$CLAUDE_JSON" ] || return 0
+    if jq -n -e --slurpfile current "$CLAUDE_JSON" --slurpfile saved "$ACCOUNTS_DIR/$active.json" '
+        ($current[0].userID // $current[0].userId // $current[0].user_id) as $c
+        | ($saved[0].userID // $saved[0].userId // $saved[0].user_id) as $s
+        | [$c, $s] as $users
+        | [$current[0].oauthAccount.accountUuid, $saved[0].oauthAccount.accountUuid] as $ids
+        | all($users[]; type == "string" and length > 0) as $user_known
+        | all($ids[]; type == "string" and length > 0) as $id_known
+        | (($user_known and $c == $s) or ($id_known and $ids[0] == $ids[1]))
+        and (if $user_known then $c == $s else true end)
+        and (if $id_known then $ids[0] == $ids[1] else true end)
+        and ([$current[0].oauthAccount.emailAddress, $saved[0].oauthAccount.emailAddress] as $emails
+            | if all($emails[]; type == "string" and length > 0) then $emails[0] == $emails[1] else true end)
+    ' >/dev/null 2>&1; then printf '%s\n' "$active"; fi
+}
+
+# Keychain and the optional file can coexist. Clear only the login field in
+# both stores; malformed optional files fail preflight before either is changed.
+cleanup_credentials_file_is_valid() {
+    jq -se 'length == 1 and (.[0] | type) == "object" and
+        (.[0].claudeAiOauth == null or (.[0].claudeAiOauth | type) == "object")' "$CREDENTIALS_FILE" >/dev/null
+}
+
+cleanup_optional_credentials_file() {
+    local temporary status=0
+    [ -f "$CREDENTIALS_FILE" ] || return 0
+    cleanup_credentials_file_is_valid || return 1
+    jq -e 'has("claudeAiOauth")' "$CREDENTIALS_FILE" >/dev/null || status=$?
+    case "$status" in 0) ;; 1) return 0 ;; *) return 1 ;; esac
+    temporary=$(mktemp "$CONFIG_DIR/.credentials.XXXXXXXX") || return 1
+    if ! jq 'del(.claudeAiOauth)' "$CREDENTIALS_FILE" > "$temporary" \
+        || ! chmod 600 "$temporary" || ! mv "$temporary" "$CREDENTIALS_FILE"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
+
+# Full current-account cleanup after explicit backup confirmation; never auto-save.
 new_command() {
-    local name="${1:-}"
+    local active confirmation zone='' pending='' zone_seen='' credentials entry path label
+    local -a cleanup_paths
     require_shell_hook || return 1
-    check_name "$name" || return 1
-
-    if [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
-        echo -e "${RED}Error: Account '${name}' already exists${NC}"
-        return 1
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --timezone)
+                [ "$#" -ge 2 ] && [ -z "$zone_seen" ] || {
+                    echo "Error: --timezone requires one value and may appear only once" >&2; return 1;
+                }
+                zone="$2"
+                valid_timezone "$zone" || { echo "Error: Invalid timezone" >&2; return 1; }
+                zone_seen=yes; shift 2 ;;
+            *) echo "Error: new accepts only [--timezone <ZONE>]; name a profile with 'ccacc save <name>'" >&2; return 1 ;;
+        esac
+    done
+    printf "Have you already run '$SCRIPT_NAME save <name>' to back up this account? (y/N): " >&2
+    if ! IFS= read -r confirmation; then confirmation=''; fi
+    case "$confirmation" in y|Y|yes) ;; *) echo "Cleanup cancelled; run '$SCRIPT_NAME save <name>' first." >&2; return 1 ;; esac
+    # Validate the entire bounded cleanup set, including optional credentials,
+    # before stopping processes or modifying any account/session metadata.
+    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$PENDING_TIMEZONE_FILE"; do
+        _ccacc_shell_path "$path" file || { echo "Error: Unsafe cleanup path; cleanup incomplete: $path" >&2; return 1; }
+    done
+    if [ -f "$CLAUDE_JSON" ]; then
+        jq -se 'length == 1 and (.[0] | type) == "object"' "$CLAUDE_JSON" >/dev/null || return 1
     fi
-    prepare_account_metadata "$@" || return 1
-    check_ready
-
-    local active=$(active_account)
-    ask_password
-    save_prepared_metadata "$name" || return 1
-    stop_claude || return 1
-    note_device_keys
-    backup_active
-
-    if ! replace_credentials '' || ! reset_account_state; then
-        echo -e "${RED}Error: Failed to start a new account${NC}"
-        return 1
+    if [ -f "$CREDENTIALS_FILE" ]; then
+        cleanup_credentials_file_is_valid || {
+            echo "Error: Malformed optional credentials file; cleanup incomplete, credentials unchanged" >&2; return 1;
+        }
     fi
-    stash_paths "$active"
-    save_account "$name" || return 1
-    echo "$name" > "$ACTIVE_FILE"
-
-    echo -e "${GREEN}Started new Claude account: ${name}${NC}"
-
-    # Before the login, so it already goes out through the account's own exit
-    setup_surge "$name"
-    apply_surge "$name"
-    echo "Run 'claude /login' to sign in; it is saved to '${name}' when you switch away"
+    credentials=$(read_credentials) && claude_login_only "$credentials" >/dev/null || {
+        echo "Error: Cannot read valid credentials; cleanup incomplete" >&2; return 1;
+    }
+    for entry in "${ACCOUNT_PATHS[@]}"; do cleanup_paths+=("${entry#*|}"); done
+    for entry in sessions ide daemon jobs remote-settings.json policy-limits.json policy-limits.json.stamp.json plugins/plugin-directory-cache-v2.json plugins/plugin-catalog-cache.json; do
+        cleanup_paths+=("$CONFIG_DIR/$entry")
+    done
+    _ccacc_shell_path "$HOME/.claude_backups" dir || {
+        echo "Error: Unsafe recovery backup directory; cleanup incomplete" >&2; return 1;
+    }
+    # Only the cleaner's recognized timestamped recovery copies contain account
+    # residue. Unrecognized backup names and all named ccacc profiles stay intact.
+    for path in "$HOME/.claude_backups"/claude_*; do
+        label=${path##*/}
+        if [[ "$label" =~ ^claude_(\.claude\.json|claude\.json|dir)_[0-9]{8}_[0-9]{6}$ ]]; then
+            cleanup_paths+=("$path")
+        fi
+    done
+    for path in "${cleanup_paths[@]}"; do
+        cleanup_path_is_safe "$path" || { echo "Error: Unsafe cleanup path; cleanup incomplete: $path" >&2; return 1; }
+    done
+    active=$(cleanup_matching_active)
+    if [ -n "$active" ]; then
+        cleanup_path_is_safe "$ACCOUNTS_DIR/$active" || return 1
+        for entry in "${ACCOUNT_PATHS[@]}"; do
+            label=${entry%%|*}; path=${entry#*|}
+            cleanup_path_is_safe "$ACCOUNTS_DIR/$active/$label" || return 1
+            if [ -e "$path" ] && [ -e "$ACCOUNTS_DIR/$active/$label" ]; then
+                echo "Error: Saved history already exists; cleanup incomplete, resolve the stash conflict first" >&2
+                return 1
+            fi
+        done
+    fi
+    if [ -z "$(active_account)" ]; then pending=$(read_timezone_file "$PENDING_TIMEZONE_FILE") || pending=''; fi
+    [ -n "$zone" ] || zone=$pending
+    if [ -z "$zone" ]; then zone=$(choose_timezone 'unnamed session') || return 1; fi
+    cleanup_stop_processes && cleanup_runtime_is_safe || {
+        echo "Error: Live or unverifiable processes/runtime owners; cleanup incomplete" >&2; return 1;
+    }
+    if [ -n "$active" ]; then
+        # Existing save files remain untouched. Move only live history, retaining
+        # prior stash entries when their live counterpart is absent.
+        for entry in "${ACCOUNT_PATHS[@]}"; do
+            label=${entry%%|*}; path=${entry#*|}
+            if [ -e "$path" ]; then
+                mkdir -p -m 700 "$ACCOUNTS_DIR/$active" || return 1
+                mv "$path" "$ACCOUNTS_DIR/$active/$label" || return 1
+            fi
+        done
+    fi
+    mkdir -p -m 700 "$CONFIG_DIR" || return 1
+    if [ ! -f "$CLAUDE_JSON" ]; then (umask 077; printf '{}\n' > "$CLAUDE_JSON") || return 1; fi
+    if ! replace_credentials '' || ! cleanup_optional_credentials_file || ! reset_account_state; then
+        echo "Error: Account cleanup incomplete" >&2; return 1
+    fi
+    for path in "${cleanup_paths[@]}"; do
+        cleanup_path_is_safe "$path" && rm -rf -- "$path" || { echo "Error: Account cleanup incomplete: $path" >&2; return 1; }
+    done
+    set_pending_timezone "$zone" && rm -f "$ACTIVE_FILE" || { echo "Error: Session setup incomplete" >&2; return 1; }
+    echo "Cleaned current account; started unnamed Claude session (logged out)."
+    echo "Run 'claude /login', then '$SCRIPT_NAME save <name>' to name and save it."
 }
 
 # Function to (re)choose the Surge policies of an account; applied right away when it is active

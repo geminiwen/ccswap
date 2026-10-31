@@ -88,7 +88,7 @@ exec "$@"
     def cli(self, *args, success=True):
         return self.run_process(["/bin/bash", str(self.core), *args], success=success)
 
-    def harness(self, body, success=True):
+    def harness(self, body, success=True, stdin="yes\n"):
         # Source the actual core file so its BASH_SOURCE points to deployment.
         # Only credential/account movement and process/Surge work are replaced.
         mocks = r'''
@@ -97,6 +97,9 @@ ask_password() { printf 'password\n' >> "$HOME/operations"; }
 save_account() { printf '{}\n' > "$ACCOUNTS_DIR/$1.json"; }
 load_account() { printf 'load %s\n' "$1" >> "$HOME/operations"; }
 backup_active() { :; }
+cleanup_stop_processes() { stop_claude; }
+cleanup_runtime_is_safe() { :; }
+read_credentials() { printf '{}'; }
 stop_claude() { printf 'stop\n' >> "$HOME/operations"; }
 note_device_keys() { :; }
 stash_paths() { :; }
@@ -106,7 +109,7 @@ replace_credentials() { printf 'credentials\n' >> "$HOME/operations"; }
 setup_surge() { :; }
 apply_surge() { :; }
 '''
-        return self.run_process(["/bin/bash", "-c", mocks + "\n" + body], success=success)
+        return self.run_process(["/bin/bash", "-c", mocks + "\n" + body], success=success, stdin=stdin)
 
     def startup(self, shell, definition=None, zdotdir=False):
         self.env["SHELL"] = "/bin/" + shell
@@ -256,12 +259,12 @@ apply_surge() { :; }
                 # Already-active use must neither ask for a password nor write hook files.
                 self.harness('ask_password() { return 97; }; use_command sydney')
                 for command in ("save sydney --timezone Australia/Sydney", "use sydney", "use tokyo",
-                                "new fresh --timezone Australia/Sydney"):
+                                "new --timezone Australia/Sydney"):
                     result = self.harness("main " + command)
                     self.assertNotIn("hook installed", result.stdout)
                     self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
                                       for p in paths}, before)
-                self.assertEqual(self.cli("timezone", "fresh").stdout, "Australia/Sydney\n")
+                self.assertEqual(self.cli("timezone").stdout, "Australia/Sydney\n")
                 self.assertFalse(self.launches.exists())
 
     def test_missing_library_and_unsupported_shell_fail_before_account_operations(self):
@@ -393,6 +396,36 @@ apply_surge() { :; }
         self.assertEqual(json.loads((private / "managed.json").read_text())["version"], 2)
         self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
                           for p in preserved}, preserved)
+
+    def test_explicit_install_never_sources_corrupt_or_orphaned_hook(self):
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                if shell == "zsh":
+                    self.reset_fixture()
+                self.startup(shell, "TZ=UTC claude --model fixture", zdotdir=shell == "zsh")
+                self.cli("install")
+                private = self.home / ".ccacc-shell"
+                hook = private / "hook.sh"
+                record = private / "managed.json"
+                saved_record = record.read_bytes()
+                hook.write_text('printf executed > "$HOME/hook-executed"\n')
+                before = self.home_snapshot()
+                result = self.cli("install", success=False)
+                self.assertIn("inspect and move aside", result.stderr)
+                self.assertEqual(self.home_snapshot(), before)
+                self.assertFalse((self.home / "hook-executed").exists())
+                record.unlink()
+                before = self.home_snapshot()
+                self.cli("install", success=False)
+                self.assertEqual(self.home_snapshot(), before)
+                self.assertFalse((self.home / "hook-executed").exists())
+                # Explicit fixture-only manual recovery retains the verified
+                # original record and regenerates a missing hook safely.
+                record.write_bytes(saved_record)
+                hook.unlink()
+                self.cli("install")
+                self.harness("require_shell_hook")
+                self.assertFalse((self.home / "hook-executed").exists())
 
     def test_corrupt_hook_is_not_sourced_by_zsh_installed_check(self):
         self.startup("zsh", "TZ=UTC claude", zdotdir=True)

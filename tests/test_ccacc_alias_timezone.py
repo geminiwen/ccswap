@@ -72,6 +72,10 @@ exec /bin/{shell} {'--noprofile --norc' if shell == 'bash' else '-f'} -c '. "$AL
         mocks = '''
 ask_password() { MASTER_PASSWORD=fixture-only; }
 require_shell_hook() { :; }
+cleanup_stop_processes() { stop_claude; }
+cleanup_runtime_is_safe() { :; }
+_ccacc_shell_path() { :; }
+read_credentials() { printf '{}'; }
 save_account() { printf '{"userID":"fixture-id"}' > "$ACCOUNTS_DIR/$1.json"; }
 setup_surge() { :; }
 apply_surge() { :; }
@@ -370,31 +374,26 @@ save_account() { printf 'save\\n' >> "$FORBIDDEN"; return 98; }
         self.metadata_path().unlink()
         self.assertEqual(self.run_cli("timezone", "example", success=False).stdout, "")
 
-    def test_new_obtains_timezone_before_clearing_credentials(self):
+    def test_new_saves_explicit_pending_timezone_after_confirmed_clean(self):
         (self.home / ".claude.json").write_text("{}")
         (self.accounts / "original.json").write_text("{}")
         (self.accounts / ".active").write_text("original\n")
         self.run_harness('''
 stop_claude() { :; }
-note_device_keys() { :; }
+stash_paths() { :; }
 reset_account_state() { :; }
 replace_credentials() {
-    [ "$(timezone_command fresh)" = Australia/Sydney ] || return 97
     printf 'cleared' > "$HOME/credential-change"
 }
-main new fresh --timezone Australia/Sydney
-''')
+main new --timezone Australia/Sydney
+''', stdin="yes\n")
         self.assertEqual((self.home / "credential-change").read_text(), "cleared")
-        self.assertEqual((self.accounts / ".active").read_text(), "fresh\n")
-        self.assertFalse(self.metadata_path("fresh").exists())
-        self.run_harness('''
-stop_claude() { :; }
-note_device_keys() { :; }
-reset_account_state() { :; }
-replace_credentials() { [ "$(timezone_command prompted)" = Europe/London ]; }
-main new prompted
-''', stdin="8\nEurope/London\n")
-        self.assertEqual(self.run_cli("timezone", "prompted").stdout, "Europe/London\n")
+        self.assertFalse((self.accounts / ".active").exists())
+        self.assertEqual(self.run_cli("timezone").stdout, "Australia/Sydney\n")
+        self.assertFalse((self.accounts / "fresh.json").exists())
+        # Repeating an already-clean session reuses the explicit pending choice.
+        self.run_harness("stop_claude() { :; }; replace_credentials() { :; }; reset_account_state() { :; }; main new", stdin="yes\n")
+        self.assertEqual(self.run_cli("timezone").stdout, "Australia/Sydney\n")
 
     def test_probe_failure_preserves_backup(self):
         (self.alias_metadata / "example.json").write_text("fixture-unchanged")

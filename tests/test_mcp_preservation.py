@@ -41,6 +41,9 @@ keychain_write() {
 }
 ask_password() { :; }
 require_shell_hook() { :; }
+cleanup_stop_processes() { stop_claude; }
+cleanup_runtime_is_safe() { :; }
+_ccacc_shell_path() { :; }
 stop_claude() { :; }
 note_device_keys() { :; }
 setup_surge() { :; }
@@ -81,7 +84,7 @@ def main():
                 env.pop('BASH_ENV', None)
                 env.pop('ENV', None)
                 result = subprocess.run(['bash', '-c', SOURCE + '\n' + MOCKS + '\n' + body],
-                                        env=env, capture_output=True, text=True)
+                                        env=env, capture_output=True, text=True, input="yes\n")
                 assert (result.returncode == 0) == expect_success, (backend, body, result.stdout, result.stderr)
                 count += 1
                 return fixture, state
@@ -143,7 +146,7 @@ load_account legacy
             fixture, state = run(r'''
 save_account original
 printf 'original\n' > "$ACTIVE_FILE"
-new_command fresh --timezone UTC
+new_command --timezone UTC
 ''')
             assert json.loads(state.read_text()) == {k: v for k, v in BASE.items() if k != 'claudeAiOauth'}
             assert not (fixture / 'home/.claude/accounts/fresh.credentials.enc').exists()

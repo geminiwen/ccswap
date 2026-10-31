@@ -30,21 +30,24 @@ ccacc install                              # Install once, before any account se
 ccacc save personal                         # Choose timezone on first setup; optionally back up its alias
 ccacc save work --alias work-claude         # Select a different alias to back up
 ccacc save work --timezone Australia/Sydney # Choose the timezone explicitly
-ccacc new personal --timezone Europe/London # Require a timezone before resetting login
+ccacc new --timezone Europe/London          # Clean to an unnamed logged-out session
+claude /login                              # Sign in using the pending session timezone
+ccacc save personal                        # Name and store the newly logged-in account
 ccacc alias work work-claude                # Back up the alias without saving credentials
 ccacc timezone work                        # Print the saved timezone
 ccacc timezone                             # Default to the active saved account
 ccacc timezone work Australia/Sydney        # Set timezone metadata only
 ```
 
-`save <name>` and `new <name>` accept `--alias <alias-name>` and `--timezone <ZONE>`
-in either order. An explicit `--timezone` takes priority; otherwise they reuse an
-existing valid timezone from `.timezones`. First setup requires an explicit numbered
-choice: UTC, Asia/Shanghai, Asia/Tokyo, Australia/Sydney, Europe/London,
+`save <name>` accepts `--alias <alias-name>` and `--timezone <ZONE>` in either order.
+An explicit `--timezone` takes priority, followed by an existing named choice in
+`.timezones`. With no active profile or prior named choice, save can consume the
+explicit pending-session timezone selected by `new`. Otherwise first setup requires
+a numbered choice: UTC, Asia/Shanghai, Asia/Tokyo, Australia/Sydney, Europe/London,
 America/New_York, America/Los_Angeles, or a custom IANA timezone entry.
 There is no default or automatic detection from aliases, environment `TZ`, system
 settings or account names. Invalid input, an empty choice or EOF fails immediately
-before passwords, credentials, process shutdown, active-account changes or metadata
+before password prompts, credential changes, process shutdown, active-account changes or metadata
 writes. Invalid, missing, duplicate and unknown flags also fail before any writes.
 Save/new/use first check the existing shell installation without writing it, before
 any timezone prompts, passwords, metadata, process shutdown or credential changes.
@@ -63,7 +66,7 @@ that query; the captured alias body is never evaluated or executed. Shell
 startup/logout output is ignored. Missing aliases and failed probes leave any
 existing alias backup unchanged. `ccacc alias` skips unsupported shells with a warning;
 save/new/use fail if their required shell installation is invalid.
-An absent alias creates no alias-definition backup; save/new can still proceed
+An absent alias creates no alias-definition backup. Save can still proceed
 with a saved timezone, `--timezone`, or a valid prompted choice.
 
 Backups are JSON in `~/.claude/accounts/.aliases/<account>.json`, written atomically with
@@ -84,13 +87,52 @@ Legacy alias records may remain on disk; their `env.TZ` is ignored. Zones select
 explicitly must use safe timezone-name characters and exist as files under
 `/usr/share/zoneinfo`.
 
-`ccacc timezone` reads only independent `.timezones` metadata. It never prompts,
+`ccacc timezone <name>` reads only that profile's independent `.timezones` metadata.
+The no-argument getter reads the active profile's zone; only when no profile is
+active can it read the pending session zone. A named query never falls back to
+pending metadata or an alias. The getter never prompts,
 starts a shell, asks for a master password, accesses credentials, stops processes,
 or changes account state. It
 prints one validated timezone and a newline on success. Missing or invalid TZ
 returns nonzero with no stdout. `ccacc rm <account>` also removes that account's alias backup and
 independent timezone metadata; metadata alone does not make an account appear
 in `ls` or `current`.
+
+`ccacc new [--timezone <ZONE>]` takes no profile name or alias flag. It first asks
+whether you already ran `ccacc save <name>` to back up the current account. The
+default is No: empty input, EOF and any answer other than `y`, `Y` or `yes` cancel
+before credentials are read, processes stopped, or session/account metadata written.
+New never automatically saves credentials or creates a named profile. After an
+explicit confirmation, it can discard an unsaved login too.
+
+Confirmed cleanup removes the current default Claude login by field from Keychain
+and an optional `.credentials.json`, retaining MCP OAuth and other fields. It resets
+IDs, account caches, project history/trust and counters; meaningful project MCP
+configuration and server selections, including explicit `false`, are preserved.
+It clears the enumerated account history/cache paths and runtime directories
+(`session-env`, `tasks`, `sessions`, `ide`, `daemon`, `jobs`) only after safe path and
+process checks. Ancestor processes are never signaled. Live or unverifiable owners,
+symlinked cleanup paths, malformed optional credentials or stash conflicts stop the
+operation with an incomplete/error result, rather than reporting a full cleanup.
+Recognized timestamped `claude_...` recovery copies in `~/.claude_backups` are
+cleared; unrecognized backup names and all named ccacc profile backups remain.
+
+Saved profiles, their independent timezones and Surge settings, MCP/shared device
+keys, settings, skills, plugins, knowledge, hooks, other config directories and
+Desktop state remain intact. When the active saved profile's identity matches the
+current account, live history (including feedback drafts) moves into that existing
+profile's stash without overwriting saved backups. A mismatched marker never writes
+another profile's history. New keeps the current Surge route; profile policy setup
+happens only when saving a named profile. The external `cccleaner` tool is not invoked.
+
+New sessions require an explicit `--timezone` or numbered menu choice, never an
+inferred/default zone. The choice is private pending metadata in
+`~/.claude/accounts/.pending-timezone` (mode `600`). Successful cleanup removes
+`.active` and creates no named profile. The generated launcher reads the pending
+zone so `claude /login` works before a profile has a name. Then `ccacc save <name>`
+backs up the login, activates the named profile and clears pending metadata only
+after a successful save and activation. Repeated cleanup still requires backup
+confirmation, and can reuse the explicitly selected pending timezone.
 
 Run `ccacc install` explicitly, then **source the printed hook path once in your
 current shell**. Installation requires only `jq`, Bash or Zsh, the adjacent companion
@@ -105,8 +147,11 @@ alias for `install`; its optional account argument is ignored.
 private record, required original-alias backup and managed source entries in the
 actual startup files. They never install or repair hook configuration. Valid
 installations work with read-only startup files. Moved deployments, changed Zsh
-startup directories, shadowed Bash login files, missing entries and modified hook
-bytes require an explicit `ccacc install`. Existing valid version-1 records are
+startup directories, shadowed Bash login files and missing entries require an
+explicit `ccacc install`. A modified hook is refused before any startup probe can
+source it. Inspect that private hook and move it aside manually before rerunning
+install; valid saved records allow the missing hook to be regenerated. Corrupt
+private records require manual review. Existing valid version-1 records are
 recognized without writes; explicit installation upgrades their records.
 Zsh checks initialize a shell to discover its effective startup directory; Bash
 checks read its known startup paths directly. Hook bytes are validated before

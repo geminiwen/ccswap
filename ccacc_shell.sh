@@ -254,6 +254,9 @@ _ccacc_shell_hook() (
         _ccacc_shell_path "$path" file || { _ccacc_shell_error 'unsafe private hook target'; return 1; }
     done
     if [ ! -f "$private/managed.json" ] && [ "$check_only" != --installed ]; then
+        [ ! -e "$private/original-alias.json" ] && [ ! -e "$private/hook.sh" ] || {
+            _ccacc_shell_error 'orphaned private hook files require manual review'; return 1;
+        }
         _ccacc_shell_probe_context || return 1
     fi
     if [ -f "$private/managed.json" ]; then
@@ -293,8 +296,11 @@ _ccacc_shell_hook() (
             _ccacc_shell_error 'unsupported Claude alias; use literal assignments, env, or _op_agent env with a claude executable and literal arguments'; return 1;
         }
     fi
-    if [ "$check_only" = --installed ]; then
-        _ccacc_shell_check_text || return 1
+    if [ "$check_only" = --installed ] || [ -f "$private/hook.sh" ]; then
+        if ! _ccacc_shell_check_text; then
+            _ccacc_shell_error "inspect and move aside the unverified $private/hook.sh manually, then run ccacc install"
+            return 1
+        fi
     fi
     # Existing Zsh hooks are verified before startup context can source them.
     if [ -f "$private/managed.json" ]; then

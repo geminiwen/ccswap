@@ -193,9 +193,10 @@ restart stopped processes or recreate running sessions.
 Older versions encrypted login backups as `<name>.credentials.enc` with a master
 password. The first `save` or `use` that finds such files asks for that password
 once, converts every backup to a plain file, and only then removes the encrypted
-files and `.check.enc`. A wrong or missing password, or any failure, leaves the
-encrypted backups untouched and changes nothing else. `rm` deletes either form
-without a password.
+files and `.check.enc`. A converted backup keeps its original fields: one written
+before logins became login-only can still carry `mcpOAuth`, which restore writes
+back. A wrong or missing password, or any failure, leaves the encrypted backups
+untouched and changes nothing else. `rm` deletes either form without a password.
 
 The archive includes these `~/.claude` paths:
 
@@ -215,8 +216,11 @@ remote/policy cache files, plugin directory/catalog caches and recognized
 timestamped cleaner recovery copies. Those extra runtime paths are not part of
 the account archive.
 
-MCP OAuth and unrelated credential fields stay shared and are never restored from
-account login backups. Shared device keys, shared MCP configuration, settings, skills,
+MCP OAuth stays shared: new login backups hold only `claudeAiOauth`, and unrelated
+credential fields are never restored from them. A backup written by an older ccacc
+that still carries `mcpOAuth` writes those entries back on restore, replacing live
+entries for the same server while keeping live entries the backup does not know
+about. Shared device keys, shared MCP configuration, settings, skills,
 installed plugins, knowledge, shell hooks and Claude Desktop data remain in place.
 Meaningful project MCP definitions/selections survive `new`, including explicit
 `false`. Suffixed Keychain items, other Claude config directories and Cowork device

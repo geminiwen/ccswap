@@ -567,18 +567,29 @@ claude_login_only() {
 }
 
 # Keep live MCP OAuth and all unrelated fields; switch only the Claude login.
+# Backups from versions that stored the whole Keychain item still carry mcpOAuth:
+# write those entries back (they replace live entries for the same server) while
+# keeping live entries the backup does not know about.
 # Updating in place also retains the existing Keychain access rules.
 replace_credentials() {
-    local login current merged
-    if ! login=$(claude_login_only "$1") \
+    local login current merged backup
+    backup="$1"
+    if ! login=$(claude_login_only "$backup") \
         || ! current=$(read_credentials); then
         echo -e "${RED}Error: Could not read the Claude login; credentials unchanged${NC}"
         return 1
     fi
     [ -n "$current" ] || current='{}'
-    if ! merged=$(printf '%s\n%s\n' "$current" "$login" | jq -cse '
-        if length != 2 or (.[0] | type) != "object" then error("invalid credentials")
-        else (.[0] | del(.claudeAiOauth)) + .[1] end
+    [ -n "$backup" ] || backup='{}'
+    if ! merged=$(printf '%s\n%s\n%s\n' "$current" "$login" "$backup" | jq -cse '
+        if length != 3 or (.[0] | type) != "object" or (.[2] | type) != "object" then error("invalid credentials")
+        else
+            (.[0] | del(.claudeAiOauth)) as $live
+            | (if (.[2].mcpOAuth | type) == "object" and (.[2].mcpOAuth | length) > 0
+               then $live + {mcpOAuth: (($live.mcpOAuth // {}) + .[2].mcpOAuth)}
+               else $live end)
+            + .[1]
+        end
     ' 2>/dev/null); then
         echo -e "${RED}Error: Invalid current credentials; credentials unchanged${NC}"
         return 1

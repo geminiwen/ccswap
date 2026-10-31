@@ -84,14 +84,33 @@ def main():
                 count += 1
                 return fixture, state
 
-            for target in (TARGET, {'claudeAiOauth': TARGET['claudeAiOauth']}):
+            # Older whole-item backups write their mcpOAuth entries back; unrelated
+            # fields stay live and entries only the live item has are kept.
+            for target, mcp_oauth in (
+                    (TARGET, {**BASE['mcpOAuth'], **TARGET['mcpOAuth']}),
+                    ({'claudeAiOauth': TARGET['claudeAiOauth']}, BASE['mcpOAuth'])):
                 _, state = run('replace_credentials "$(cat "$FIXTURE/target.json")"', target=target)
-                expected = {**BASE, 'claudeAiOauth': TARGET['claudeAiOauth']}
+                expected = {**BASE, 'mcpOAuth': mcp_oauth, 'claudeAiOauth': TARGET['claudeAiOauth']}
                 assert json.loads(state.read_text()) == expected
 
-            for target in ('', {}, {'mcpOAuth': TARGET['mcpOAuth']}, {'claudeAiOauth': None}):
+            # A server present in both is replaced whole by the backup's entry.
+            overlap = {'claudeAiOauth': TARGET['claudeAiOauth'],
+                       'mcpOAuth': {'figma': {'accessToken': 'fixture-backup-figma'}}}
+            _, state = run('replace_credentials "$(cat "$FIXTURE/target.json")"', target=overlap)
+            assert json.loads(state.read_text()) == {
+                **BASE, 'mcpOAuth': {'figma': {'accessToken': 'fixture-backup-figma'}},
+                'claudeAiOauth': TARGET['claudeAiOauth']}
+
+            for target, mcp_oauth in (
+                    ('', BASE['mcpOAuth']),
+                    ({}, BASE['mcpOAuth']),
+                    ({'mcpOAuth': {}}, BASE['mcpOAuth']),
+                    ({'mcpOAuth': TARGET['mcpOAuth']}, {**BASE['mcpOAuth'], **TARGET['mcpOAuth']}),
+                    ({'claudeAiOauth': None}, BASE['mcpOAuth'])):
                 _, state = run('replace_credentials "$(cat "$FIXTURE/target.json")"', target=target)
-                assert json.loads(state.read_text()) == {k: v for k, v in BASE.items() if k != 'claudeAiOauth'}
+                expected = {k: v for k, v in BASE.items() if k != 'claudeAiOauth'}
+                expected['mcpOAuth'] = mcp_oauth
+                assert json.loads(state.read_text()) == expected
 
             _, state = run('replace_credentials "$(cat "$FIXTURE/target.json")"', current='',
                            target={'claudeAiOauth': TARGET['claudeAiOauth']})
@@ -134,7 +153,9 @@ printf '%s' "$(cat "$FIXTURE/target.json")" > "$ACCOUNTS_DIR/legacy.credentials"
 printf '{"userID":"fixture-target-id"}' > "$ACCOUNTS_DIR/legacy.json"
 load_account legacy
 ''')
-            assert json.loads(state.read_text()) == {**BASE, 'claudeAiOauth': TARGET['claudeAiOauth']}
+            assert json.loads(state.read_text()) == {
+                **BASE, 'mcpOAuth': {**BASE['mcpOAuth'], **TARGET['mcpOAuth']},
+                'claudeAiOauth': TARGET['claudeAiOauth']}
             assert json.loads((fixture / 'home/.claude.json').read_text())['mcpServers'] == {'fixture': {'type': 'http'}}
 
             fixture, state = run(r'''
@@ -174,6 +195,7 @@ use_command original
 ''')
             expected = json.loads(json.dumps(BASE))
             expected['claudeAiOauth']['accessToken'] = 'fixture-original-refreshed'
+            expected['mcpOAuth'].update(TARGET['mcpOAuth'])
             expected['mcpOAuth']['extra'] = {'accessToken': 'fixture-new-shared'}
             assert json.loads(state.read_text()) == expected
     print(f'PASS: {count} isolated checks against the mocked macOS Keychain; '

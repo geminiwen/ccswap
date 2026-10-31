@@ -552,12 +552,14 @@ main new
         self.saved_active()
         self.run_body("main new")
         self.login("unsaved@example.invalid")
-        before = self.snapshot()
-        operations = self.operations()
-        result = self.run_body("main use kept", success=False)
-        self.assertIn("save", result.stdout + result.stderr)
-        self.assertEqual(self.snapshot(), before)
-        self.assertEqual(self.operations(), operations + ["read"])
+        for options in ("", " --yes --no-yolo"):
+            before = self.snapshot()
+            operations = self.operations()
+            result = self.run_body("main use kept" + options, success=False)
+            self.assertIn("save", result.stdout + result.stderr)
+            self.assertNotIn("Confirm outgoing backup", result.stderr)
+            self.assertEqual(self.snapshot(), before)
+            self.assertEqual(self.operations(), operations + ["read"])
 
     def test_unnamed_restore_config_write_failure_cannot_claim_success(self):
         self.saved_active()
@@ -581,8 +583,10 @@ main new
         history.mkdir()
         (history / "unsaved").write_text("must save first")
         before = self.snapshot()
-        self.run_body("main use kept", success=False)
-        self.assertEqual(self.snapshot(), before)
+        for options in ("", " --yes --no-yolo"):
+            result = self.run_body("main use kept" + options, success=False)
+            self.assertNotIn("Confirm outgoing backup", result.stderr)
+            self.assertEqual(self.snapshot(), before)
 
     def test_full_cleanup_whitelist_preserves_saved_and_shared_assets(self):
         self.accounts.mkdir(parents=True)

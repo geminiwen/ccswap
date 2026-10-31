@@ -98,8 +98,8 @@ Commands:
   save <name> [--timezone <ZONE>]
                         Back up the current account and its timezone
   timezone [name]       Print the saved TZ only (defaults to the active account)
-  use <name> [--yolo|--no-yolo]
-                        Switch accounts and choose the current selection launch mode
+  use <name> [--yes] [--yolo|--no-yolo]
+                        Confirm outgoing backup, switch, and choose the launch mode
   new
                         Confirm prior backup, then clean to an unnamed logged-out session
                         (logged out; run 'claude /login', then 'ccacc save <name>')
@@ -118,6 +118,9 @@ With Surge installed, save asks which policies the account uses and use applies 
 without Surge no policy selection is asked.
 Install/reinstall with: $INSTALL_COMMAND
 Only use requires the installed shell hook; save/new never install or repair it.
+Switching away from a saved account previews its backup and asks to proceed (y/N).
+Noninteractive switches between saved accounts require --yes to confirm that backup.
+--yes never enables YOLO. Saved timezone and Surge choices stay unchanged.
 Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
 Only save records a timezone; use 'save <name> --timezone <ZONE>' to change it.
 New clears the active timezone. Unnamed sessions launch Claude with TZ unset.
@@ -1102,16 +1105,58 @@ save_command() (
     echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
 )
 
+# Preview metadata only: never fetch credentials or print account/config values.
+confirm_outgoing_backup() {
+    local outgoing="$1" incoming="$2" keys entry path found=false answer=''
+    if [ ! -t 0 ] || [ ! -t 2 ]; then
+        printf "Error: Switching from '%s' to '%s' saves the current account to profile '%s'.\n" \
+            "$outgoing" "$incoming" "$outgoing" >&2
+        printf "Run '%s use %s --yes' to confirm the outgoing backup (--yes does not enable YOLO).\n" \
+            "$SCRIPT_NAME" "$incoming" >&2
+        return 1
+    fi
+    keys=$(jq -r --argjson keys "$ACCOUNT_KEYS" \
+        '[keys_unsorted[] | select(. as $key | $keys | index($key))] | join(", ")' \
+        "$CLAUDE_JSON") || return 1
+    printf "Will save the current account to profile '%s', then switch to '%s'.\n" "$outgoing" "$incoming" >&2
+    printf 'Saved contents:\n  - Encrypted Claude login credentials (claudeAiOauth only).\n' >&2
+    printf '  - Account-bound ~/.claude.json keys present: %s (names only; no values).\n' "${keys:-none}" >&2
+    printf '  - Existing account history/session/cache paths:\n' >&2
+    for entry in "${ACCOUNT_PATHS[@]}"; do
+        path="${entry#*|}"
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            printf '      %s\n' "~${path#"$HOME"}" >&2
+            found=true
+        fi
+    done
+    if [ "$found" = false ]; then printf '      (none present)\n' >&2; fi
+    printf 'Active files/directories move into ~/.claude/accounts/%s/ stash; they are not copied.\n' "$outgoing" >&2
+    printf 'Saved timezone (TZ) and Surge choices remain unchanged.\nConfirm outgoing backup? (y/N) ' >&2
+    if { IFS= read -r answer < /dev/tty; } 2>/dev/null; then
+        case "$answer" in y|Y|[yY][eE][sS]) return 0 ;; esac
+    fi
+    printf "Switch cancelled; profile '%s' remains active.\n" "$outgoing" >&2
+    return 1
+}
+
 # Function to switch to a saved account
 use_command() (
-    local name="${1:-}" zone active mode=false answer='' staged_mode=''
-    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "Error: use requires a name and optional --yolo or --no-yolo" >&2; return 1; }
-    case "${2:-}" in
-        '') ;;
-        --yolo) mode=true ;;
-        --no-yolo) ;;
-        *) echo "Error: Expected --yolo or --no-yolo" >&2; return 1 ;;
-    esac
+    local name="${1:-}" zone active mode=false answer='' staged_mode='' mode_option='' backup_confirmed=false
+    [ "$#" -ge 1 ] || { echo "Error: use requires a name [--yes] [--yolo|--no-yolo]" >&2; return 1; }
+    shift
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --yes)
+                [ "$backup_confirmed" = false ] || { echo "Error: Duplicate --yes" >&2; return 1; }
+                backup_confirmed=true ;;
+            --yolo|--no-yolo)
+                [ -z "$mode_option" ] || { echo "Error: Duplicate or conflicting launch mode options" >&2; return 1; }
+                mode_option="$1"
+                if [ "$1" = --yolo ]; then mode=true; fi ;;
+            *) echo "Error: Unknown use option '$1'; expected --yes, --yolo or --no-yolo" >&2; return 1 ;;
+        esac
+        shift
+    done
     require_shell_hook || return 1
     cleanup_is_complete || return 1
     check_name "$name" || return 1
@@ -1135,14 +1180,17 @@ use_command() (
         echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
         return 1
     fi
+    trap 'exit 130' INT
+    if [ -n "$active" ] && [ "$active" != "$name" ] && [ "$backup_confirmed" = false ]; then
+        confirm_outgoing_backup "$active" "$name" || return 1
+    fi
     # Validate and stage this session record before passwords or process/account
     # mutations. A failed selection leaves the previous launch mode untouched.
     _ccacc_shell_path "$LAUNCH_MODE_FILE" file && cleanup_file_is_writable "$LAUNCH_MODE_FILE" || {
         echo "Error: Current launch mode cannot be safely updated; account unchanged" >&2; return 1;
     }
     trap '[ -z "$staged_mode" ] || rm -f "$staged_mode"' EXIT
-    trap 'exit 130' INT
-    if [ "$#" = 1 ] && [ -t 0 ] && [ -t 2 ]; then
+    if [ -z "$mode_option" ] && [ -t 0 ] && [ -t 2 ]; then
         printf 'YOLO? (y/N) ' >&2
         if { IFS= read -r answer < /dev/tty; } 2>/dev/null; then
             case "$answer" in y|Y|[yY][eE][sS]) mode=true ;; esac

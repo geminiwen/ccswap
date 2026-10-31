@@ -32,6 +32,7 @@ ccacc save work --timezone Australia/Sydney  # Explicit timezone choice
 ccacc new                                   # Confirm prior backup, then clean/logout
 claude /login                               # Unnamed session: BROWSER=false, TZ unset
 ccacc save personal --timezone Europe/London # Name and save the login and timezone
+ccacc use                                   # Pick a saved profile on a terminal
 ccacc use work                              # Restore profile/TZ and choose YOLO (y/N)
 ccacc use work --no-yolo                    # Explicit normal permissions; --yolo opts in
 ccacc use work --yes --no-yolo              # Confirm outgoing backup for automation
@@ -141,6 +142,20 @@ A clean logged-out unnamed session can `use <saved-name>` directly without
 creating an empty profile. An unsaved Claude OAuth login or unowned history must
 first be preserved with `save <name>`; `use` refuses to discard it.
 
+`ccacc use` without a name opens a terminal-only saved-profile picker. Up/Down
+arrows or `j`/`k` move the highlight; Return accepts; `q`, Esc, Ctrl-C or EOF
+cancels without changing account/profile/mode data. The active profile is marked
+and initially highlighted, otherwise the first profile is highlighted. Each row
+shows its saved name, saved email and saved timezone when available; invalid or
+symlinked JSON profiles are excluded. Longer lists show a scrolling page of up
+to eight profiles. Labels are sanitized and clipped to the terminal width.
+Bare Esc takes up to one second to distinguish it from an arrow-key sequence.
+The menu goes to stderr, so redirecting stdout works. No-name use requires both
+stdin and stderr to be terminals and never consumes piped password input.
+`--yes` and one of `--yolo`/`--no-yolo` may accompany the picker, but `--yes`
+never automatically selects a profile. Selection still runs the normal target,
+timezone, installed-hook and recovery checks before any account changes.
+
 When switching between saved accounts, `use` previews the outgoing profile name,
 incoming target, encrypted Claude login backup (`claudeAiOauth` only), and existing
 account history, session and cache paths. The preview displays no values and never fetches login
@@ -157,9 +172,10 @@ as a stash; they are restored when returning. A failed outgoing backup stops the
 switch.
 Noninteractive switching between saved accounts fails without reading password
 stdin unless `--yes` is supplied. `ccacc use work --yes --no-yolo` explicitly
-confirms that backup and selects normal permissions; the two options may appear
-in either order. `--yes` skips only the outgoing-backup confirmation and never
-enables YOLO. Duplicate, conflicting and unknown options are rejected.
+confirms that backup and selects normal permissions; options and the optional
+name may appear in either order. `--yes` skips only the outgoing-backup
+confirmation and never enables YOLO. Duplicate, conflicting and unknown options
+are rejected.
 Selecting the already-active account never reloads its older backup; it only
 updates the current YOLO choice, without outgoing-backup confirmation. A clean
 unnamed session also needs no outgoing confirmation; unsaved login/history still

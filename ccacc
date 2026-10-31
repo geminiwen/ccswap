@@ -98,8 +98,8 @@ Commands:
   save <name> [--timezone <ZONE>]
                         Back up the current account and its timezone
   timezone [name]       Print the saved TZ only (defaults to the active account)
-  use <name> [--yes] [--yolo|--no-yolo]
-                        Confirm outgoing backup, switch, and choose the launch mode
+  use [name] [--yes] [--yolo|--no-yolo]
+                        Pick a saved account, confirm backup, and choose launch mode
   new
                         Confirm prior backup, then clean to an unnamed logged-out session
                         (logged out; run 'claude /login', then 'ccacc save <name>')
@@ -121,6 +121,8 @@ Only use requires the installed shell hook; save/new never install or repair it.
 Switching away from a saved account previews its backup and asks to proceed (y/N).
 Noninteractive switches between saved accounts require --yes to confirm that backup.
 --yes never enables YOLO. Saved timezone and Surge choices stay unchanged.
+Without a name, use requires a terminal: arrows or j/k move, Return selects,
+q, Esc, Ctrl-C or EOF cancel. --yes never automatically selects a profile.
 Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
 Only save records a timezone; use 'save <name> --timezone <ZONE>' to change it.
 New clears the active timezone. Unnamed sessions launch Claude with TZ unset.
@@ -139,6 +141,7 @@ Examples:
   claude /login
   $SCRIPT_NAME save work
   $SCRIPT_NAME use personal
+  $SCRIPT_NAME use
 
 EOF
 }
@@ -1135,11 +1138,111 @@ confirm_outgoing_backup() {
     return 1
 }
 
+# Shared by discovery and the final selected-target check; never reads credentials.
+valid_saved_account() {
+    check_name "$1" >/dev/null 2>&1 && [ -f "$ACCOUNTS_DIR/$1.json" ] \
+        && [ ! -L "$ACCOUNTS_DIR/$1.json" ] \
+        && jq -se 'length == 1 and (.[0] | type) == "object"' \
+            "$ACCOUNTS_DIR/$1.json" >/dev/null 2>&1
+}
+
+# Read-only terminal UI. stdout is exclusively the chosen safe name, so command
+# substitution and redirected caller stdout both work. Keep ISIG enabled for
+# Ctrl-C and restore the exact terminal state on every exit (including signals).
+pick_saved_account() (
+    local file name email zone active='' selected=0 index start end key suffix
+    local tty_state='' size rows=24 columns=80 page=8 drawn=0 line marker
+    local -a names labels
+    if [ ! -t 0 ] || [ ! -t 2 ]; then
+        echo "Error: ccacc use without a name requires a terminal; use 'ccacc use <name> [--yes] [--yolo|--no-yolo]'" >&2
+        return 1
+    fi
+    command -v jq >/dev/null 2>&1 || { echo "Error: jq is required" >&2; return 1; }
+    # A symlinked marker is not trusted for display or initial selection.
+    if [ -f "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ]; then
+        active=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z"))
+            | rtrimstr("\n")' "$ACTIVE_FILE" 2>/dev/null) || active=''
+    fi
+    names=() labels=()
+    for file in "$ACCOUNTS_DIR"/*.json; do
+        name=${file##*/}; name=${name%.json}
+        valid_saved_account "$name" || continue
+        # Printable ASCII only: saved metadata cannot inject terminal escapes,
+        # newlines, bidi controls or shell code. Cap before rendering, too.
+        email=$(jq -r '(.oauthAccount? | if type == "object" then .emailAddress else null end)
+            | if type == "string" then gsub("[^ -~]"; "?") | .[0:160] else "" end' "$file") || email=''
+        zone=''
+        if [ -f "$TIMEZONES_DIR/$name" ] && [ ! -L "$TIMEZONES_DIR/$name" ]; then
+            zone=$(read_timezone_file "$TIMEZONES_DIR/$name") || zone=''
+        fi
+        index=${#names[@]}
+        names[index]=$name
+        line="$name"
+        [ "$name" != "$active" ] || { selected=$index; line="$line (active)"; }
+        [ -z "$email" ] || line="$line | $email"
+        [ -z "$zone" ] || line="$line | TZ=$zone"
+        labels[index]=$line
+    done
+    if [ "${#names[@]}" -eq 0 ]; then
+        echo "No saved profiles. Save the current account with: ccacc save <name> --timezone <ZONE>" >&2
+        return 1
+    fi
+    exec 3< /dev/tty || return 1
+    tty_state=$(stty -g <&3) || return 1
+    trap 'stty "$tty_state" <&3 2>/dev/null || : ' EXIT
+    trap 'exit 130' INT
+    trap 'exit 129' HUP
+    trap 'exit 143' TERM
+    size=$(stty size <&3 2>/dev/null) || size=''
+    if [[ "$size" =~ ^[0-9]+[[:space:]][0-9]+$ ]]; then
+        rows=${size% *}; columns=${size#* }
+    fi
+    [ "$rows" -gt 0 ] || rows=24
+    [ "$columns" -gt 1 ] || columns=80
+    columns=$((columns - 1)) # Avoid autowrap at the last terminal column.
+    page=$((rows - 4)); [ "$page" -ge 1 ] || page=1
+    [ "$page" -le 8 ] || page=8
+    # Let read -s -n manage its own temporary input modes. Manually disabling
+    # canonical input first makes Bash 3.2 restore that intermediate state after
+    # an INT trap, overriding our restoration and leaving the terminal unusable.
+    while :; do
+        while [ "$drawn" -gt 0 ]; do printf '\033[A\033[2K' >&2; drawn=$((drawn - 1)); done
+        printf '%.*s\n' "$columns" 'Choose saved profile (Up/Down or j/k, Return selects; q/Esc cancels)' >&2
+        start=$((selected / page * page)); end=$((start + page))
+        [ "$end" -le "${#names[@]}" ] || end=${#names[@]}
+        for ((index=start; index<end; index++)); do
+            marker=' '; [ "$index" -ne "$selected" ] || marker='>'
+            printf '%.*s\n' "$columns" "$marker ${labels[index]}" >&2
+        done
+        printf '%.*s\n' "$columns" "Profiles $((start + 1))-$end of ${#names[@]}" >&2
+        drawn=$((end - start + 2))
+        key=''
+        if ! IFS= read -r -s -n 1 key <&3; then
+            printf 'Profile selection cancelled.\n' >&2; return 1
+        fi
+        case "$key" in
+            '') printf '%s\n' "${names[selected]}"; return 0 ;;
+            q|$'\004') printf 'Profile selection cancelled.\n' >&2; return 1 ;;
+            $'\033')
+                # Bash 3.2 supports integer read timeouts. A bare Esc cancels
+                # after at most one second; accept CSI and application arrows.
+                suffix=''
+                if IFS= read -r -s -n 1 -t 1 suffix <&3 && { [ "$suffix" = '[' ] || [ "$suffix" = O ]; }; then
+                    key=''
+                    IFS= read -r -s -n 1 -t 1 key <&3 || key=''
+                    case "$key" in A) key=k ;; B) key=j ;; *) key=ignored ;; esac
+                else printf 'Profile selection cancelled.\n' >&2; return 1; fi ;;
+        esac
+        case "$key" in
+            j) selected=$(((selected + 1) % ${#names[@]})) ;;
+            k) selected=$(((selected + ${#names[@]} - 1) % ${#names[@]})) ;;
+        esac
+    done
+)
+
 # Function to switch to a saved account
 use_command() (
-    local name="${1:-}" zone active mode=false answer='' staged_mode='' mode_option='' backup_confirmed=false
-    [ "$#" -ge 1 ] || { echo "Error: use requires a name [--yes] [--yolo|--no-yolo]" >&2; return 1; }
-    shift
+    local name='' name_seen=false zone active mode=false answer='' staged_mode='' mode_option='' backup_confirmed=false status
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --yes)
@@ -1149,20 +1252,29 @@ use_command() (
                 [ -z "$mode_option" ] || { echo "Error: Duplicate or conflicting launch mode options" >&2; return 1; }
                 mode_option="$1"
                 if [ "$1" = --yolo ]; then mode=true; fi ;;
-            *) echo "Error: Unknown use option '$1'; expected --yes, --yolo or --no-yolo" >&2; return 1 ;;
+            -*) echo "Error: Unknown use option '$1'; expected --yes, --yolo or --no-yolo" >&2; return 1 ;;
+            *)
+                [ "$name_seen" = false ] || { echo "Error: use accepts at most one account name" >&2; return 1; }
+                check_name "$1" >&2 || return 1
+                name="$1"; name_seen=true ;;
         esac
         shift
     done
     require_shell_hook || return 1
     cleanup_is_complete || return 1
+    trap 'exit 130' INT
+    if [ "$name_seen" = false ]; then
+        status=0
+        name=$(pick_saved_account) || status=$?
+        [ "$status" -eq 0 ] || return "$status"
+    fi
     check_name "$name" || return 1
     if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
         echo -e "${RED}Error: Account '${name}' not found${NC}"
         list_accounts
         return 1
     fi
-    if [ -L "$ACCOUNTS_DIR/${name}.json" ] || ! jq -se 'length == 1 and (.[0] | type) == "object"' \
-        "$ACCOUNTS_DIR/${name}.json" >/dev/null 2>&1; then
+    if ! valid_saved_account "$name"; then
         echo "Error: Invalid saved account '$name'; account unchanged" >&2
         return 1
     fi
@@ -1176,7 +1288,6 @@ use_command() (
         echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
         return 1
     fi
-    trap 'exit 130' INT
     if [ -n "$active" ] && [ "$active" != "$name" ] && [ "$backup_confirmed" = false ]; then
         confirm_outgoing_backup "$active" "$name" || return 1
     fi

@@ -212,7 +212,7 @@ printf '%s\n' "$remaining"
                 self.run_body("main use sydney --yes --no-yolo")
 
     def test_bad_options_fail_before_any_system_boundary(self):
-        for args in ("", "tokyo --yes --yes", "tokyo --yolo --yolo", "tokyo --no-yolo --no-yolo",
+        for args in ("tokyo --yes --yes", "tokyo --yolo --yolo", "tokyo --no-yolo --no-yolo",
                      "tokyo --yes --yolo --no-yolo", "tokyo --no-yolo --yes --yolo",
                      "tokyo --yes --unknown", "tokyo extra", "tokyo ''"):
             with self.subTest(args=args):

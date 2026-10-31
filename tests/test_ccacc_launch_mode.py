@@ -264,14 +264,143 @@ main use tokyo --no-yolo
         self.fixture.env["HOME"] = "relative-fixture-home"
         self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
 
-    def test_save_does_not_store_yolo_in_profile_backups_or_change_selection_mode(self):
+    def remove_profile(self, name, stdin="y\n", success=True):
+        return self.fixture.run_process(["/bin/bash", str(self.fixture.core), "rm", name],
+                                        stdin=stdin, success=success)
+
+    def test_removed_name_cannot_resurrect_previous_yolo_choice(self):
         self.fixture.harness("main use sydney --yolo")
-        before = self.mode.read_bytes()
+        self.remove_profile("sydney")
+        self.assertFalse(self.mode.exists())
         self.fixture.harness("main save sydney --timezone UTC")
-        self.assertEqual(self.mode.read_bytes(), before)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+        self.launch(["-p", "opaque caller arg"])
+        self.assertEqual(self.fixture.records(self.fixture.launches)[-1]["args"], ["-p", "opaque caller arg"])
+
+    def test_renaming_and_reusing_name_cannot_resurrect_previous_choice(self):
+        self.fixture.harness("main use sydney --yolo")
+        self.fixture.harness("main save renamed --timezone UTC")
+        self.assertFalse(self.mode.exists())
+        self.fixture.harness("main save sydney --timezone UTC")
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+
+    def test_save_replacing_identity_under_same_name_invalidates_choice(self):
+        profile = self.accounts / "sydney.json"
+        profile.write_text('{"userID":"old-identity"}')
+        self.fixture.harness("main use sydney --yolo")
+        (self.home / ".claude.json").write_text('{"userID":"new-identity"}')
+        self.fixture.harness(r'''
+save_account() { command jq '{userID}' "$CLAUDE_JSON" > "$ACCOUNTS_DIR/$1.json"; }
+main save sydney --timezone UTC
+''')
+        self.assertEqual(json.loads(profile.read_text())["userID"], "new-identity")
+        self.assertFalse(self.mode.exists())
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+
+    def test_removing_unrelated_profile_preserves_retained_active_choice(self):
+        self.fixture.harness("main use sydney --yolo")
+        self.mode.chmod(0o400)
+        before = self.mode.read_bytes(), self.mode.stat().st_mtime_ns, self.mode.stat().st_ino
+        self.remove_profile("tokyo")
+        self.assertEqual((self.mode.read_bytes(), self.mode.stat().st_mtime_ns, self.mode.stat().st_ino), before)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "true\n")
+
+    def test_deleting_dormant_mode_owner_invalidates_only_that_choice(self):
+        self.seed("tokyo")
+        self.remove_profile("tokyo")
+        self.assertFalse(self.mode.exists())
+        self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
+        self.assertTrue((self.accounts / "sydney.json").exists())
+
+    def test_unsafe_mode_path_blocks_save_and_delete_before_profile_changes(self):
+        target = self.home / "mode-link-target"
+        target.write_text('{"version":1,"account":"sydney","yolo":true}')
+        self.mode.symlink_to(target)
+        before = self.fixture.home_snapshot()
+        self.remove_profile("sydney", success=False)
+        self.fixture.harness("main save renamed --timezone UTC", success=False)
+        self.assertEqual(self.fixture.home_snapshot(), before)
+        self.assertTrue(self.mode.is_symlink())
+
+    def test_cancelled_delete_and_failed_password_preserve_prior_state(self):
+        self.fixture.harness("main use sydney --yolo")
+        before = self.fixture.home_snapshot()
+        for answer in ("n\n", "\n", ""):
+            self.remove_profile("sydney", stdin=answer, success=False)
+            self.assertEqual(self.fixture.home_snapshot(), before)
+        self.fixture.harness("ask_password() { return 91; }; main save renamed --timezone UTC", success=False)
+        self.assertEqual(self.fixture.home_snapshot(), before)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "true\n")
+
+    def test_mode_permission_failure_precedes_profile_deletion_and_save(self):
+        self.fixture.harness("main use sydney --yolo")
+        self.mode.chmod(0o400)
+        if os.access(self.mode, os.W_OK):
+            self.skipTest("Current user can write mode-0400 files")
+        before = self.fixture.home_snapshot()
+        self.remove_profile("sydney", success=False)
+        self.assertEqual(self.fixture.home_snapshot(), before)
+        self.fixture.harness("main save renamed --timezone UTC", success=False)
+        self.assertEqual(self.fixture.home_snapshot(), before)
+        self.assertFalse((self.home / "operations").exists())
+
+    def test_failed_save_restores_profile_and_runtime_choice(self):
+        self.fixture.harness("main use sydney --yolo")
+        profile = self.accounts / "sydney.json"
+        profile.write_text('{"userID":"prior-identity"}')
+        before = self.fixture.home_snapshot()
+        self.fixture.harness(r'''
+ask_password() { :; }
+save_account() { printf '{"userID":"replacement"}' > "$ACCOUNTS_DIR/$1.json"; return 91; }
+main save sydney --timezone UTC
+''', success=False)
+        self.assertEqual(profile.read_text(), '{"userID":"prior-identity"}')
+        self.assertEqual(self.fixture.home_snapshot(), before)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "true\n")
+
+    def test_failed_delete_staging_restores_target_and_runtime_choice(self):
+        self.fixture.harness("main use sydney --yolo")
+        (self.accounts / "sydney.credentials.enc").write_text("fixture encrypted backup")
+        before = self.fixture.home_snapshot()
+        self.fixture.harness(r'''
+mv() { if [ "$1" = "$ACCOUNTS_DIR/sydney.credentials.enc" ]; then return 91; fi; command mv "$@"; }
+main rm sydney
+''', success=False)
+        self.assertEqual(self.fixture.home_snapshot(), before)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "true\n")
+        self.assertEqual(list(self.accounts.glob(".profile-transaction.*")), [])
+
+    def test_incomplete_rollback_keeps_choice_disabled_and_private_restore_paths(self):
+        self.fixture.harness("main use sydney --yolo")
+        result = self.fixture.harness(r'''
+ask_password() { :; }
+save_account() { printf '{"userID":"replacement"}' > "$ACCOUNTS_DIR/$1.json"; return 91; }
+mv() {
+    case "$1" in
+        "$ACCOUNTS_DIR"/.profile-transaction.*/2)
+            if [ "$2" = "$ACCOUNTS_DIR/sydney.json" ]; then return 92; fi ;;
+    esac
+    command mv "$@"
+}
+main save sydney --timezone UTC
+''', success=False)
+        self.assertIn("rollback incomplete", result.stderr)
+        self.assertIn("manifest.json", result.stderr)
+        self.assertFalse(self.mode.exists())
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+        recovery, = self.accounts.glob(".profile-transaction.*")
+        self.assertEqual(recovery.stat().st_mode & 0o777, 0o700)
+        manifest = json.loads((recovery / "manifest.json").read_text())
+        self.assertEqual(manifest[0]["source"], str(self.mode))
+        self.assertEqual(json.loads((recovery / "0").read_text())["yolo"], True)
+
+    def test_save_invalidates_runtime_choice_without_storing_it_in_backups(self):
+        self.fixture.harness("main use sydney --yolo")
+        self.fixture.harness("main save sydney --timezone UTC")
+        self.assertFalse(self.mode.exists())
         self.assertEqual(json.loads((self.accounts / "sydney.json").read_text()), {})
         self.fixture.harness("main save renamed --timezone UTC")
-        self.assertEqual(self.mode.read_bytes(), before)
+        self.assertFalse(self.mode.exists())
         self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
 
 

@@ -158,8 +158,16 @@ A successful selection publishes one private current-selection record,
 `~/.claude/accounts/.launch-mode` (mode `600`), bound to that profile. This is not
 named profile backup data: `save` records only login, timezone and Surge settings.
 The selected mode applies while that profile is active. The next `use` replaces
-it and a successful `new` clears it; failed/cancelled selections leave the prior
-mode unchanged.
+it; successful `save` and `new` clear it. Save always invalidates runtime consent,
+including a same-name save, because the login identity may have changed. Deleting
+the profile named by the mode clears that choice; deleting another retained
+profile leaves its active choice intact. A name reused after deletion or renaming
+cannot revive an earlier permission choice. Failed/cancelled operations restore
+the prior state, and unsafe or unwritable metadata fails before profile mutation.
+Save/delete stage only their bounded profile/session files in a private directory.
+If rollback cannot complete, the error names retained restore files and a path-only
+`manifest.json`; restore those paths before retrying. Staged runtime consent is
+restored last, only after the account metadata recovers.
 The hook reads this record without passwords, credentials, shell startup or
 installed-check recursion. Only a valid matching `true` adds
 `--dangerously-skip-permissions`; absent, corrupt, stale or unsafe records use

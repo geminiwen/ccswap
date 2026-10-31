@@ -980,26 +980,110 @@ show_current() {
     echo -e "Config dir: ${CONFIG_DIR}"
 }
 
+# Save/delete stage only their bounded profile/session paths. Runtime consent is
+# moved first and restored last, after all account metadata has been restored.
+# Caller locals contain the transaction directory, entries and commit state.
+_ccacc_profile_tx_preflight() {
+    local entry path kind index
+    for entry in "${_ccacc_profile_tx_entries[@]}"; do
+        kind=${entry%%|*}; path=${entry#*|}
+        if ! _ccacc_shell_path "$path" "$kind" || ! cleanup_file_is_writable "$path"; then
+            echo "Error: Unsafe or unwritable profile transaction path; account unchanged: $path" >&2
+            return 1
+        fi
+    done
+    _ccacc_profile_tx_dir=$(mktemp -d "$ACCOUNTS_DIR/.profile-transaction.XXXXXXXX") || return 1
+    if ! (
+        set -o pipefail
+        for ((index=0; index<${#_ccacc_profile_tx_entries[@]}; index++)); do
+            entry=${_ccacc_profile_tx_entries[index]}; kind=${entry%%|*}; path=${entry#*|}
+            jq -cn --arg source "$path" --arg staged "$_ccacc_profile_tx_dir/$index" --arg kind "$kind" \
+                '{source:$source, staged:$staged, kind:$kind}' || exit 1
+        done | jq -s . > "$_ccacc_profile_tx_dir/manifest.json"
+    ); then
+        rm -rf -- "$_ccacc_profile_tx_dir"
+        _ccacc_profile_tx_dir=''
+        return 1
+    fi
+}
+
+_ccacc_profile_tx_stage() {
+    local index path
+    for ((index=0; index<${#_ccacc_profile_tx_entries[@]}; index++)); do
+        path=${_ccacc_profile_tx_entries[index]#*|}
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            mv "$path" "$_ccacc_profile_tx_dir/$index" || return 1
+        fi
+    done
+}
+
+_ccacc_profile_tx_finish() {
+    local index entry path kind failed=''
+    [ -n "$_ccacc_profile_tx_dir" ] || return 0
+    if [ "$_ccacc_profile_tx_committed" = yes ]; then
+        rm -rf -- "$_ccacc_profile_tx_dir" || {
+            echo "Warning: Profile change committed; private staged data retained at $_ccacc_profile_tx_dir" >&2
+        }
+        return 0
+    fi
+    for ((index=${#_ccacc_profile_tx_entries[@]}-1; index>=0; index--)); do
+        entry=${_ccacc_profile_tx_entries[index]}; kind=${entry%%|*}; path=${entry#*|}
+        # Never re-enable consent when any account metadata could not recover.
+        if [ "$path" = "$LAUNCH_MODE_FILE" ] && [ -n "$failed" ]; then continue; fi
+        if [ -e "$_ccacc_profile_tx_dir/$index" ] || [ -L "$_ccacc_profile_tx_dir/$index" ]; then
+            if [ -e "$path" ] || [ -L "$path" ]; then
+                if [ "$_ccacc_profile_tx_writes" != yes ] || [ "$kind" != file ] \
+                    || ! _ccacc_shell_path "$path" file || ! rm -f "$path"; then
+                    failed=yes; continue
+                fi
+            fi
+            mv "$_ccacc_profile_tx_dir/$index" "$path" || failed=yes
+        elif [ "$_ccacc_profile_tx_writes" = yes ]; then
+            _ccacc_shell_path "$path" file && rm -f "$path" || failed=yes
+        fi
+    done
+    if [ -z "$failed" ]; then rm -rf -- "$_ccacc_profile_tx_dir"
+    else
+        echo "Error: Profile operation failed and rollback incomplete; runtime choice stays disabled where staged; restore manifest.json paths from $_ccacc_profile_tx_dir before retrying" >&2
+    fi
+}
+
 # Function to save the current account as <name>
-save_command() {
+save_command() (
     local name="${1:-}"
+    local _ccacc_profile_tx_dir='' _ccacc_profile_tx_committed='' _ccacc_profile_tx_writes=''
+    local -a _ccacc_profile_tx_entries
+    umask 077
     load_shell_companion || return 1
     cleanup_is_complete || return 1
     prepare_account_metadata "$@" || return 1
     check_ready || return 1
+    # Every successful save invalidates current runtime consent, even for the
+    # same name: the current login may be a different identity. Nothing about
+    # launch permissions is stored in the named profile backup.
+    _ccacc_profile_tx_entries=("file|$LAUNCH_MODE_FILE" "file|$ACTIVE_FILE"
+        "file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials.enc"
+        "file|$TIMEZONES_DIR/$name" "file|$LEGACY_PENDING_TIMEZONE_FILE")
+    if [ ! -f "$ACCOUNTS_DIR/$name.surge" ]; then
+        _ccacc_profile_tx_entries+=("file|$ACCOUNTS_DIR/$name.surge")
+    fi
+    _ccacc_profile_tx_preflight || return 1
+    trap '_ccacc_profile_tx_finish' EXIT
+    trap 'exit 130' INT
     ask_password || return 1
+    _ccacc_profile_tx_stage || return 1
+    _ccacc_profile_tx_writes=yes
     save_prepared_metadata "$name" || return 1
-
     save_account "$name" || return 1
     printf '%s\n' "$name" > "$ACTIVE_FILE" || return 1
     rm -f "$LEGACY_PENDING_TIMEZONE_FILE" || return 1
-    echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
-
     if [ ! -f "$ACCOUNTS_DIR/${name}.surge" ]; then
-        setup_surge "$name"
-        apply_surge "$name"
+        setup_surge "$name" || return 1
+        apply_surge "$name" || return 1
     fi
-}
+    _ccacc_profile_tx_committed=yes
+    echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
+)
 
 # Function to switch to a saved account
 use_command() (
@@ -1399,38 +1483,49 @@ surge_command() {
 }
 
 # Function to delete a saved account
-delete_command() {
-    local name="$1"
-    check_name "$name"
-    check_ready
-
+delete_command() (
+    local name="${1:-}" reply='' active
+    local _ccacc_profile_tx_dir='' _ccacc_profile_tx_committed='' _ccacc_profile_tx_writes=''
+    local -a _ccacc_profile_tx_entries
+    umask 077
+    check_name "$name" || return 1
+    check_ready || return 1
+    load_shell_companion || return 1
     if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
         echo -e "${RED}Error: Account '${name}' not found${NC}"
         return 1
     fi
-
-    if [ "$(active_account)" = "$name" ]; then
+    # Inspect only a safe regular session record. Do not alter the runtime mode
+    # of another retained profile, even when that record is read-only.
+    _ccacc_shell_path "$LAUNCH_MODE_FILE" file && \
+        { [ ! -f "$LAUNCH_MODE_FILE" ] || [ -r "$LAUNCH_MODE_FILE" ]; } || {
+        echo "Error: Cannot safely inspect current launch mode; account unchanged" >&2; return 1;
+    }
+    if [ -f "$LAUNCH_MODE_FILE" ] && jq -se --arg account "$name" 'length == 1 and (.[0] |
+        keys == ["account", "version", "yolo"] and .version == 1 and .account == $account and
+        (.yolo | type == "boolean"))' "$LAUNCH_MODE_FILE" >/dev/null 2>&1; then
+        _ccacc_profile_tx_entries=("file|$LAUNCH_MODE_FILE")
+    fi
+    active=$(active_account)
+    if [ "$active" = "$name" ]; then
         echo -e "${YELLOW}Warning: '${name}' is currently active; its login and history stay in place but are no longer saved${NC}"
+        _ccacc_profile_tx_entries+=("file|$ACTIVE_FILE")
     else
         echo -e "${YELLOW}Warning: this deletes the saved login and history of '${name}'${NC}"
     fi
-    read -p "Delete anyway? (y/N): " -n 1 -r
+    if ! IFS= read -r -n 1 -p "Delete anyway? (y/N): " reply; then reply=''; fi
     echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        return 1
-    fi
-
-    if [ "$(active_account)" = "$name" ]; then
-        rm -f "$ACTIVE_FILE"
-    fi
-    rm -f "$ACCOUNTS_DIR/${name}.json"
-    delete_backup "$name" credentials
-    rm -f "$ACCOUNTS_DIR/${name}.surge"
-    rm -f "$ALIASES_DIR/${name}.json"
-    rm -f "$TIMEZONES_DIR/$name"
-    rm -rf "${ACCOUNTS_DIR:?}/${name:?}"
+    case "$reply" in y|Y) ;; *) return 1 ;; esac
+    _ccacc_profile_tx_entries+=("file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials.enc"
+        "file|$ACCOUNTS_DIR/$name.surge" "file|$ALIASES_DIR/$name.json" "file|$TIMEZONES_DIR/$name"
+        "dir|$ACCOUNTS_DIR/$name")
+    _ccacc_profile_tx_preflight || return 1
+    trap '_ccacc_profile_tx_finish' EXIT
+    trap 'exit 130' INT
+    _ccacc_profile_tx_stage || return 1
+    _ccacc_profile_tx_committed=yes
     echo -e "${GREEN}Deleted account: ${name}${NC}"
-}
+)
 
 # Main function
 main() {

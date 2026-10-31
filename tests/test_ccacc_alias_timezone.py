@@ -341,7 +341,7 @@ main new
         self.assertFalse(legacy.exists())
         self.assertFalse((self.accounts / "fresh.json").exists())
         # Repeating cleanup with EOF chooses default and creates no selection.
-        self.run_harness("stop_claude() { :; }; replace_credentials() { :; }; reset_account_state() { :; }; main new", stdin="yes\n")
+        self.run_harness("stop_claude() { :; }; replace_credentials() { :; }; reset_account_state() { :; }; main new")
         self.assertEqual(self.run_cli("timezone", success=False).returncode, 3)
         self.assertFalse(self.timezones.exists())
 

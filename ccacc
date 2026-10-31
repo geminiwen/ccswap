@@ -1752,22 +1752,45 @@ cleanup_rollback() {
     fi
 }
 
-# Full current-account cleanup after explicit backup confirmation; never auto-save.
+# How new treats the current login before cleaning it:
+#   save:<name>  logged in as the active profile's identity; refresh that backup first
+#   clean        logged out, and any active profile owns the history; nothing to lose
+#   ask:<name>   the active profile does not match the current login
+#   ask:         a login that no profile owns
+# Reads only ~/.claude.json while logged in; credentials only to prove a logout.
+new_cleanup_plan() {
+    local active matching credentials
+    active=$(active_account)
+    matching=$(cleanup_matching_active)
+    if [ -f "$CLAUDE_JSON" ] && ! jq -e '.oauthAccount == null' "$CLAUDE_JSON" >/dev/null 2>&1; then
+        if [ -n "$active" ] && [ "$matching" = "$active" ]; then echo "save:$active"; else echo "ask:$active"; fi
+        return 0
+    fi
+    # No account in the config: a login left in either credential store still counts.
+    if ! credentials=$(read_credentials) || ! credentials=$(claude_login_only "$credentials") \
+        || [ "$credentials" != '{}' ] \
+        || { [ -f "$STRAY_CREDENTIALS_FILE" ] && ! jq -e '.claudeAiOauth == null' "$STRAY_CREDENTIALS_FILE" >/dev/null 2>&1; }; then
+        echo "ask:$active"
+    elif [ -z "$active" ] || [ "$matching" = "$active" ]; then
+        echo clean
+    else
+        echo "ask:$active"
+    fi
+}
+
+# Full current-account cleanup. The active profile's own login is backed up
+# first; a logout is cleaned directly; anything else needs confirmation.
 new_command() {
-    local active confirmation credentials entry path label selected_zone
+    local active confirmation credentials entry path label selected_zone plan save_name=''
     local optional_credentials='' optional_existed='' credentials_attempted='' config_attempted='' metadata_attempted=''
     local index destination
     local -a cleanup_paths staged_locations
     load_shell_companion || return 1
     cleanup_is_complete || return 1
     [ "$#" -eq 0 ] || { echo "Error: new accepts no arguments; choose timezone in its menu" >&2; return 1; }
-    printf "Have you already run '$SCRIPT_NAME save <name>' to back up this account? (y/N): " >&2
-    if ! IFS= read -r confirmation; then confirmation=''; fi
-    case "$confirmation" in y|Y|yes) ;; *) echo "Cleanup cancelled; run '$SCRIPT_NAME save <name>' first." >&2; return 1 ;; esac
-    selected_zone=$(choose_timezone 'unnamed session' optional) || return 1
     validate_unnamed_session || return 1
     # Validate the entire bounded cleanup set, including optional credentials,
-    # before stopping processes or modifying any account/session metadata.
+    # before asking, reading the login, stopping processes or modifying anything.
     for path in "$CLAUDE_JSON" "$STRAY_CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE" "$UNNAMED_SESSION_FILE"; do
         _ccacc_shell_path "$path" file || { echo "Error: Unsafe cleanup path; cleanup incomplete: $path" >&2; return 1; }
     done
@@ -1778,6 +1801,24 @@ new_command() {
         cleanup_credentials_file_is_valid || {
             echo "Error: Malformed optional credentials file; cleanup incomplete, credentials unchanged" >&2; return 1;
         }
+    fi
+    plan=$(new_cleanup_plan) || return 1
+    case "$plan" in
+        save:*)
+            save_name=${plan#save:}
+            echo "The current login belongs to active profile '$save_name'; it will be saved before cleanup." >&2 ;;
+        clean)
+            echo "Not logged in; cleaning without a backup." >&2 ;;
+        *)
+            if [ -n "${plan#ask:}" ]; then
+                echo "The current login does not match active profile '${plan#ask:}'; that profile will not be updated." >&2
+            fi
+            printf "Have you already run '$SCRIPT_NAME save <name>' to back up this account? (y/N): " >&2
+            if ! IFS= read -r confirmation; then confirmation=''; fi
+            case "$confirmation" in y|Y|yes) ;; *) echo "Cleanup cancelled; run '$SCRIPT_NAME save <name>' first." >&2; return 1 ;; esac ;;
+    esac
+    selected_zone=$(choose_timezone 'unnamed session' optional) || return 1
+    if [ -f "$STRAY_CREDENTIALS_FILE" ]; then
         optional_existed=yes
         optional_credentials=$(cat "$STRAY_CREDENTIALS_FILE" && printf '.') || return 1
         optional_credentials=${optional_credentials%.}
@@ -1835,9 +1876,21 @@ new_command() {
             }
         done
     fi
+    # Interactive and before any process stop, as in use: a plain backup must not
+    # sit next to a differing encrypted one.
+    if [ -n "$save_name" ]; then migrate_encrypted_backups || return 1; fi
     cleanup_stop_processes && cleanup_runtime_is_safe || {
         echo "Error: Live or unverifiable processes/runtime owners; cleanup incomplete" >&2; return 1;
     }
+    # Save only once Claude is stopped, and only if the login still is that profile's.
+    if [ -n "$save_name" ]; then
+        if [ "$active" != "$save_name" ] || [ "$(cleanup_matching_active)" != "$save_name" ]; then
+            echo "Error: Current login changed while preparing cleanup; nothing cleaned, run '$SCRIPT_NAME new' again" >&2
+            return 1
+        fi
+        save_account "$save_name" || { echo "Error: Could not save profile '$save_name'; nothing cleaned" >&2; return 1; }
+        echo "Saved current login to profile '$save_name'." >&2
+    fi
     mkdir -p -m 700 "$CONFIG_DIR" || return 1
     mkdir -p -m 700 "$ACCOUNTS_DIR" || return 1
     # One bounded recovery directory also invalidates the active fastpath if the

@@ -42,7 +42,7 @@ the printed repair command or rerun the installer after resolving the error.
 
 ```bash
 ccacc save personal --timezone Asia/Shanghai # Save the current login and name it
-ccacc new                                   # Confirm backup, choose optional TZ, log out
+ccacc new                                   # Back up/confirm, choose optional TZ, log out
 claude /login                               # Login in the unnamed session
 ccacc save work                              # Choose work's saved timezone independently
 ccacc use personal                          # Auto-back up outgoing account, choose YOLO, switch
@@ -71,7 +71,7 @@ its saved identity, backup, timezone, policy choices and stored stash.
 
 ## Timezones and launches
 
-After backup confirmation, `new` offers UTC, Asia/Shanghai, Asia/Tokyo,
+After the backup step, `new` offers UTC, Asia/Shanghai, Asia/Tokyo,
 Australia/Sydney, Europe/London, America/New_York, America/Los_Angeles, or a custom
 IANA timezone. Blank or EOF means default: `TZ` is genuinely unset in the Claude
 child process. `q` cancels; invalid input fails before process shutdown or account
@@ -172,7 +172,7 @@ boolean, `use` fails with an error naming the file and changes nothing.
 | --- | --- |
 | `save <name>` | Creates a new profile or refreshes the active one; other existing names are refused. Only `claudeAiOauth` goes into `<name>.credentials`; account-bound `~/.claude.json` fields go into `<name>.json`. Save also records the independently chosen timezone and optional Surge policies. Live directories stay in place. |
 | `use <name>` | Updates the outgoing login/config backup, moves its account directories into `~/.claude/accounts/<outgoing>/`, and restores the target's saved login/config and directory stash. Saved timezone and Surge choices stay unchanged. |
-| `new` | Never auto-saves login/config or creates a named profile. After confirmation it logs out and resets account state. If the active saved identity matches the current identity, archive paths move into its stash; unmatched/unnamed paths are cleared. |
+| `new` | Never creates a named profile. If the current login matches the active profile, it first refreshes that profile's login/config backup (like `use` does for the outgoing account) without asking. If not logged in, it cleans without asking. Otherwise (a login that does not match the active profile, or no active profile) it asks for confirmation first. It then logs out and resets account state. Archive paths move into the matching active profile's stash; unmatched/unnamed paths are cleared. |
 
 ccacc writes the `Claude Code-credentials` keychain item the same way Claude Code
 does: through `/usr/bin/security` with hex data on `security -i`'s standard input,

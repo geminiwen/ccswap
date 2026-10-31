@@ -27,7 +27,7 @@ class UnnamedSessionTests(unittest.TestCase):
         self.active = self.accounts / ".active"
         self.shared = {"mcpOAuth": {"fixture": {"accessToken": "shared"}}, "futureField": {"keep": True}}
 
-    def run_body(self, body, success=True, stdin="yes\n", process_mocks=True):
+    def run_body(self, body, success=True, stdin="", process_mocks=True):
         # Only these boundaries are fake. All metadata, backup staging, bounded
         # config reset, history stashing and installation checks use real code.
         mocks = r'''
@@ -61,6 +61,16 @@ new_identity() { printf '{"userID":"new-fixture-id","anonymousId":"new-anonymous
 
     def operations(self):
         return self.ops.read_text().splitlines() if self.ops.exists() else []
+
+    def new_input(self, zone_answer=""):
+        # The confirmation is asked only for a login no matching profile owns.
+        plan = self.run_body("new_cleanup_plan").stdout.strip()
+        return ("yes\n" if plan.startswith("ask:") else "") + zone_answer
+
+    def mismatch_active(self):
+        config = json.loads(self.config.read_text())
+        config["userID"] = "different-unsaved-login"
+        self.config.write_text(json.dumps(config))
 
     def test_new_cancellation_and_rollback_preserve_launch_mode(self):
         self.saved_active()
@@ -184,7 +194,7 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
         self.assertEqual([p.name for p in self.accounts.glob("*.json")], ["kept.json"])
         self.assertEqual(json.loads((self.accounts / "kept.json").read_text())["userID"], "old-id")
         self.assertEqual(json.loads((self.accounts / "kept.credentials").read_text()),
-                         {"claudeAiOauth": {"accessToken": "prior-backup"}})
+                         {"claudeAiOauth": {"accessToken": "fixture-login"}})
         self.assertEqual((self.accounts / "kept/projects/history.json").read_text(), "fixture history")
         self.assertFalse((self.home / ".claude/projects").exists())
         self.assertFalse((self.home / ".claude/sessions").exists())
@@ -210,7 +220,7 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
         live = self.home / ".claude/sessions"
         self.assertEqual({p.name: p.read_bytes() for p in live.iterdir()}, sessions)
         self.assertFalse((self.accounts / "kept/sessions").exists())
-        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main new", stdin="3\n")
         self.assertFalse(live.exists())
         self.assertEqual({p.name: p.read_bytes() for p in (self.accounts / "kept/sessions").iterdir()}, sessions)
         self.run_body("main use kept")
@@ -223,7 +233,7 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
         before = self.snapshot()
         self.run_body("main new", success=False, stdin="n\n")
         self.assertEqual(self.snapshot(), before)
-        self.run_body("main new", success=False, stdin="yes\nq\n")
+        self.run_body("main new", success=False, stdin="q\n")
         self.assertEqual(self.snapshot(), before)
         stash = self.accounts / "kept/sessions"
         stash.mkdir(parents=True)
@@ -258,7 +268,7 @@ main new
                     self.config.write_text(json.dumps(config))
                 else:
                     self.active.unlink(missing_ok=True)
-                self.run_body("main new")
+                self.run_body("main new", stdin=self.new_input())
                 self.assertFalse((self.home / ".claude/sessions").exists())
                 self.assertFalse((self.accounts / "kept/sessions").exists())
                 self.assertFalse((self.accounts / ".cleanup-recovery").exists())
@@ -274,6 +284,7 @@ main new
     def test_unnamed_sessions_entries_and_unsafe_registry_still_block_use(self):
         self.saved_active()
         self.run_body("main new")
+        self.ops.unlink(missing_ok=True)
         sessions = self.home / ".claude/sessions"
         sessions.mkdir()
         for name in ("session.json", "session.key", ".hidden.key", "nested", "dangling.key"):
@@ -420,18 +431,55 @@ main new
         self.assertEqual(json.loads(self.credentials.read_text()), self.shared)
         self.assertEqual(json.loads((self.accounts / "kept.json").read_text())["projects"], config["projects"])
 
-    def test_confirmation_never_auto_saves_or_overwrites_saved_backups(self):
+    def test_matching_login_is_saved_to_active_profile_without_asking(self):
+        self.saved_active()
+        surge = (self.accounts / "kept.surge").read_bytes()
+        result = self.run_body("main new")
+        self.assertNotIn("Have you already run", result.stderr)
+        self.assertIn("will be saved before cleanup", result.stderr)
+        self.assertIn("Saved current login to profile 'kept'", result.stderr)
+        self.assertEqual(json.loads((self.accounts / "kept.credentials").read_text()),
+                         {"claudeAiOauth": {"accessToken": "fixture-login"}})
+        self.assertEqual(json.loads((self.accounts / "kept.json").read_text())["oauthAccount"],
+                         {"emailAddress": "fixture@example.invalid"})
+        self.assertEqual((self.accounts / "kept.surge").read_bytes(), surge)
+        self.assertFalse(self.active.exists())
+        operations = self.operations()
+        # Backups migrate before Claude stops; the login is read for the save only after it.
+        self.assertLess(operations.index("password"), operations.index("stop"))
+        self.assertEqual(operations[operations.index("stop") + 1], "read")
+
+    def test_failed_save_cleans_nothing(self):
+        self.saved_active()
+        before = self.snapshot()
+        result = self.run_body("save_account() { return 98; }; main new", success=False)
+        self.assertIn("Could not save profile 'kept'; nothing cleaned", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn("write", self.operations())
+
+    def test_mismatched_or_unowned_login_asks_and_never_saves(self):
         self.saved_active()
         profiles = {p: p.read_bytes() for p in self.accounts.glob("kept.*")}
-        self.run_body(r'''
+        self.mismatch_active()
+        result = self.run_body(r'''
 save_account() { printf 'unexpected-save' >> "$SESSION_OPERATIONS"; return 98; }
 migrate_encrypted_backups() { printf 'unexpected-password' >> "$SESSION_OPERATIONS"; return 98; }
 main new
-''')
+''', stdin="yes\n")
+        self.assertIn("Have you already run", result.stderr)
         self.assertEqual({p: p.read_bytes() for p in profiles}, profiles)
         self.assertFalse(self.active.exists())
         self.assertNotIn("unexpected-save", self.operations())
         self.assertNotIn("unexpected-password", self.operations())
+
+    def test_logged_out_new_cleans_without_asking(self):
+        self.saved_active()
+        self.run_body("main new")
+        self.ops.unlink(missing_ok=True)
+        result = self.run_body("main new")
+        self.assertIn("Not logged in; cleaning without a backup.", result.stderr)
+        self.assertNotIn("Have you already run", result.stderr)
+        self.assertNotIn("password", self.operations())
 
     def test_legacy_surge_setter_cannot_write_outside_save(self):
         self.saved_active()
@@ -443,9 +491,11 @@ main new
 
     def test_cancellation_precedes_credentials_prompts_processes_and_writes(self):
         self.saved_active()
+        self.mismatch_active()
         before = self.snapshot()
         for answer in ("", "\n", "n\n", "no\n", "YES\n", "sure\n"):
             result = self.run_body("main new", success=False, stdin=answer)
+            self.assertIn("does not match active profile 'kept'", result.stderr)
             self.assertIn("Cleanup cancelled", result.stderr)
             self.assertNotIn("Choose timezone", result.stderr)
             self.assertEqual(self.operations(), [])
@@ -469,7 +519,7 @@ main new
         stash.mkdir(parents=True)
         (stash / "saved.txt").write_text("existing saved history")
         profile = (self.accounts / "kept.json").read_bytes()
-        self.run_body("main new")
+        self.run_body("main new", stdin="yes\n")
         self.assertEqual((stash / "saved.txt").read_text(), "existing saved history")
         self.assertFalse((stash / "history.json").exists())
         self.assertEqual((self.accounts / "kept.json").read_bytes(), profile)
@@ -482,7 +532,7 @@ main new
         remnants.mkdir()
         (remnants / "unowned.txt").write_text("retain this unowned history")
         self.pending.write_text("Europe/Paris\n")
-        result = self.run_body("main new", stdin="y\n8\nEurope/Paris\n")
+        result = self.run_body("main new", stdin="8\nEurope/Paris\n")
         self.assertIn("Choose timezone", result.stderr)
         self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
         self.assertFalse(self.pending.exists())
@@ -507,7 +557,7 @@ main new
         self.assertIn("Cleaned current account", result.stdout)
         self.assertFalse((self.home / ".ccacc-shell/hook.sh").exists())
         self.assertFalse(self.pending.exists())
-        self.run_body("new_command", stdin="yes\n8\nEurope/Paris\n")
+        self.run_body("new_command", stdin="8\nEurope/Paris\n")
         self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
         self.assertFalse((self.home / ".ccacc-shell/hook.sh").exists())
 
@@ -543,7 +593,7 @@ main new
     def test_active_zone_is_not_inferred_for_new(self):
         self.saved_active()
         self.fixture.env["TZ"] = "Australia/Sydney"
-        self.run_body("main new", stdin="yes\n\n")
+        self.run_body("main new", stdin="\n")
         self.assertEqual(self.fixture.cli("timezone", success=False).returncode, 3)
         self.assertEqual(self.fixture.cli("timezone", "kept").stdout, "UTC\n")
         self.assertFalse(self.active.exists())
@@ -555,7 +605,7 @@ main new
                                  ("2\n", "Asia/Shanghai"), ("8\n\n", None),
                                  ("3\n", "Asia/Tokyo"), ("8\n", None)):
             with self.subTest(answer=answer):
-                self.run_body("main new", stdin="yes\n" + answer)
+                self.run_body("main new", stdin=answer)
                 self.assertFalse(self.active.exists())
                 result = self.fixture.cli("timezone", success=expected is not None)
                 self.assertEqual((result.returncode, result.stdout),
@@ -569,7 +619,7 @@ main new
         self.assertEqual(self.fixture.cli("timezone", "kept").stdout, "UTC\n")
 
     def test_selected_unnamed_session_ignores_stale_yolo_record(self):
-        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main new", stdin="3\n")
         (self.accounts / ".launch-mode").write_text('{"version":1,"account":"kept","yolo":true}')
         self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
         result = self.fixture.cli("launch-mode")
@@ -580,7 +630,7 @@ main new
         before = self.snapshot()
         for answer in ("q\n", "Q\n", "9\n", "UTC\n", "8\nInvalid/Zone\n", "\x1b\n", "8\n../UTC\n"):
             with self.subTest(answer=answer):
-                self.run_body("main new", success=False, stdin="yes\n" + answer)
+                self.run_body("main new", success=False, stdin=answer)
                 self.assertEqual(self.snapshot(), before)
                 self.assertEqual(self.operations(), [])
 
@@ -593,7 +643,7 @@ main new
                 self.fixture.cli("configure-shell")
                 hook = self.hook_snapshot()
                 for answer, expected in (("3\n", "Asia/Tokyo"), ("8\nEurope/Paris\n", "Europe/Paris"), ("\n", None)):
-                    self.run_body("main new; require_shell_hook", stdin="yes\n" + answer)
+                    self.run_body("main new; require_shell_hook", stdin=answer)
                     source = shlex.quote(str(self.home / ".ccacc-shell/hook.sh"))
                     parent = self.home / "parent-env.json"
                     code = (f". {source}\nclaude /login\n"
@@ -608,7 +658,7 @@ main new
                     self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
 
     def test_save_uses_explicit_zone_and_retains_pending_on_failure(self):
-        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main new", stdin="3\n")
         self.login()
         before = self.selection.read_bytes()
         for failure in ("migrate_encrypted_backups() { return 1; }", "save_account() { return 1; }",
@@ -624,14 +674,14 @@ main new
         self.assertNotIn("Choose timezone", result.stderr)
         self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
         self.assertFalse(self.selection.exists())
-        self.run_body("main new", stdin="yes\n2\n")
+        self.run_body("main new", stdin="2\n")
         self.login()
         self.run_body("main save other --timezone Europe/Paris")
         self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
         self.assertFalse(self.selection.exists())
 
     def test_selected_unnamed_login_then_first_save_requires_its_own_picker(self):
-        self.run_body("main new", stdin="yes\n8\nEurope/Paris\n")
+        self.run_body("main new", stdin="8\nEurope/Paris\n")
         source = shlex.quote(str(self.home / ".ccacc-shell/hook.sh"))
         self.fixture.interactive("bash", f". {source}\nclaude /login\n", startup=False)
         launch = self.fixture.records(self.fixture.launches)[-1]
@@ -651,7 +701,7 @@ main new
 
     def test_use_retains_selection_on_failure_and_clears_on_success(self):
         self.saved_active()
-        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main new", stdin="3\n")
         before = self.selection.read_bytes()
         for failure in ("migrate_encrypted_backups() { return 1; }", "load_account() { return 1; }",
                         "unstash_paths() { return 1; }", "apply_surge() { return 1; }"):
@@ -661,7 +711,7 @@ main new
             # named timezone still wins a retained stale unnamed selection.
             if self.active.exists():
                 self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
-            self.run_body("main new", stdin="yes\n3\n")
+            self.run_body("main new", stdin=self.new_input("3\n"))
         self.run_body("main use kept")
         self.assertFalse(self.selection.exists())
         self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
@@ -697,7 +747,7 @@ main new
                 self.assertFalse(self.fixture.launches.exists())
 
     def test_unsafe_and_readonly_selection_fail_before_cleanup(self):
-        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main new", stdin="3\n")
         saved = self.selection.read_bytes()
         self.selection.chmod(0o400)
         before = self.snapshot()
@@ -717,7 +767,7 @@ main new
         self.assertEqual(outside.read_bytes(), saved)
 
     def test_unnamed_getter_rejects_symlinked_parent_and_nonregular_metadata(self):
-        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main new", stdin="3\n")
         self.selection.unlink()
         self.selection.mkdir()
         self.assertEqual(self.fixture.cli("timezone", success=False).returncode, 1)
@@ -732,7 +782,7 @@ main new
         self.assertEqual(self.snapshot(), before)
 
     def test_new_metadata_publish_failure_restores_previous_selection(self):
-        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main new", stdin="3\n")
         before = self.selection.read_bytes(), self.selection.stat().st_mtime_ns
         self.run_body(r'''
 mv() {
@@ -740,13 +790,13 @@ mv() {
     command mv "$@"
 }
 main new
-''', success=False, stdin="yes\n2\n")
+''', success=False, stdin="2\n")
         self.assertEqual((self.selection.read_bytes(), self.selection.stat().st_mtime_ns), before)
         self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
         self.assertFalse((self.accounts / ".cleanup-recovery").exists())
 
     def test_metadata_rollback_failure_retains_recovery_and_blocks_launch(self):
-        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main new", stdin="3\n")
         self.run_body(r'''
 mv() {
     if [ "$1" = "$CLEANUP_RECOVERY_DIR/selected-session" ]; then return 1; fi
@@ -757,7 +807,7 @@ cp() {
     command cp "$@"
 }
 main new
-''', success=False, stdin="yes\n2\n")
+''', success=False, stdin="2\n")
         recovery = self.accounts / ".cleanup-recovery"
         self.assertTrue(recovery.exists())
         self.assertEqual(json.loads((recovery / "unnamed-session").read_text())["timezone"], "Asia/Tokyo")
@@ -817,6 +867,7 @@ main new
 
     def test_late_cleanup_failures_restore_history_credentials_and_markers(self):
         self.saved_active()
+        self.run_body("save_account kept")
         config = self.config.read_bytes()
         credentials = self.credentials.read_bytes()
         profiles = {p: p.read_bytes() for p in self.accounts.glob("kept.*")}
@@ -959,7 +1010,7 @@ main new
         self.assertEqual({p: p.read_bytes() for p in profiles}, profiles)
         self.assertEqual([p.name for p in self.accounts.glob("*.json")], ["kept.json"])
         self.assertEqual((self.home / ".claude/projects/history.json").read_text(), "fixture history")
-        self.assertEqual(json.loads(self.credentials.read_text())["claudeAiOauth"], {"accessToken": "prior-backup"})
+        self.assertEqual(json.loads(self.credentials.read_text())["claudeAiOauth"], {"accessToken": "fixture-login"})
         self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"], self.shared["mcpOAuth"])
 
     def test_new_unsaved_login_refuses_use_without_mutation(self):
@@ -1044,7 +1095,7 @@ main new
         unrelated.write_text("unrecognized backup")
         preserved[unrelated] = unrelated.read_bytes()
         hook = self.hook_snapshot()
-        self.run_body("main new")
+        self.run_body("main new", stdin="yes\n")
         self.assertFalse((recovery / "claude_.claude.json_20261031_010101").exists())
         self.assertFalse((recovery / "claude_dir_20261031_010101").exists())
         self.assertEqual({p: p.read_bytes() for p in preserved}, preserved)
@@ -1085,7 +1136,7 @@ read_credentials() { cat "$SESSION_KEYCHAIN"; }
 write_credentials() { printf '%s' "$1" > "$SESSION_KEYCHAIN"; }
 delete_credentials() { rm -f "$SESSION_KEYCHAIN"; }
 main new
-''')
+''', stdin="yes\n")
         self.assertEqual(json.loads(keychain.read_text()), self.shared)
         self.assertEqual(json.loads(self.credentials.read_text()), self.shared)
 

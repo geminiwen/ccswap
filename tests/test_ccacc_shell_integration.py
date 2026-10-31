@@ -491,7 +491,7 @@ apply_surge() { :; }
     def test_public_install_redirects_to_curl_without_writing(self):
         before = self.home_snapshot()
         result = self.cli("install", success=False)
-        self.assertIn("curl -fsSL https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash", result.stderr)
+        self.assertIn("curl -fsSL https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | bash", result.stderr)
         self.assertEqual(self.home_snapshot(), before)
 
     def test_source_adds_deployed_prefix_to_path_once_without_account_operations(self):

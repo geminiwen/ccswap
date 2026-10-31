@@ -154,8 +154,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.prefix / "ccacc_shell.sh").stat().st_mode), 0o600)
         args = self.log_args(self.download_log)
         for file in ("ccacc", "ccacc_shell.sh"):
-            self.assertIn("https://raw.githubusercontent.com/geminiwen/ccswap/" + COMMIT + "/" + file, args)
-        self.assertEqual(args.count("https://api.github.com/repos/geminiwen/ccswap/commits/main"), 1)
+            self.assertIn("https://raw.githubusercontent.com/geminiwen/ccacc/" + COMMIT + "/" + file, args)
+        self.assertEqual(args.count("https://api.github.com/repos/geminiwen/ccacc/commits/main"), 1)
         for flag in ("--disable", "--fail", "--location", "--proto", "--proto-redir"):
             self.assertEqual(args.count(flag), 3)
         self.assertEqual(self.log_args(self.setup_log), [str(self.prefix / "ccacc"), "configure-shell"])
@@ -195,9 +195,9 @@ class InstallerTests(unittest.TestCase):
         self.run_installer()
         self.assertEqual(Path(self.env["BRANCH_STATE"]).read_text(), NEXT_COMMIT)
         urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
-        self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccswap/commits/main",
-                               "https://raw.githubusercontent.com/geminiwen/ccswap/" + COMMIT + "/ccacc",
-                               "https://raw.githubusercontent.com/geminiwen/ccswap/" + COMMIT + "/ccacc_shell.sh"])
+        self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccacc/commits/main",
+                               "https://raw.githubusercontent.com/geminiwen/ccacc/" + COMMIT + "/ccacc",
+                               "https://raw.githubusercontent.com/geminiwen/ccacc/" + COMMIT + "/ccacc_shell.sh"])
 
     def test_explicit_full_sha_bypasses_api(self):
         for commit in (COMMIT, COMMIT.upper()):
@@ -206,7 +206,7 @@ class InstallerTests(unittest.TestCase):
                 self.env.update(CCACC_INSTALL_REF=commit, API_FAIL="yes")
                 self.run_installer()
                 urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
-                self.assertEqual(urls, ["https://raw.githubusercontent.com/geminiwen/ccswap/" + commit + "/" + name
+                self.assertEqual(urls, ["https://raw.githubusercontent.com/geminiwen/ccacc/" + commit + "/" + name
                                         for name in ("ccacc", "ccacc_shell.sh")])
 
     def test_api_failure_and_invalid_responses_never_clobber_or_fetch_files(self):
@@ -226,12 +226,12 @@ class InstallerTests(unittest.TestCase):
                 self.assert_old_pair()
                 self.assertFalse(self.stage_log.exists())
                 urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
-                self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccswap/commits/main"])
+                self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccacc/commits/main"])
 
     def test_short_sha_is_resolved_through_api(self):
         self.env["CCACC_INSTALL_REF"] = COMMIT[:12]
         self.run_installer()
-        self.assertIn("https://api.github.com/repos/geminiwen/ccswap/commits/" + COMMIT[:12],
+        self.assertIn("https://api.github.com/repos/geminiwen/ccacc/commits/" + COMMIT[:12],
                       self.log_args(self.download_log))
 
     def test_missing_prefix_on_path_prints_executable_export(self):

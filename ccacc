@@ -14,7 +14,7 @@ set -e
 
 SCRIPT_NAME="ccacc"
 VERSION="0.1.0"
-INSTALL_COMMAND="curl -fsSL https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash"
+INSTALL_COMMAND="curl -fsSL https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | bash"
 
 # Always the default config dir, whatever CLAUDE_CONFIG_DIR says
 CONFIG_DIR="$HOME/.claude"

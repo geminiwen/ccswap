@@ -17,7 +17,7 @@ login, account-bound configuration, history and session files together.
 Install or update with the same command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | bash
 source "$HOME/.ccacc-shell/hook.sh"
 ```
 
@@ -31,7 +31,7 @@ files together; moving them or changing shell startup files can require a reinst
 To choose another absolute **bin directory**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash -s -- --prefix /absolute/path/to/bin
+curl -fsSL https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | bash -s -- --prefix /absolute/path/to/bin
 ```
 
 Installation rejects symlinked targets or path components. It does not install

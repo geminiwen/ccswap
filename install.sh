@@ -1,5 +1,5 @@
 #!/bin/bash
-# Public bootstrap: curl https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash
+# Public bootstrap: curl https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | bash
 # macOS only. --prefix names the bin directory itself, not its parent. No sudo/package installs.
 
 ccacc_install_main() (
@@ -47,7 +47,7 @@ ccacc_install_main() (
     valid_path "$prefix" || fail 'prefix must be absolute, without dot components or repeated slashes'
     valid_path "$HOME" || fail 'HOME must be absolute, without dot components or repeated slashes'
 
-    repo=${CCACC_INSTALL_REPO:-geminiwen/ccswap}
+    repo=${CCACC_INSTALL_REPO:-geminiwen/ccacc}
     ref=${CCACC_INSTALL_REF:-main}
     case "$repo" in
         */*) owner=${repo%%/*}; name=${repo#*/} ;;

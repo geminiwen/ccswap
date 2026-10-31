@@ -142,16 +142,23 @@ A clean logged-out unnamed session can `use <saved-name>` directly without
 creating an empty profile. An unsaved Claude OAuth login or unowned history must
 first be preserved with `save <name>`; `use` refuses to discard it.
 
-`ccacc use` without a name opens a terminal-only saved-profile picker. Up/Down
+`ccacc use` without a name opens a full-screen terminal saved-profile picker. Up/Down
 arrows or `j`/`k` move the highlight; Return accepts; `q`, Esc, Ctrl-C or EOF
 cancels without changing account/profile/mode data. The active profile is marked
 and initially highlighted, otherwise the first profile is highlighted. Each row
 shows its saved name, saved email and saved timezone when available; invalid or
-symlinked JSON profiles are excluded. Longer lists show a scrolling page of up
-to eight profiles. Labels are sanitized and clipped to the terminal width.
+symlinked JSON profiles are excluded. The selected row uses high-contrast reverse
+video across the terminal width. Longer lists scroll through the available
+viewport, with profile counts and key help at the bottom. Resizing redraws the
+menu within one second; very small terminals prioritize the selected row.
+Labels are sanitized and clipped to the terminal width.
 Bare Esc takes up to one second to distinguish it from an arrow-key sequence.
-The menu goes to stderr, so redirecting stdout works. No-name use requires both
-stdin and stderr to be terminals and never consumes piped password input.
+The menu uses the alternate screen buffer and hides the cursor while open.
+Selection, cancellation, handled signals and input/output errors restore text
+attributes, cursor visibility, the original screen and terminal input settings
+before any backup, YOLO or password prompt. The menu goes to stderr, so
+redirecting stdout works. No-name use requires both stdin and stderr to be
+terminals and never consumes piped password input.
 `--yes` and one of `--yolo`/`--no-yolo` may accompany the picker, but `--yes`
 never automatically selects a profile. Selection still runs the normal target,
 timezone, installed-hook and recovery checks before any account changes.

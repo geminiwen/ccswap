@@ -3,6 +3,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import shlex
 import signal
@@ -12,6 +13,43 @@ import time
 import unittest
 
 import test_ccacc_use_confirmation as confirmation
+
+
+ENTER = '\x1b[?1049h'
+LEAVE = '\x1b[0m\x1b[?25h\x1b[?1049l\x1b[0m\x1b[?25h'
+
+
+def rendered_frames(output, rows, columns):
+    """Model the emitted VT subset, including delayed wrap and reverse cells.
+
+    Reject cursor overflow/newlines/scrolls instead of accepting clipped output.
+    This deliberately has no runtime or third-party dependency.
+    """
+    frames = []
+    for screen in output.split('\x1b[2J\x1b[H')[1:]:
+        screen = screen.split('\x1b[?1049l')[0]
+        cells = [[(' ', False) for _ in range(columns)] for _ in range(rows)]
+        row = col = 0
+        reverse = False
+        for token in re.findall(r'\x1b\[[0-9;?]*[A-Za-z]|[^\x1b]', screen):
+            if token.startswith('\x1b['):
+                if token.endswith('H'):
+                    position = token[2:-1].split(';')
+                    row, col = (int(position[0] or 1) - 1,
+                                int(position[1]) - 1 if len(position) > 1 else 0)
+                    assert 0 <= row < rows and 0 <= col < columns, token
+                elif token == '\x1b[7m':
+                    reverse = True
+                elif token == '\x1b[0m':
+                    reverse = False
+                else:
+                    assert token == '\x1b[?25h', token
+            else:
+                assert token >= ' ' and col < columns, (token, row, col)
+                cells[row][col] = (token, reverse)
+                col += 1
+        frames.append(cells)
+    return frames
 
 
 class ProfilePickerTests(unittest.TestCase):
@@ -27,18 +65,23 @@ class ProfilePickerTests(unittest.TestCase):
             "oauthAccount": {"emailAddress": "saved-tokyo@example.test"}}))
 
     def run_pty(self, args=(), keys=b"q", backup=None, yolo=None, body=None,
-                before_select=None, before_prompt=None, size=(24, 110)):
+                before_select=None, before_prompt=None, size=(24, 110),
+                ready_marker=b"Profiles ", menu_action=None, on_output=None, tty_setup=None):
         code = self.case.mocks + "\n" + (body or "main use " + shlex.join(args))
         stdout = self.fixture.fixture / "picker.stdout"
         before = self.case.snapshot()
         pid, master = pty.fork()
         if pid == 0:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", *size, 0, 0))
+            if tty_setup:
+                termios.tcsetattr(0, termios.TCSANOW, tty_setup(termios.tcgetattr(0)))
             output = os.open(stdout, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             os.dup2(output, 1)
             os.close(output)
             os.execve("/bin/bash", ["bash", "--noprofile", "--norc", "-c", code], self.fixture.env)
         original = termios.tcgetattr(master)
+        if tty_setup:
+            original = tty_setup(original)
         data = b""
         sent = backup_sent = yolo_sent = False
         status = None
@@ -51,16 +94,22 @@ class ProfilePickerTests(unittest.TestCase):
                         data += os.read(master, 65536)
                     except OSError:
                         pass
-                if not sent and b"Profiles " in data:
+                if not sent and ready_marker in data:
                     # Discovery must not stage mode, read passwords/credentials,
                     # stop processes, or alter any profile/session file.
                     self.assertEqual(self.case.snapshot(), before)
                     self.assertEqual(self.case.operations(), [])
                     if before_select:
                         before_select()
+                    if menu_action:
+                        menu_action(pid, master, data)
                     os.write(master, keys)
                     sent = True
+                if on_output:
+                    on_output(pid, master, data)
                 if not backup_sent and b"Confirm outgoing backup? (y/N) " in data:
+                    self.assertIn(LEAVE.encode(), data)
+                    self.assertLess(data.index(LEAVE.encode()), data.index(b"Confirm outgoing backup"))
                     self.assertIsNotNone(backup, data.decode(errors="replace"))
                     self.assertEqual(self.case.operations(), [])
                     if before_prompt:
@@ -68,6 +117,8 @@ class ProfilePickerTests(unittest.TestCase):
                     os.write(master, backup)
                     backup_sent = True
                 if not yolo_sent and b"YOLO? (y/N) " in data:
+                    self.assertIn(LEAVE.encode(), data)
+                    self.assertLess(data.index(LEAVE.encode()), data.index(b"YOLO?"))
                     self.assertIsNotNone(yolo, data.decode(errors="replace"))
                     self.assertEqual(self.case.operations(), [])
                     os.write(master, yolo)
@@ -96,7 +147,140 @@ class ProfilePickerTests(unittest.TestCase):
                 os.waitpid(pid, 0)
             os.close(master)
         self.assertFalse(self.fixture.forbidden.exists())
+        if ENTER.encode() in data:
+            self.assertEqual(data.count(ENTER.encode()), 1)
+            self.assertEqual(data.count(LEAVE.encode()), 1)
+            self.assertIn(b'\x1b[?25l', data)
         return status, data.decode(errors="replace"), stdout.read_text()
+
+    def test_full_viewport_reverse_video_and_bottom_footer(self):
+        for index in range(30):
+            self.fixture.account("account%02d" % index, "UTC")
+        (self.accounts / '.active').unlink()
+        before = self.case.snapshot()
+        status, menu, stdout = self.run_pty(body='pick_saved_account', keys=b'j\r')
+        self.assertEqual((status, stdout), (0, 'account01\n'))
+        frames = rendered_frames(menu, 24, 110)
+        self.assertGreaterEqual(len(frames), 2)
+        first, last = frames[0], frames[-1]
+        self.assertTrue(all(reverse for _, reverse in first[2]))
+        self.assertTrue(all(reverse for _, reverse in last[3]))
+        self.assertFalse(any(reverse for _, reverse in last[2]))
+        self.assertTrue(''.join(c for c, _ in first[21]).startswith('  account19'))
+        self.assertTrue(''.join(c for c, _ in last[22]).startswith('Profiles 1-20 of 32'))
+        self.assertTrue(''.join(c for c, _ in last[23]).startswith('Up/Down j/k: move'))
+        self.assertEqual(self.case.snapshot(), before)
+        self.assertEqual(self.case.operations(), [])
+
+    def test_tiny_and_narrow_screens_never_wrap_or_scroll(self):
+        for size in ((1, 1), (2, 8), (3, 16), (4, 1), (6, 24)):
+            with self.subTest(size=size):
+                before = self.case.snapshot()
+                status, menu, stdout = self.run_pty(body='pick_saved_account', keys=b'j\r',
+                    size=size, ready_marker=b'\x1b[0m\x1b[2J\x1b[H')
+                self.assertEqual((status, stdout), (0, 'tokyo\n'))
+                frames = rendered_frames(menu, *size)
+                self.assertTrue(frames)
+                self.assertTrue(any(all(reverse for _, reverse in row) for row in frames[-1]))
+                self.assertEqual(self.case.snapshot(), before)
+
+    def test_resize_redraws_while_idle_and_keeps_selection(self):
+        state = {}
+
+        def resize(pid, master, data):
+            state['frames'] = data.count(b'\x1b[2J\x1b[H')
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 5, 18, 0, 0))
+            os.killpg(pid, signal.SIGWINCH)
+
+        def accept(pid, master, data):
+            if state and not state.get('accepted') and data.count(b'\x1b[2J\x1b[H') > state['frames']:
+                state['accepted'] = True
+                os.write(master, b'j\r')
+
+        status, menu, stdout = self.run_pty(body='pick_saved_account', keys=b'',
+            menu_action=resize, on_output=accept)
+        self.assertEqual((status, stdout), (0, 'tokyo\n'), menu)
+        self.assertTrue(state.get('accepted'))
+        # The last frame uses the new viewport and pins help to its bottom row.
+        final = '\x1b[2J\x1b[H' + menu.rsplit('\x1b[2J\x1b[H', 1)[1]
+        cells = rendered_frames(final, 5, 18)[0]
+        self.assertTrue(all(reverse for _, reverse in cells[2]))
+        self.assertEqual(''.join(c for c, _ in cells[4]), 'Up/Down j/k: move ')
+        self.assertEqual(self.case.operations(), [])
+
+    def test_idle_timeout_does_not_cancel_or_repaint(self):
+        state = {}
+
+        def idle(pid, master, data):
+            state['started'] = time.monotonic()
+
+        def accept(pid, master, data):
+            if state and not state.get('accepted') and time.monotonic() - state['started'] > 2.2:
+                state['accepted'] = True
+                os.write(master, b'\r')
+
+        before = self.case.snapshot()
+        status, menu, stdout = self.run_pty(body='pick_saved_account', keys=b'',
+            menu_action=idle, on_output=accept)
+        self.assertEqual((status, stdout), (0, 'sydney\n'), menu)
+        self.assertEqual(menu.count('\x1b[2J\x1b[H'), 1)
+        self.assertEqual(self.case.snapshot(), before)
+
+    def test_password_prompt_follows_primary_screen_restore(self):
+        body = r'''ask_password() {
+            printf 'Fixture password? ' >&2
+            printf 'password\n' >> "$OPS"
+            MASTER_PASSWORD=fixture
+        }; main use --yes --no-yolo'''
+        status, menu, _ = self.run_pty(body=body, keys=b'j\r')
+        self.assertEqual(status, 0, menu)
+        self.assertLess(menu.index(LEAVE), menu.index('Fixture password?'))
+        self.case.assert_switched()
+
+    def test_nondefault_terminal_modes_are_preserved_exactly(self):
+        def custom(attributes):
+            attributes[0] &= ~termios.IXON
+            attributes[1] &= ~termios.ONLCR
+            attributes[3] &= ~termios.ECHO
+            attributes[6][termios.VERASE] = b'\x08'
+            return attributes
+
+        for keys in (b'q', b'\x03', b'\r'):
+            with self.subTest(keys=keys):
+                before = self.case.snapshot()
+                status, menu, stdout = self.run_pty(body='pick_saved_account', keys=keys,
+                    tty_setup=custom)
+                self.assertEqual(status, 130 if keys == b'\x03' else 1 if keys == b'q' else 0, menu)
+                self.assertEqual(stdout, 'sydney\n' if keys == b'\r' else '')
+                self.assertEqual(self.case.snapshot(), before)
+
+    def test_hup_term_and_read_render_failures_restore_terminal(self):
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            with self.subTest(signal=sig):
+                before = self.case.snapshot()
+                # Record the actual picker subshell PID, since Bash 3.2 keeps
+                # $$ unchanged in subshells and has no BASHPID. This child only
+                # reports its own PPID; no process-table discovery is needed.
+                pidfile = self.fixture.fixture / 'menu.pid'
+                body = ('stty() { if [ "$1" = -echo ]; then /bin/bash -c '
+                        + shlex.quote('printf "%s" "$PPID"') + ' > '
+                        + shlex.quote(str(pidfile)) + '; fi; command stty "$@"; }; pick_saved_account')
+                def interrupt(pid, master, data):
+                    os.kill(int(pidfile.read_text()), sig)
+                status, menu, stdout = self.run_pty(body=body, keys=b'', menu_action=interrupt)
+                self.assertEqual(status, 128 + sig, menu)
+                self.assertEqual(stdout, '')
+                self.assertEqual(self.case.snapshot(), before)
+        for failure in ('read() { return 1; }; ',
+                        'printf() { if [ "$1" = "\\033[%s;1H" ]; then return 1; fi; builtin printf "$@"; }; '):
+            with self.subTest(failure=failure):
+                before = self.case.snapshot()
+                status, menu, stdout = self.run_pty(body=failure + 'pick_saved_account', keys=b'')
+                self.assertEqual(status, 1, menu)
+                self.assertEqual(stdout, '')
+                self.assertIn(LEAVE, menu)
+                self.assertEqual(self.case.snapshot(), before)
+                self.assertEqual(self.case.operations(), [])
 
     def test_initial_current_saved_labels_and_enter_fast_path(self):
         status, menu, stdout = self.run_pty(["--no-yolo"], b"\r")

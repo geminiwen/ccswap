@@ -1151,8 +1151,13 @@ valid_saved_account() {
 # Ctrl-C and restore the exact terminal state on every exit (including signals).
 pick_saved_account() (
     local file name email zone active='' selected=0 index start end key suffix
-    local tty_state='' size rows=24 columns=80 page=8 drawn=0 line marker
+    local tty_state='' size rows=24 columns=80 page first row line marker
+    local screen=false resized=false read_status interrupted=0 read_started
+    local LC_ALL=C
     local -a names labels
+    # A local SECONDS loses its clock behavior in Bash 3.2. This assignment is
+    # confined to the picker subshell and keeps Bash's elapsed-time variable.
+    SECONDS=0
     if [ ! -t 0 ] || [ ! -t 2 ]; then
         echo "Error: ccacc use without a name requires a terminal; use 'ccacc use <name> [--yes] [--yolo|--no-yolo]'" >&2
         return 1
@@ -1189,40 +1194,92 @@ pick_saved_account() (
     fi
     exec 3< /dev/tty || return 1
     tty_state=$(stty -g <&3) || return 1
-    trap 'stty "$tty_state" <&3 2>/dev/null || : ' EXIT
-    trap 'exit 130' INT
-    trap 'exit 129' HUP
-    trap 'exit 143' TERM
-    size=$(stty size <&3 2>/dev/null) || size=''
-    if [[ "$size" =~ ^[0-9]+[[:space:]][0-9]+$ ]]; then
-        rows=${size% *}; columns=${size#* }
-    fi
-    [ "$rows" -gt 0 ] || rows=24
-    [ "$columns" -gt 1 ] || columns=80
-    columns=$((columns - 1)) # Avoid autowrap at the last terminal column.
-    page=$((rows - 4)); [ "$page" -ge 1 ] || page=1
-    [ "$page" -le 8 ] || page=8
-    # Let read -s -n manage its own temporary input modes. Manually disabling
-    # canonical input first makes Bash 3.2 restore that intermediate state after
-    # an INT trap, overriding our restoration and leaving the terminal unusable.
-    while :; do
-        while [ "$drawn" -gt 0 ]; do printf '\033[A\033[2K' >&2; drawn=$((drawn - 1)); done
-        printf '%.*s\n' "$columns" 'Choose saved profile (Up/Down or j/k, Return selects; q/Esc cancels)' >&2
+    # All helpers live in this subshell. EXIT also covers render/read failures;
+    # leave the alternate buffer before the caller can display normal prompts.
+    _ccacc_picker_cleanup() {
+        trap '' PIPE
+        if [ "$screen" = true ]; then
+            # 1049 can restore saved cursor attributes: reset/show again on the
+            # primary screen as well as before leaving the alternate screen.
+            printf '\033[0m\033[?25h\033[?1049l\033[0m\033[?25h' >&2 || :
+        fi
+        stty "$tty_state" <&3 2>/dev/null || :
+    }
+    trap '_ccacc_picker_cleanup' EXIT
+    # Let an in-progress Bash read finish restoring its temporary modes before
+    # EXIT restores ours; exiting directly inside its signal trap can leave
+    # Bash 3.2 in the intermediate (no-echo/noncanonical) state.
+    trap 'interrupted=130' INT
+    trap 'interrupted=129' HUP
+    trap 'interrupted=143' TERM
+    trap 'exit 1' PIPE
+    # No rendering inside a signal trap: read can be interrupted safely and the
+    # next frame obtains the new dimensions, even if WINCH arrives mid-frame.
+    trap 'resized=true' WINCH
+    _ccacc_picker_line() {
+        # No newlines, including at the right/bottom edge. Absolute positioning
+        # clears pending autowrap before another printable character is sent.
+        printf '\033[%s;1H' "$1" >&2 && printf '%-*.*s' "$columns" "$columns" "$2" >&2
+    }
+    _ccacc_picker_render() {
+        size=$(stty size <&3 2>/dev/null) || return 1
+        if [[ "$size" =~ ^[0-9]+[[:space:]][0-9]+$ ]]; then
+            rows=${size% *}; columns=${size#* }
+        fi
+        [ "$rows" -gt 0 ] || rows=24
+        [ "$columns" -gt 0 ] || columns=80
+        first=1; page=1
+        if [ "$rows" -ge 5 ]; then
+            first=3; page=$((rows - 4))
+        elif [ "$rows" -ge 3 ]; then first=2; fi
         start=$((selected / page * page)); end=$((start + page))
         [ "$end" -le "${#names[@]}" ] || end=${#names[@]}
-        for ((index=start; index<end; index++)); do
-            marker=' '; [ "$index" -ne "$selected" ] || marker='>'
-            printf '%.*s\n' "$columns" "$marker ${labels[index]}" >&2
-        done
-        printf '%.*s\n' "$columns" "Profiles $((start + 1))-$end of ${#names[@]}" >&2
-        drawn=$((end - start + 2))
-        key=''
-        if ! IFS= read -r -s -n 1 key <&3; then
-            printf 'Profile selection cancelled.\n' >&2; return 1
+        printf '\033[0m\033[2J\033[H' >&2 || return 1
+        if [ "$rows" -ge 3 ]; then
+            _ccacc_picker_line 1 'Choose saved profile' || return 1
         fi
+        for ((index=start; index<end; index++)); do
+            row=$((first + index - start))
+            marker=' '; [ "$index" -ne "$selected" ] || marker='>'
+            [ "$index" -ne "$selected" ] || printf '\033[7m' >&2 || return 1
+            _ccacc_picker_line "$row" "$marker ${labels[index]}" || return 1
+            printf '\033[0m' >&2 || return 1
+        done
+        if [ "$rows" -ge 4 ]; then
+            _ccacc_picker_line "$((rows - 1))" "Profiles $((start + 1))-$end of ${#names[@]} | Selected: ${names[selected]}" || return 1
+        fi
+        if [ "$rows" -ge 2 ]; then
+            _ccacc_picker_line "$rows" 'Up/Down j/k: move | Return: select | q/Esc: cancel' || return 1
+        fi
+    }
+    # Suppress echo even between reads and while drawing. Keep ISIG enabled.
+    stty -echo <&3 || return 1
+    screen=true
+    printf '\033[?1049h\033[?25l' >&2 || return 1
+    while :; do
+        [ "$interrupted" -eq 0 ] || return "$interrupted"
+        resized=false
+        _ccacc_picker_render || return 1
+        [ "$resized" = false ] || continue
+        key=''; read_status=1
+        while :; do
+            [ "$interrupted" -eq 0 ] || return "$interrupted"
+            [ "$resized" = false ] || break
+            key=''; read_status=0; read_started=$SECONDS
+            IFS= read -r -s -n 1 -t 1 key <&3 || read_status=$?
+            [ "$interrupted" -eq 0 ] || return "$interrupted"
+            [ "$read_status" -ne 0 ] || break
+            [ "$resized" = false ] || break
+            # Bash 3.2 returns 1 for both timeout and EOF (newer Bash uses
+            # >128 for timeout). An immediate read failure still exits. Polling
+            # bounds idle WINCH/signal handling to one second without repainting.
+            if [ "$SECONDS" -gt "$read_started" ]; then continue; fi
+            return 1
+        done
+        [ "$read_status" -eq 0 ] || continue
         case "$key" in
             '') printf '%s\n' "${names[selected]}"; return 0 ;;
-            q|$'\004') printf 'Profile selection cancelled.\n' >&2; return 1 ;;
+            q|$'\004') return 1 ;;
             $'\033')
                 # Bash 3.2 supports integer read timeouts. A bare Esc cancels
                 # after at most one second; accept CSI and application arrows.
@@ -1231,7 +1288,11 @@ pick_saved_account() (
                     key=''
                     IFS= read -r -s -n 1 -t 1 key <&3 || key=''
                     case "$key" in A) key=k ;; B) key=j ;; *) key=ignored ;; esac
-                else printf 'Profile selection cancelled.\n' >&2; return 1; fi ;;
+                else
+                    [ "$interrupted" -eq 0 ] || return "$interrupted"
+                    [ "$resized" = false ] || continue
+                    return 1
+                fi ;;
         esac
         case "$key" in
             j) selected=$(((selected + 1) % ${#names[@]})) ;;

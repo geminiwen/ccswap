@@ -326,6 +326,40 @@ main new
         self.assertEqual(cleaned["mcpServers"], config["mcpServers"])
         self.assertEqual(cleaned["settings"], config["settings"])
 
+    def test_save_new_use_roundtrip_preserves_previously_reset_only_fields(self):
+        self.saved_active()
+        keys = (
+            "additionalModelCostsCache additionalModelOptionsAnsweredAt announcementImpressions "
+            "apiCreditLinkStatusCache autoCompactWindowsCache bridgeOauthDeadExpiresAt "
+            "bridgeOauthDeadFailCount cachedChromeExtensionInstalled cachedExperimentData "
+            "cachedExperimentFeatures cachedExtraUsageDisabledReason claudeAiMcpEverConnected "
+            "githubWebConnectionStatusCache groveChoiceSeenAt hasAvailableSubscription "
+            "hasRemoteEnvironment mcpNeedsAuthNoticed modelAccessCache orgModelDefaultCache "
+            "penguinModeOrgEnabled promoStartupSeenCount promoStartupStatusCache "
+            "rcLongTurnNudgeSeenCount rcLongTurnNudgeSeenKey seenNotifications tipsHistoryByCommand"
+        ).split()
+        values = [False, 0, {}, [], "fixture-state", {"fixture": [False, 0, "fixture-org"]}]
+        state = {key: values[index % len(values)] for index, key in enumerate(keys)}
+        config = json.loads(self.config.read_text())
+        config.update(state)
+        self.config.write_text(json.dumps(config))
+        self.run_body("main save kept --timezone UTC")
+        saved = (self.accounts / "kept.json").read_bytes()
+        for key, value in state.items():
+            self.assertEqual(json.loads(saved)[key], value)
+        self.run_body("main new")
+        cleaned = json.loads(self.config.read_text())
+        for key in keys:
+            self.assertNotIn(key, cleaned)
+        self.assertEqual((self.accounts / "kept.json").read_bytes(), saved)
+        self.run_body("main use kept")
+        restored = json.loads(self.config.read_text())
+        for key, value in state.items():
+            self.assertEqual(restored[key], value)
+        self.assertEqual(restored["mcpServers"], config["mcpServers"])
+        self.assertEqual(restored["settings"], config["settings"])
+        self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"], self.shared["mcpOAuth"])
+
     def test_saved_account_uuid_can_prove_history_ownership_without_user_id(self):
         self.saved_active()
         config = json.loads(self.config.read_text())

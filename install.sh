@@ -62,7 +62,7 @@ ccacc_install_main() (
         ''|/*|*/|*//*|*..*|./*|*/./*|*/.|.|*[!A-Za-z0-9_./-]*) fail 'invalid CCACC_INSTALL_REF' ;;
     esac
 
-    for tool in bash curl jq mkdir mktemp chmod cp mv rm; do
+    for tool in bash curl jq mkdir mktemp chmod cp mv rm ln; do
         command -v "$tool" >/dev/null 2>&1 \
             || fail "missing prerequisite: $tool; install it and rerun this installer"
     done
@@ -172,12 +172,51 @@ ccacc_install_main() (
     printf 'Installed ccacc and ccacc_shell.sh in %s\n' "$prefix"
     # Never run from staging: the hook records this permanent absolute path.
     # Redirecting stdin also makes curl | bash safe from setup prompts/reads.
+    # Ask once about alwaysYOLO, only when ~/.ccacc/settings.json does not exist.
+    # curl | bash feeds this script on stdin, so the question uses /dev/tty; with
+    # no terminal nothing is written. Failures here never undo the installation.
+    settings_file=$HOME/.ccacc/settings.json
+    configure_settings() {
+        local answer value tmp
+        if [ -e "$settings_file" ] || [ -L "$settings_file" ]; then
+            printf 'Keeping existing settings in %s\n' "$settings_file"
+            return 0
+        fi
+        if ! ( : </dev/tty >/dev/tty ) 2>/dev/null; then
+            printf 'No terminal to ask about YOLO; to always enable it when switching accounts, create %s with {"alwaysYOLO": true}\n' \
+                "$settings_file"
+            return 0
+        fi
+        printf '%s' 'Always turn on YOLO (skip Claude permission prompts) when switching accounts? (y/N) ' >/dev/tty
+        IFS= read -r answer </dev/tty || answer=
+        case "$answer" in
+            [yY]|[yY][eE][sS]) value=true ;;
+            *) value=false ;;
+        esac
+        if ! ( ensure_directory "${settings_file%/*}" ); then
+            printf 'ccacc installer: settings were not saved; create %s with {"alwaysYOLO": %s} to keep this choice\n' \
+                "$settings_file" "$value" >&2
+            return 0
+        fi
+        # Publish with a hard link so a file created meanwhile is never overwritten.
+        if tmp=$(mktemp "${settings_file%/*}/.settings.XXXXXXXX") \
+            && printf '{\n  "alwaysYOLO": %s\n}\n' "$value" >"$tmp" \
+            && chmod 600 "$tmp" && ln -- "$tmp" "$settings_file" 2>/dev/null; then
+            rm -f -- "$tmp"
+            printf 'Saved alwaysYOLO=%s in %s; edit that file to change it later\n' "$value" "$settings_file"
+        else
+            [ -z "${tmp:-}" ] || rm -f -- "$tmp"
+            printf 'ccacc installer: settings were not saved; create %s with {"alwaysYOLO": %s} to keep this choice\n' \
+                "$settings_file" "$value" >&2
+        fi
+    }
     if ! bash "$prefix/ccacc" configure-shell </dev/null; then
         printf 'ccacc installer: files are installed, but shell setup failed. Fix the error and run:\n  bash %q configure-shell\n' \
             "$prefix/ccacc" >&2
         printf '%s\n' 'Or rerun this installer to reinstall both files and retry setup.' >&2
         exit 1
     fi
+    configure_settings
     printf 'Setup complete. To update this shell, run:\n  source %q\nOr open a new terminal.\n' "$HOME/.ccacc-shell/hook.sh"
     case "$prefix" in
         *:*)

@@ -34,7 +34,7 @@ ACTIVE_FILE="$ACCOUNTS_DIR/.active"
 LAUNCH_MODE_FILE="$ACCOUNTS_DIR/.launch-mode"
 CLEANUP_RECOVERY_DIR="$ACCOUNTS_DIR/.cleanup-recovery"
 CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
-# Optional user settings; ccacc only reads this file and never creates it.
+# Optional user settings; ccacc only reads this file. The installer may create it.
 SETTINGS_FILE="$HOME/.ccacc/settings.json"
 MASTER_PASSWORD=""
 SURGE_CLI=""

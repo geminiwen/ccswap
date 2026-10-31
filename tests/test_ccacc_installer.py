@@ -1,5 +1,7 @@
 """Offline installer contract tests: fake downloads/core and isolated HOME/PATH."""
 
+import fcntl
+import json
 import os
 from pathlib import Path
 import shlex
@@ -8,12 +10,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import termios
+import threading
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
-TOOLS = ("bash", "jq", "mkdir", "mktemp", "chmod", "cp", "mv", "rm")
+TOOLS = ("bash", "jq", "mkdir", "mktemp", "chmod", "cp", "mv", "rm", "ln")
 COMMIT = "1234567890abcdef" * 2 + "12345678"
 NEXT_COMMIT = "abcdef1234567890" * 2 + "abcdef12"
 CORE = r'''#!/bin/bash
@@ -114,7 +118,7 @@ class InstallerTests(unittest.TestCase):
     def run_installer(self, *args, success=True, stdin="", command=None, retained_stage=False):
         result = subprocess.run(command or ["/bin/bash", str(INSTALLER), *args],
                                 input=stdin, text=True, capture_output=True,
-                                env=self.env, timeout=15)
+                                env=self.env, timeout=15, start_new_session=True)
         self.assertEqual(result.returncode == 0, success, (result.stdout, result.stderr))
         self.assertEqual(bool(list(self.prefix.glob(".ccacc-install.*"))), retained_stage)
         # The fake core never writes any profiles, accounts or authentication.
@@ -261,6 +265,75 @@ class InstallerTests(unittest.TestCase):
         # Feed the actual script through stdin, just as curl | bash does.
         self.run_installer(stdin=INSTALLER.read_text(), command=["/bin/bash"])
         self.assertEqual(self.log_args(self.setup_log), [str(self.prefix / "ccacc"), "configure-shell"])
+
+    def run_with_tty(self, answer):
+        # Give the installer a controlling terminal, as curl | bash in Terminal has.
+        # macOS waits for unread tty output on exit, so drain the master meanwhile.
+        master, slave = os.openpty()
+        def attach():
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+        chunks = []
+        def drain():
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                chunks.append(chunk)
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        os.write(master, answer.encode())
+        try:
+            result = subprocess.run(["/bin/bash"], input=INSTALLER.read_text(), text=True,
+                                    capture_output=True, env=self.env, timeout=15,
+                                    preexec_fn=attach, pass_fds=(slave,))
+        finally:
+            os.close(slave)
+            reader.join(2)
+            os.close(master)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        return result, b"".join(chunks).decode(errors="replace")
+
+    @property
+    def settings(self):
+        return self.home / ".ccacc/settings.json"
+
+    def test_no_terminal_writes_no_settings(self):
+        result = self.run_installer(stdin=INSTALLER.read_text(), command=["/bin/bash"])
+        self.assertFalse((self.home / ".ccacc").exists())
+        self.assertIn('{"alwaysYOLO": true}', result.stdout)
+        self.assertIn("Setup complete", result.stdout)
+
+    def test_terminal_yes_saves_always_yolo_true(self):
+        result, prompt = self.run_with_tty("y\n")
+        self.assertIn("switching accounts? (y/N)", prompt)
+        self.assertEqual(json.loads(self.settings.read_text()), {"alwaysYOLO": True})
+        self.assertEqual(stat.S_IMODE(self.settings.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.settings.parent.stat().st_mode), 0o700)
+        self.assertEqual([p.name for p in self.settings.parent.iterdir()], ["settings.json"])
+        self.assertIn("Saved alwaysYOLO=true", result.stdout)
+
+    def test_terminal_blank_answer_defaults_to_false(self):
+        result, _ = self.run_with_tty("\n")
+        self.assertEqual(json.loads(self.settings.read_text()), {"alwaysYOLO": False})
+        self.assertIn("Saved alwaysYOLO=false", result.stdout)
+
+    def test_existing_settings_are_kept_without_asking(self):
+        self.settings.parent.mkdir(mode=0o700)
+        self.settings.write_text('{"alwaysYOLO": true, "other": 1}')
+        result, prompt = self.run_with_tty("n\n")
+        self.assertNotIn("(y/N)", prompt)
+        self.assertEqual(self.settings.read_text(), '{"alwaysYOLO": true, "other": 1}')
+        self.assertIn("Keeping existing settings", result.stdout)
+
+    def test_unsavable_settings_warn_but_install_succeeds(self):
+        (self.home / ".ccacc").write_text("not a directory")
+        result, _ = self.run_with_tty("y\n")
+        self.assertIn("settings were not saved", result.stderr)
+        self.assertIn("Setup complete", result.stdout)
 
     def test_missing_prerequisites_fail_before_download_or_clobber(self):
         for name in ("curl", *TOOLS):

@@ -198,6 +198,7 @@ timezone_command() {
     local name="${1:-}"
     if [ -z "$name" ]; then
         [ ! -e "$CLEANUP_RECOVERY_DIR" ] && [ ! -L "$CLEANUP_RECOVERY_DIR" ] || return 1
+        if profile_recovery_path >/dev/null; then return 1; fi
         # Exit 3 means a legitimate unnamed session, never corrupt metadata.
         # The generated hook uses it to unset TZ without prompting or writing.
         [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] && return 3
@@ -868,7 +869,10 @@ setup_surge() {
     done
 
     if [ "$picks" != "{}" ]; then
-        printf '%s\n' "$picks" > "$ACCOUNTS_DIR/${name}.surge"
+        if ! printf '%s\n' "$picks" > "$ACCOUNTS_DIR/${name}.surge"; then
+            echo -e "${RED}Error: Could not save Surge policies for '${name}'${NC}" >&2
+            return 1
+        fi
         echo -e "${GREEN}Saved Surge policies for '${name}'${NC}"
     fi
 }
@@ -910,9 +914,22 @@ apply_surge() {
     fi
 }
 
+# Retained profile transactions are unresolved recovery, never ordinary backups.
+profile_recovery_path() {
+    local path
+    for path in "$ACCOUNTS_DIR"/.profile-transaction.*; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            printf '%s\n' "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Function to print the active account name (empty if none)
 active_account() {
     [ ! -e "$CLEANUP_RECOVERY_DIR" ] && [ ! -L "$CLEANUP_RECOVERY_DIR" ] || return 0
+    if profile_recovery_path >/dev/null; then return 0; fi
     if [ -f "$ACTIVE_FILE" ]; then
         local name
         name=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z")) | rtrimstr("\n")' "$ACTIVE_FILE" 2>/dev/null) || return 0
@@ -1245,11 +1262,18 @@ cleanup_optional_credentials_file() {
 }
 
 cleanup_is_complete() {
+    local recovery
     if [ -e "$CLEANUP_RECOVERY_DIR" ] || [ -L "$CLEANUP_RECOVERY_DIR" ]; then
         echo "Error: Previous cleanup incomplete; recovery data retained at $CLEANUP_RECOVERY_DIR" >&2
         echo "Restore the paths in manifest.json and config/metadata copies before removing that directory; credentials may require a saved encrypted profile or login." >&2
         return 1
     fi
+    if recovery=$(profile_recovery_path); then
+        echo "Error: Previous profile operation incomplete; recovery data retained at $recovery" >&2
+        echo "Restore the paths in manifest.json before removing that directory and retrying." >&2
+        return 1
+    fi
+    return 0
 }
 
 clean_unnamed_session() {
@@ -1491,6 +1515,7 @@ delete_command() (
     check_name "$name" || return 1
     check_ready || return 1
     load_shell_companion || return 1
+    cleanup_is_complete || return 1
     if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
         echo -e "${RED}Error: Account '${name}' not found${NC}"
         return 1

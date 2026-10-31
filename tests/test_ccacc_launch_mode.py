@@ -393,6 +393,34 @@ main save sydney --timezone UTC
         manifest = json.loads((recovery / "manifest.json").read_text())
         self.assertEqual(manifest[0]["source"], str(self.mode))
         self.assertEqual(json.loads((recovery / "0").read_text())["yolo"], True)
+        before = self.fixture.home_snapshot()
+        for command in ("main save another --timezone UTC", "main use sydney --yolo",
+                        "main new", "main rm sydney"):
+            with self.subTest(command=command):
+                blocked = self.fixture.harness(command, success=False)
+                self.assertIn("recovery", blocked.stderr.lower())
+                self.assertEqual(self.fixture.home_snapshot(), before)
+        self.assertEqual(self.fixture.cli("timezone", success=False).stdout, "")
+
+    def test_surge_write_failure_is_not_reported_as_success(self):
+        code = r'''
+source "$FIXTURE_CORE" help >/dev/null
+find_surge() { SURGE_CLI=fixture_surge; }
+surge_groups() { builtin printf '%s' '{"Claude":["route"]}'; }
+fixture_surge() {
+    builtin printf '%s' '{"environment":{"ProxyGroupSelection":{"Claude":"route"}}}'
+}
+printf() {
+    if [ "$#" = 2 ] && [ "$1" = '%s\n' ] && [ "$2" = '{"Claude":"route"}' ]; then return 91; fi
+    builtin printf "$@"
+}
+if setup_surge sydney; then
+    echo 'unexpected successful policy write' >&2
+    exit 99
+fi
+'''
+        result = self.fixture.run_process(["/bin/bash", "-c", code], stdin="1\n1\n")
+        self.assertNotIn("Saved Surge policies", result.stdout)
 
     def test_save_invalidates_runtime_choice_without_storing_it_in_backups(self):
         self.fixture.harness("main use sydney --yolo")

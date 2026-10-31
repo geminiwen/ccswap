@@ -168,6 +168,8 @@ Save/delete stage only their bounded profile/session files in a private director
 If rollback cannot complete, the error names retained restore files and a path-only
 `manifest.json`; restore those paths before retrying. Staged runtime consent is
 restored last, only after the account metadata recovers.
+Retained `.profile-transaction.*` recovery directories block further profile
+mutations and Claude launch until the recorded paths have been recovered.
 The hook reads this record without passwords, credentials, shell startup or
 installed-check recursion. Only a valid matching `true` adds
 `--dangerously-skip-permissions`; absent, corrupt, stale or unsafe records use

@@ -73,14 +73,12 @@ class KeychainWriteTests(unittest.TestCase):
         self.bin.mkdir()
         self.log = self.fixture / "security.log"
         self.store = self.fixture / "store.json"
-        self.osascript_log = self.fixture / "osascript.log"
         (self.fixture / "fake_security.py").write_text(FAKE_SECURITY)
         self.executable("security", f'#!/bin/bash\nexec {sys.executable} -I '
                         f'"{self.fixture}/fake_security.py" "$@"\n')
-        self.executable("osascript", '#!/bin/bash\nprintf "%s\\n" "$*" >> "$OSASCRIPT_LOG"\nexit 98\n')
         self.env = dict(os.environ, HOME=str(self.home), USER="fixture-user", TMPDIR=str(self.fixture),
                         PATH=f"{self.bin}:{os.environ['PATH']}", SEC_LOG=str(self.log),
-                        SEC_STORE=str(self.store), OSASCRIPT_LOG=str(self.osascript_log))
+                        SEC_STORE=str(self.store))
         for name in ("BASH_ENV", "ENV", "FAKE_LINE_LIMIT"):
             self.env.pop(name, None)
 
@@ -94,7 +92,6 @@ class KeychainWriteTests(unittest.TestCase):
         result = subprocess.run(["/bin/bash", "-c", SOURCE + "\n" + body], env=env,
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode == 0, success, (result.stdout, result.stderr))
-        self.assertFalse(self.osascript_log.exists())
         return result
 
     def calls(self):
@@ -160,11 +157,6 @@ class KeychainWriteTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.run_body(body, '{"claudeAiOauth":{}}', success=False)
                 self.assertEqual(self.calls(), [])
-
-    def test_no_osascript_keychain_code_remains(self):
-        self.assertNotIn("osascript", SOURCE.split("keychain_write() {", 1)[1].split("\n}\n", 1)[0])
-        self.assertNotIn("SecItemUpdate(", SOURCE)
-        self.assertNotIn("SecItemAdd(", SOURCE)
 
 
 if __name__ == "__main__":

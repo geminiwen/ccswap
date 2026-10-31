@@ -63,6 +63,38 @@ new_identity() { printf '{"userID":"new-fixture-id","anonymousId":"new-anonymous
     def operations(self):
         return self.ops.read_text().splitlines() if self.ops.exists() else []
 
+    def test_new_cancellation_and_rollback_preserve_launch_mode(self):
+        self.saved_active()
+        mode = self.accounts / ".launch-mode"
+        mode.write_text('{"version":1,"account":"kept","yolo":true}\n')
+        mode.chmod(0o600)
+        before = mode.read_bytes(), mode.stat().st_mtime_ns, mode.stat().st_mode
+        self.run_body("main new", success=False, stdin="n\n")
+        self.assertEqual((mode.read_bytes(), mode.stat().st_mtime_ns, mode.stat().st_mode), before)
+        self.run_body(r'''
+rm() {
+    if [ "$2" = "$LAUNCH_MODE_FILE" ] && [ ! -f "$HOME/mode-remove-failed" ]; then
+        printf failed > "$HOME/mode-remove-failed"
+        return 91
+    fi
+    command rm "$@"
+}
+main new
+''', success=False)
+        self.assertEqual((mode.read_bytes(), mode.stat().st_mtime_ns, mode.stat().st_mode), before)
+        self.assertEqual(self.active.read_text(), "kept\n")
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "true\n")
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+
+    def test_successful_new_removes_launch_mode(self):
+        self.saved_active()
+        mode = self.accounts / ".launch-mode"
+        mode.write_text('{"version":1,"account":"kept","yolo":true}\n')
+        result = self.run_body("main new")
+        self.assertNotIn("YOLO", result.stderr)
+        self.assertFalse(mode.exists())
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+
     def login(self, name="fixture@example.invalid"):
         self.credentials.write_text(json.dumps({**self.shared, "claudeAiOauth": {"accessToken": "fixture-login"}}))
         config = json.loads(self.config.read_text())

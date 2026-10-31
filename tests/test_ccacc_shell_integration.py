@@ -204,12 +204,41 @@ apply_surge() { :; }
         self.assertTrue((startup / ".zlogin").exists())
         self.assertFalse((self.home / ".zshrc").exists())
 
+    def test_zsh_conditional_login_rcs_context_uses_authentic_options(self):
+        for global_rcs in (True, False):
+            with self.subTest(global_rcs=global_rcs):
+                self.reset_fixture()
+                self.env["SHELL"] = "/bin/zsh"
+                directory = self.home / "conditional login directory"
+                directory.mkdir()
+                (self.home / ".zshenv").write_text("" if global_rcs else "unsetopt GLOBAL_RCS\n")
+                condition = "-o GLOBAL_RCS" if global_rcs else "! -o GLOBAL_RCS"
+                (self.home / ".zprofile").write_text(
+                    f"if [[ -o login && -o interactive && -o RCS && {condition} ]]; then\n"
+                    "  ZDOTDIR=" + shlex.quote(str(directory)) + "\nfi\n")
+                self.cli("configure-shell")
+                self.harness("require_shell_hook")
+                self.assertTrue((directory / ".zshrc").exists())
+                self.assertTrue((directory / ".zlogin").exists())
+                self.assertFalse((self.home / ".zshrc").exists())
+                self.assertFalse(self.launches.exists())
+
+    def test_zsh_disabled_rcs_does_not_read_skipped_startup_files(self):
+        self.env["SHELL"] = "/bin/zsh"
+        (self.home / ".zshenv").write_text("unsetopt RCS\n")
+        for name in (".zprofile", ".zshrc", ".zlogin"):
+            (self.home / name).write_text('printf unexpected > "$HOME/skipped-rc-executed"\n')
+        self.cli("configure-shell")
+        self.harness("require_shell_hook")
+        self.assertFalse((self.home / "skipped-rc-executed").exists())
+        self.assertFalse(self.launches.exists())
+
     def test_zsh_rejects_changed_managed_source_before_evaluating_it(self):
-        for version in (1, 3):
+        for version in (2, 3):
             with self.subTest(version=version):
                 self.reset_fixture()
-                if version == 1:
-                    self.legacy_install(1, "zsh")
+                if version == 2:
+                    self.legacy_install(2, "zsh")
                 else:
                     self.startup("zsh", zdotdir=True)
                     self.cli("configure-shell")
@@ -467,15 +496,9 @@ apply_surge() { :; }
         hook = template.replace("@SCRIPT@", quote(self.core)).replace("@COMMAND@", command)
         hook = hook.replace("@DIRECTORY@", quote(self.core.parent))
         (private / "hook.sh").write_text(hook)
-        if shell == "zsh":
-            # If the context probe sources the old hook, its function/alias
-            # definitions become visible here even without a Claude launch.
-            with (self.home / "zsh settings/.zlogin").open("a") as stream:
-                stream.write('if (( ${+functions[__ccacc_launch]} )); then '
-                             'printf sourced > "$HOME/legacy-sourced"; fi\n')
         return private
 
-    def test_v1_v2_upgrades_never_source_or_retain_old_alias_commands(self):
+    def test_v1_v2_upgrades_never_launch_or_retain_old_alias_commands(self):
         for version in (1, 2):
             for shell in ("bash", "zsh"):
                 for missing in (False, True):
@@ -497,7 +520,6 @@ apply_surge() { :; }
                         self.env["FIXTURE_CORE"] = str(self.core)
                         self.cli("configure-shell")
                         self.harness("require_shell_hook")
-                        self.assertFalse((self.home / "legacy-sourced").exists())
                         self.assertEqual(json.loads((private / "managed.json").read_text())["version"], 3)
                         self.assertNotIn("_op_agent", (private / "hook.sh").read_text())
                         self.assertEqual(backups, {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
@@ -505,6 +527,23 @@ apply_surge() { :; }
                         self.interactive(shell, "claude /login\n")
                         self.assertEqual(self.records(self.launches)[0]["args"], ["/login"])
                         self.assertFalse(self.wrappers.exists())
+
+    def test_previous_owned_v3_hook_requires_explicit_safe_upgrade(self):
+        self.startup("zsh", zdotdir=True)
+        self.cli("configure-shell")
+        hook = self.home / ".ccacc-shell/hook.sh"
+        current = hook.read_bytes()
+        quote = lambda value: "'" + str(value).replace("'", "'\\''") + "'"
+        previous = (ROOT / "tests/fixtures/ccacc_hook_v3_launch_prompt.sh.in").read_text()
+        previous = previous.replace("@SCRIPT@", quote(self.core)).replace("@DIRECTORY@", quote(self.core.parent))
+        hook.write_text(previous)
+        before = self.home_snapshot()
+        self.harness("require_shell_hook", success=False)
+        self.assertEqual(self.home_snapshot(), before)
+        self.cli("configure-shell")
+        self.assertEqual(hook.read_bytes(), current)
+        self.assertFalse(self.launches.exists())
+        self.harness("require_shell_hook")
 
     def test_corrupt_legacy_code_is_refused_before_startup_or_writes(self):
         for version in (1, 2):
@@ -517,7 +556,6 @@ apply_surge() { :; }
             self.assertIn("inspect and move aside", result.stderr)
             self.assertEqual(self.home_snapshot(), before)
             self.assertFalse((self.home / "hook-executed").exists())
-            self.assertFalse((self.home / "legacy-sourced").exists())
 
     def test_v3_ignores_and_preserves_unreadable_legacy_backup_contents(self):
         self.startup("zsh", zdotdir=True)

@@ -29,6 +29,7 @@ ALIASES_DIR="$ACCOUNTS_DIR/.aliases"
 TIMEZONES_DIR="$ACCOUNTS_DIR/.timezones"
 LEGACY_PENDING_TIMEZONE_FILE="$ACCOUNTS_DIR/.pending-timezone"
 ACTIVE_FILE="$ACCOUNTS_DIR/.active"
+LAUNCH_MODE_FILE="$ACCOUNTS_DIR/.launch-mode"
 CLEANUP_RECOVERY_DIR="$ACCOUNTS_DIR/.cleanup-recovery"
 CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
 MASTER_PASSWORD=""
@@ -97,7 +98,8 @@ Commands:
   save <name> [--timezone <ZONE>]
                         Back up the current account and its timezone
   timezone [name]       Print the saved TZ only (defaults to the active account)
-  use <name>            Back up the active account, then switch to <name>
+  use <name> [--yolo|--no-yolo]
+                        Switch accounts and choose the current selection launch mode
   new
                         Confirm prior backup, then clean to an unnamed logged-out session
                         (logged out; run 'claude /login', then 'ccacc save <name>')
@@ -116,6 +118,7 @@ With Surge installed, save asks which policies the account uses and use applies 
 without Surge no policy selection is asked.
 Install/reinstall with: $INSTALL_COMMAND
 Only use requires the installed shell hook; save/new never install or repair it.
+Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
 Only save records a timezone; use 'save <name> --timezone <ZONE>' to change it.
 New clears the active timezone. Unnamed sessions launch Claude with TZ unset.
 First save requires a numbered timezone choice or custom IANA entry, with no default.
@@ -205,6 +208,27 @@ timezone_command() {
     fi
     check_name "$name" >/dev/null 2>&1 || return 1
     read_timezone_file "$TIMEZONES_DIR/$name"
+}
+
+# Internal read-only API for the fixed hook. Invalid, absent, stale or unsafe
+# session metadata always means normal permissions; no startup/credential work.
+launch_mode_command() {
+    local active path="$LAUNCH_MODE_FILE"
+    case "${HOME:-}" in /*) ;; *) printf 'false\n'; return 0 ;; esac
+    while [ -n "$path" ]; do
+        if [ -L "$path" ]; then printf 'false\n'; return 0; fi
+        path=${path%/*}
+    done
+    if ! timezone_command >/dev/null 2>&1 || [ ! -f "$LAUNCH_MODE_FILE" ]; then
+        printf 'false\n'; return 0
+    fi
+    active=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z"))
+        | rtrimstr("\n")' "$ACTIVE_FILE" 2>/dev/null) || { printf 'false\n'; return 0; }
+    if jq -se --arg account "$active" 'length == 1 and (.[0] |
+        keys == ["account", "version", "yolo"] and .version == 1 and
+        .account == $account and (.yolo | type == "boolean") and .yolo == true)' \
+        "$LAUNCH_MODE_FILE" >/dev/null 2>&1; then printf 'true\n'
+    else printf 'false\n'; fi
 }
 
 # An explicit first-setup choice only; never infer a zone from the environment,
@@ -978,8 +1002,15 @@ save_command() {
 }
 
 # Function to switch to a saved account
-use_command() {
-    local name="${1:-}" zone
+use_command() (
+    local name="${1:-}" zone active mode=false answer='' staged_mode=''
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo "Error: use requires a name and optional --yolo or --no-yolo" >&2; return 1; }
+    case "${2:-}" in
+        '') ;;
+        --yolo) mode=true ;;
+        --no-yolo) ;;
+        *) echo "Error: Expected --yolo or --no-yolo" >&2; return 1 ;;
+    esac
     require_shell_hook || return 1
     cleanup_is_complete || return 1
     check_name "$name" || return 1
@@ -988,24 +1019,41 @@ use_command() {
         list_accounts
         return 1
     fi
-
+    if [ -L "$ACCOUNTS_DIR/${name}.json" ] || ! jq -se 'length == 1 and (.[0] | type) == "object"' \
+        "$ACCOUNTS_DIR/${name}.json" >/dev/null 2>&1; then
+        echo "Error: Invalid saved account '$name'; account unchanged" >&2
+        return 1
+    fi
     zone=$(timezone_command "$name") || {
         echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME save $name --timezone <ZONE>' first" >&2
         return 1
     }
     check_ready || return 1
-
-    local active=$(active_account)
-    if [ "$active" = "$name" ]; then
-        echo -e "${YELLOW}'${name}' is already active${NC}"
-        return 0
-    fi
-
-    # A clean unnamed session has nothing to back up. An unsaved login or
-    # history must be named first, before passwords/processes or any writes.
-    if [ -z "$active" ] && ! clean_unnamed_session; then
+    active=$(active_account)
+    if [ "$active" != "$name" ] && [ -z "$active" ] && ! clean_unnamed_session; then
         echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
         return 1
+    fi
+    # Validate and stage this session record before passwords or process/account
+    # mutations. A failed selection leaves the previous launch mode untouched.
+    _ccacc_shell_path "$LAUNCH_MODE_FILE" file && cleanup_file_is_writable "$LAUNCH_MODE_FILE" || {
+        echo "Error: Current launch mode cannot be safely updated; account unchanged" >&2; return 1;
+    }
+    trap '[ -z "$staged_mode" ] || rm -f "$staged_mode"' EXIT
+    trap 'exit 130' INT
+    if [ "$#" = 1 ] && [ -t 0 ] && [ -t 2 ]; then
+        printf 'YOLO? (y/N) ' >&2
+        if { IFS= read -r answer < /dev/tty; } 2>/dev/null; then
+            case "$answer" in y|Y|[yY][eE][sS]) mode=true ;; esac
+        fi
+    fi
+    staged_mode=$(umask 077; mktemp "$ACCOUNTS_DIR/.launch-mode.XXXXXXXX") || return 1
+    jq -cn --arg account "$name" --argjson yolo "$mode" \
+        '{version:1,account:$account,yolo:$yolo}' > "$staged_mode" && chmod 600 "$staged_mode" || return 1
+    if [ "$active" = "$name" ]; then
+        mv -f "$staged_mode" "$LAUNCH_MODE_FILE" || return 1
+        echo -e "${YELLOW}'${name}' is already active${NC}"
+        return 0
     fi
     ask_password || return 1
     stop_claude || return 1
@@ -1016,9 +1064,10 @@ use_command() {
     unstash_paths "$name" || return 1
     echo "$name" > "$ACTIVE_FILE" || return 1
     rm -f "$LEGACY_PENDING_TIMEZONE_FILE" || return 1
+    apply_surge "$name" || return 1
+    mv -f "$staged_mode" "$LAUNCH_MODE_FILE" || return 1
     echo -e "${GREEN}Switched to Claude account: ${name} ($(current_email))${NC}"
-    apply_surge "$name"
-}
+)
 
 # Cleanup never signals a PID taken from a config record. Ancestors and
 # unverifiable process snapshots must block cleanup rather than kill the caller.
@@ -1181,7 +1230,7 @@ cleanup_stage_and_reset() {
         done
     fi
     metadata_attempted=yes
-    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" && rm -f "$ACTIVE_FILE"
+    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" && rm -f "$ACTIVE_FILE" && rm -f "$LAUNCH_MODE_FILE"
 }
 
 cleanup_restore_snapshot() {
@@ -1213,6 +1262,7 @@ cleanup_rollback() {
     if [ -n "$metadata_attempted" ]; then
         cleanup_restore_snapshot active "$ACTIVE_FILE" || failed=yes
         cleanup_restore_snapshot pending-timezone "$LEGACY_PENDING_TIMEZONE_FILE" || failed=yes
+        cleanup_restore_snapshot launch-mode "$LAUNCH_MODE_FILE" || failed=yes
     fi
     if [ -z "$failed" ] && rm -rf -- "$CLEANUP_RECOVERY_DIR"; then
         echo "Error: Account cleanup failed; previous account, credentials and history restored" >&2
@@ -1236,7 +1286,7 @@ new_command() {
     case "$confirmation" in y|Y|yes) ;; *) echo "Cleanup cancelled; run '$SCRIPT_NAME save <name>' first." >&2; return 1 ;; esac
     # Validate the entire bounded cleanup set, including optional credentials,
     # before stopping processes or modifying any account/session metadata.
-    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE"; do
+    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE"; do
         _ccacc_shell_path "$path" file || { echo "Error: Unsafe cleanup path; cleanup incomplete: $path" >&2; return 1; }
     done
     if [ -f "$CLAUDE_JSON" ]; then
@@ -1286,7 +1336,7 @@ new_command() {
     # No probe writes: permission and ancestor checks are read-only. Check all
     # metadata/config/stash destinations before any irreversible work begins.
     _ccacc_shell_path "$CLEANUP_RECOVERY_DIR" dir || return 1
-    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE"; do
+    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE"; do
         cleanup_file_is_writable "$path" || { echo "Error: Cleanup destination is not writable: $path" >&2; return 1; }
     done
     cleanup_parent_is_writable "$CLEANUP_RECOVERY_DIR/data" || return 1
@@ -1311,7 +1361,7 @@ new_command() {
     # process exits or rollback fails. Its manifest contains paths, never secrets.
     mkdir -m 700 "$CLEANUP_RECOVERY_DIR" || return 1
     if ! mkdir -m 700 "$CLEANUP_RECOVERY_DIR/data"; then return 1; fi
-    for entry in "config.json|$CLAUDE_JSON" "active|$ACTIVE_FILE" "pending-timezone|$LEGACY_PENDING_TIMEZONE_FILE"; do
+    for entry in "config.json|$CLAUDE_JSON" "active|$ACTIVE_FILE" "pending-timezone|$LEGACY_PENDING_TIMEZONE_FILE" "launch-mode|$LAUNCH_MODE_FILE"; do
         label=${entry%%|*}; path=${entry#*|}
         if [ -f "$path" ] && ! cp -p "$path" "$CLEANUP_RECOVERY_DIR/$label"; then
             rm -rf -- "$CLEANUP_RECOVERY_DIR"
@@ -1412,8 +1462,13 @@ main() {
             [ "$#" -le 2 ] || { echo "Error: configure-shell accepts at most one account" >&2; return 1; }
             configure_shell_command
             ;;
+        launch-mode)
+            [ "$#" = 1 ] || return 1
+            launch_mode_command
+            ;;
         use)
-            use_command "$2"
+            shift
+            use_command "$@"
             ;;
         new)
             shift

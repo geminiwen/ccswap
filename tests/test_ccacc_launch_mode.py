@@ -1,0 +1,279 @@
+"""Selection-only YOLO state with fixture accounts, fake CLI and terminal input."""
+import json
+import os
+import pty
+import select
+import shlex
+import time
+import unittest
+
+import test_ccacc_shell_integration as integration
+
+
+class LaunchModeTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = integration.ShellIntegrationTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.home = self.fixture.home
+        self.accounts = self.fixture.accounts
+        self.mode = self.accounts / ".launch-mode"
+        self.fixture.startup("bash")
+        self.fixture.cli("configure-shell")
+
+    def seed(self, account="sydney", yolo=True):
+        self.mode.write_text(json.dumps({"version": 1, "account": account, "yolo": yolo}) + "\n")
+        self.mode.chmod(0o600)
+
+    def record(self):
+        return json.loads(self.mode.read_text())
+
+    def launch(self, args, shell="bash"):
+        flags = ["--noprofile", "--norc"] if shell == "bash" else ["-f"]
+        return self.fixture.run_process(["/bin/" + shell, *flags, "-c",
+            '. "$HOME/.ccacc-shell/hook.sh"\nclaude ' + shlex.join(args)], stdin="payload\n")
+
+    def selection_pty(self, target, answer, extra=""):
+        # Every credential/process boundary is fake; selection, state staging,
+        # installed checks and active-marker writes use the actual core code.
+        code = r'''
+source "$FIXTURE_CORE" help >/dev/null
+ask_password() { printf 'password\n' >> "$HOME/selection-operations"; }
+stop_claude() { printf 'stop\n' >> "$HOME/selection-operations"; }
+note_device_keys() { :; }
+backup_active() { :; }
+load_account() { :; }
+stash_paths() { :; }
+unstash_paths() { :; }
+apply_surge() { :; }
+'''
+        code += extra + "\nmain use " + shlex.quote(target)
+        stdout_path = self.fixture.fixture / "selection.stdout"
+        pid, master = pty.fork()
+        if pid == 0:
+            output = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.dup2(output, 1)
+            os.close(output)
+            os.execve("/bin/bash", ["bash", "--noprofile", "--norc", "-c", code], self.fixture.env)
+        stderr = b""
+        status = None
+        sent = False
+        deadline = time.monotonic() + 8
+        try:
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([master], [], [], 0.1)
+                if readable:
+                    try:
+                        stderr += os.read(master, 65536)
+                    except OSError:
+                        pass
+                if not sent and b"YOLO? (y/N) " in stderr:
+                    os.write(master, answer)
+                    sent = True
+                done, result = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    status = os.waitstatus_to_exitcode(result)
+                    break
+            self.assertIsNotNone(status, stderr.decode(errors="replace"))
+        finally:
+            os.close(master)
+        self.assertFalse(self.fixture.forbidden.exists())
+        return status, stderr.decode(errors="replace"), stdout_path.read_text()
+
+    def test_use_pty_yes_no_blank_eof_and_ctrl_c(self):
+        for answer, expected in ((b"y\n", True), (b"YES\n", True), (b"n\n", False),
+                                 (b"\n", False), (b"\x04", False)):
+            with self.subTest(answer=answer):
+                (self.accounts / ".active").write_text("sydney\n")
+                self.seed()
+                status, stderr, stdout = self.selection_pty("tokyo", answer)
+                self.assertEqual(status, 0, stderr + stdout)
+                self.assertEqual(stderr.count("YOLO? (y/N) "), 1)
+                self.assertNotIn("YOLO", stdout)
+                self.assertEqual(self.record(), {"version": 1, "account": "tokyo", "yolo": expected})
+                self.assertEqual(self.mode.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(self.fixture.cli("launch-mode").stdout, str(expected).lower() + "\n")
+        self.seed("tokyo")
+        before = self.mode.read_bytes()
+        status, _, _ = self.selection_pty("sydney", b"\x03")
+        self.assertEqual(status, 130)
+        self.assertEqual(self.mode.read_bytes(), before)
+        self.assertEqual((self.accounts / ".active").read_text(), "tokyo\n")
+        self.assertFalse(self.fixture.launches.exists())
+
+    def test_same_active_can_toggle_without_passwords_or_rc_writes(self):
+        rcs = [self.home / ".bashrc", self.home / ".bash_profile"]
+        paths = rcs + list((self.home / ".ccacc-shell").iterdir())
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths}
+        for answer, enabled in ((b"y\n", True), (b"\n", False), (b"n\n", False)):
+            status, stderr, _ = self.selection_pty("sydney", answer,
+                "ask_password() { return 97; }; stop_claude() { return 98; }")
+            self.assertEqual(status, 0, stderr)
+            self.assertEqual(self.record()["yolo"], enabled)
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths})
+        self.assertFalse((self.home / "selection-operations").exists())
+
+    def test_non_tty_defaults_no_without_consuming_password_input(self):
+        self.seed()
+        result = self.fixture.harness(r'''
+ask_password() { IFS= read -r password; printf '%s\n' "$password" > "$HOME/password-input"; }
+main use tokyo
+''', stdin="fixture-password\n")
+        self.assertNotIn("YOLO", result.stderr)
+        self.assertEqual((self.home / "password-input").read_text(), "fixture-password\n")
+        self.assertFalse(self.record()["yolo"])
+        self.fixture.harness("main use tokyo --yolo", stdin="")
+        self.assertTrue(self.record()["yolo"])
+        self.fixture.harness("main use tokyo --no-yolo", stdin="")
+        self.assertFalse(self.record()["yolo"])
+
+    def test_failed_use_keeps_previous_mode_and_cleans_staging(self):
+        for failure in ("ask_password", "stop_claude", "backup_active", "load_account",
+                        "stash_paths", "unstash_paths", "apply_surge"):
+            with self.subTest(failure=failure):
+                (self.accounts / ".active").write_text("sydney\n")
+                self.seed()
+                before = self.mode.read_bytes(), self.mode.stat().st_mtime_ns, self.mode.stat().st_ino
+                self.fixture.harness(f"{failure}() {{ return 91; }}; main use tokyo --no-yolo", success=False)
+                self.assertEqual((self.mode.read_bytes(), self.mode.stat().st_mtime_ns, self.mode.stat().st_ino), before)
+                self.assertEqual(list(self.accounts.glob(".launch-mode.????????")), [])
+        for body in ("main use missing --yolo", "main use tokyo --bad", "main use tokyo --yolo --no-yolo"):
+            self.seed()
+            before = self.mode.read_bytes()
+            self.fixture.harness(body, success=False)
+            self.assertEqual(self.mode.read_bytes(), before)
+        self.seed()
+        before = self.mode.read_bytes()
+        (self.accounts / ".timezones/tokyo").write_text("Invalid/Zone\n")
+        self.fixture.harness("main use tokyo --no-yolo", success=False)
+        self.assertEqual(self.mode.read_bytes(), before)
+
+    def test_staging_failure_precedes_password_process_and_account_mutation(self):
+        self.seed()
+        before = self.mode.read_bytes()
+        self.fixture.harness(r'''
+chmod() { return 91; }
+main use tokyo --no-yolo
+''', success=False)
+        self.assertEqual(self.mode.read_bytes(), before)
+        self.assertFalse((self.home / "operations").exists())
+        self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
+        self.assertEqual(list(self.accounts.glob(".launch-mode.????????")), [])
+
+    def test_bad_install_and_unknown_target_fail_before_prompt_or_mode_change(self):
+        self.seed()
+        before = self.mode.read_bytes(), self.mode.stat().st_mtime_ns
+        status, stderr, _ = self.selection_pty("missing", b"y\n")
+        self.assertNotEqual(status, 0)
+        self.assertNotIn("YOLO", stderr)
+        hook = self.home / ".ccacc-shell/hook.sh"
+        hook.write_text("unverified fixture code\n")
+        status, stderr, _ = self.selection_pty("tokyo", b"y\n")
+        self.assertNotEqual(status, 0)
+        self.assertNotIn("YOLO", stderr)
+        self.assertEqual((self.mode.read_bytes(), self.mode.stat().st_mtime_ns), before)
+        self.assertFalse((self.home / "selection-operations").exists())
+
+    def test_failed_mode_publish_does_not_replace_previous_choice(self):
+        self.seed()
+        before = self.mode.read_bytes()
+        self.fixture.harness(r'''
+mv() { if [ "$3" = "$LAUNCH_MODE_FILE" ]; then return 91; fi; command mv "$@"; }
+main use tokyo --no-yolo
+''', success=False)
+        self.assertEqual(self.mode.read_bytes(), before)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+
+    def test_absent_corrupt_stale_and_symlink_mode_never_enable_bypass(self):
+        for content in (None, "{bad", "null", "[]", '{"version":1,"account":"sydney","yolo":"true"}',
+                        '{"version":1,"account":"tokyo","yolo":true}',
+                        '{"version":2,"account":"sydney","yolo":true}',
+                        '{"version":1,"account":"sydney","yolo":true,"extra":true}'):
+            with self.subTest(content=content):
+                self.mode.unlink(missing_ok=True)
+                if content is not None:
+                    self.mode.write_text(content)
+                self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+                self.launch(["--help", "opaque arg"])
+                self.assertEqual(self.fixture.records(self.fixture.launches)[-1]["args"], ["--help", "opaque arg"])
+        self.mode.unlink()
+        target = self.home / "mode-target"
+        target.write_text('{"version":1,"account":"sydney","yolo":true}')
+        self.mode.symlink_to(target)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+        self.fixture.harness("main use sydney --yolo", success=False)
+        self.assertTrue(self.mode.is_symlink())
+
+    def test_no_active_ignores_stale_mode_and_unsets_timezone(self):
+        self.seed()
+        (self.accounts / ".active").unlink()
+        self.fixture.env["TZ"] = "America/New_York"
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+        self.launch(["/login"])
+        entry = self.fixture.records(self.fixture.launches)[0]
+        self.assertEqual(entry["args"], ["/login"])
+        self.assertIsNone(entry["tz"])
+        self.assertEqual(entry["browser"], "false")
+
+    def test_chosen_mode_prepends_one_flag_without_classifying_caller_argv(self):
+        self.fixture.harness("main use sydney --yolo")
+        for shell in ("bash", "zsh"):
+            for args in (["--help"], ["--version"], ["/login"], ["-p", "two words", ""],
+                         ["--dangerously-skip-permissions", "literal;value"]):
+                self.launch(args, shell)
+                self.assertEqual(self.fixture.records(self.fixture.launches)[-1]["args"],
+                                 ["--dangerously-skip-permissions", *args])
+
+    def test_selected_launch_consumes_no_stdin_and_preserves_exit_status(self):
+        self.fixture.harness("main use sydney --yolo")
+        self.fixture.executable("claude", '#!/bin/bash\nIFS= read -r input\n'
+                                'printf "%s\\n" "$input"\nprintf "[%s]\\n" "$@"\nexit 37\n')
+        for shell in ("bash", "zsh"):
+            flags = ["--noprofile", "--norc"] if shell == "bash" else ["-f"]
+            result = self.fixture.run_process(["/bin/" + shell, *flags, "-c",
+                '. "$HOME/.ccacc-shell/hook.sh"; claude -p "two words" ""'],
+                success=False, stdin="payload survives\n")
+            self.assertEqual(result.returncode, 37)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(result.stdout,
+                             "payload survives\n[--dangerously-skip-permissions]\n[-p]\n[two words]\n[]\n")
+
+    def test_invalid_same_active_profile_and_recovery_guard_cannot_update_mode(self):
+        self.seed()
+        before = self.mode.read_bytes()
+        profile = self.accounts / "sydney.json"
+        profile.write_text("[]")
+        status, stderr, _ = self.selection_pty("sydney", b"y\n")
+        self.assertNotEqual(status, 0)
+        self.assertNotIn("YOLO", stderr)
+        self.assertEqual(self.mode.read_bytes(), before)
+        profile.write_text("{}")
+        (self.accounts / ".cleanup-recovery").mkdir()
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+        self.fixture.harness("main use sydney --no-yolo", success=False)
+        self.assertEqual(self.mode.read_bytes(), before)
+
+    def test_getter_is_readonly_without_credentials_or_installed_checks(self):
+        self.seed()
+        (self.home / ".claude.json").unlink()
+        self.fixture.core.with_name("ccacc_shell.sh").unlink()
+        (self.home / ".ccacc-shell/hook.sh").write_text("unverified fixture code\n")
+        before = self.fixture.home_snapshot()
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "true\n")
+        self.assertEqual(self.fixture.home_snapshot(), before)
+        self.fixture.env["HOME"] = "relative-fixture-home"
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+
+    def test_save_does_not_store_yolo_in_profile_backups_or_change_selection_mode(self):
+        self.fixture.harness("main use sydney --yolo")
+        before = self.mode.read_bytes()
+        self.fixture.harness("main save sydney --timezone UTC")
+        self.assertEqual(self.mode.read_bytes(), before)
+        self.assertEqual(json.loads((self.accounts / "sydney.json").read_text()), {})
+        self.fixture.harness("main save renamed --timezone UTC")
+        self.assertEqual(self.mode.read_bytes(), before)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -395,7 +395,7 @@ class ShellHookTests(unittest.TestCase):
         self.assertNotEqual(self.install(check=False).returncode, 0)
         self.assertEqual((self.home / ".bashrc").read_bytes(), before)
 
-    def pty_launch(self, shell, args, answer=None):
+    def pty_launch(self, shell, args):
         stdout_path = self.home / "pty.stdout"
         code = '. "$HOME/.ccacc-shell/hook.sh"\n'
         if args is not None:
@@ -408,7 +408,6 @@ class ShellHookTests(unittest.TestCase):
             os.close(output)
             os.execve(shutil.which(shell), [shell, *flags, "-i", "-c", code], self.env)
         output = b""
-        sent = False
         status = None
         deadline = time.monotonic() + 8
         try:
@@ -420,10 +419,7 @@ class ShellHookTests(unittest.TestCase):
                     except OSError:
                         chunk = b""
                     output += chunk
-                if not sent and b"YOLO? (y/N) " in output:
-                    self.assertIsNotNone(answer, output)
-                    os.write(master, answer)
-                    sent = True
+                self.assertNotIn(b"YOLO?", output)
                 done, child_status = os.waitpid(pid, os.WNOHANG)
                 if done:
                     status = os.waitstatus_to_exitcode(child_status)
@@ -442,13 +438,6 @@ class ShellHookTests(unittest.TestCase):
         self.assertFalse(self.log.exists())
         self.assertFalse((self.home / "timezone.calls").exists())
 
-    def test_pty_ctrl_c_cancels_without_launch(self):
-        self.install()
-        for shell in ("bash", "zsh"):
-            status, _, _ = self.pty_launch(shell, [], b"\x03")
-            self.assertEqual(status, 130)
-        self.assertFalse(self.log.exists())
-
     def test_pty_invalid_timezone_fails_before_yolo_prompt(self):
         self.install()
         self.zone.write_text("Invalid/Zone\n")
@@ -458,47 +447,18 @@ class ShellHookTests(unittest.TestCase):
             self.assertNotIn("YOLO", stderr)
         self.assertFalse(self.log.exists())
 
-    def test_pty_yolo_choice_is_per_launch_and_preserves_stdin_args_status(self):
-        self.claude.write_text(
-            '#!/bin/bash\n'
-            'input=; if [ "${READ_PAYLOAD-}" = yes ]; then IFS= read -r input; fi\n'
-            'command jq -cn --args \'{args:$ARGS.positional, browser:env.BROWSER, '
-            'tz:env.TZ}\' -- "$@" >> "$HOME/pty.calls"\n'
-            'printf "CLI:%s\\n" "$input"\nexit 37\n')
-        args = ["two words", "", "$(touch nope)", "a*b", "--model", "fixture"]
-        self.install()
-        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.private.iterdir()}
-        for shell in ("bash", "zsh"):
-            for answer, yolo in ((b"y\n", True), (b"YES\n", True), (b"n\n", False),
-                                 (b"\n", False), (b"\x04", False)):
-                with self.subTest(shell=shell, answer=answer):
-                    status, stderr, stdout = self.pty_launch(shell, args, answer)
-                    self.assertEqual(status, 37)
-                    self.assertEqual(stderr.count("YOLO? (y/N) "), 1)
-                    self.assertNotIn("YOLO", stdout)
-                    record = json.loads((self.home / "pty.calls").read_text().splitlines()[-1])
-                    self.assertEqual(record["args"], (["--dangerously-skip-permissions"] if yolo else []) + args)
-                    self.assertEqual(record["browser"], "false")
-                    self.assertEqual(record["tz"], "Australia/Sydney")
-            self.env["READ_PAYLOAD"] = "yes"
-            status, _, stdout = self.pty_launch(shell, args, b"n\npayload survives\n")
-            self.assertEqual(status, 37)
-            self.assertEqual(stdout, "CLI:payload survives\n")
-            self.env.pop("READ_PAYLOAD")
-        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
-
-    def test_pty_explicit_flag_and_informational_commands_skip_prompt(self):
+    def test_pty_launch_forwards_every_argument_without_prompting(self):
         self.install()
         for shell in ("bash", "zsh"):
-            for args in (["--dangerously-skip-permissions", "two words"], ["--help"],
-                         ["--version"], ["/login"], ["--print", "prompt"]):
-                with self.subTest(shell=shell, args=args):
-                    status, stderr, _ = self.pty_launch(shell, args)
-                    self.assertEqual(status, 0)
-                    self.assertNotIn("YOLO", stderr)
-                    calls = self.log.read_text()
-                    self.assertEqual(calls.count("ARG=--dangerously-skip-permissions"),
-                                     1 if shell == "bash" else 2)
+            for args in ([], ["--help"], ["--version"], ["/login"], ["--print", "two words"],
+                         ["--dangerously-skip-permissions", "", "literal;argument"]):
+                status, stderr, _ = self.pty_launch(shell, args)
+                self.assertEqual(status, 0)
+                self.assertNotIn("YOLO", stderr)
+        self.assertEqual(self.log.read_text().count("ARG=--dangerously-skip-permissions"), 2)
+        hook = (self.private / "hook.sh").read_text()
+        self.assertNotIn("read -r", hook)
+        self.assertNotIn("__ccacc_prompt", hook)
 
     def test_non_tty_preserves_stdin_and_caller_arguments_without_prompt(self):
         self.install()
@@ -507,10 +467,10 @@ class ShellHookTests(unittest.TestCase):
         for shell in ("bash", "zsh"):
             flags = ["--noprofile", "--norc"] if shell == "bash" else ["-f"]
             result = subprocess.run([shutil.which(shell), *flags, "-c",
-                '. "$HOME/.ccacc-shell/hook.sh"; claude "two words" ""'],
+                '. "$HOME/.ccacc-shell/hook.sh"; claude -p "two words" ""'],
                 env=self.env, input="payload survives\n", text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 29)
-            self.assertEqual(result.stdout, "payload survives\n[two words]\n[]\n")
+            self.assertEqual(result.stdout, "payload survives\n[-p]\n[two words]\n[]\n")
             self.assertEqual(result.stderr, "")
 
     def test_publish_failure_rolls_back_hook_record_and_startup_files(self):

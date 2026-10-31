@@ -32,7 +32,8 @@ ccacc save work --timezone Australia/Sydney  # Explicit timezone choice
 ccacc new                                   # Confirm prior backup, then clean/logout
 claude /login                               # Unnamed session: BROWSER=false, TZ unset
 ccacc save personal --timezone Europe/London # Name and save the login and timezone
-ccacc use work                              # Restore a saved profile and its timezone
+ccacc use work                              # Restore profile/TZ and choose YOLO (y/N)
+ccacc use work --no-yolo                    # Explicit normal permissions; --yolo opts in
 ccacc timezone work                         # Read the named timezone
 ccacc timezone                              # Read the active profile timezone
 ```
@@ -80,10 +81,13 @@ Hook validation checks the private v3 record, exact generated hook bytes and man
 source entries in the actual startup files. Moved deployments, changed Zsh startup
 directories, shadowed Bash login files and missing source entries require explicit
 reinstall. An explicit install recognizes exact known v1/v2 copied-alias hooks,
-including prior deployment paths, and replaces them with the fixed hook. Legacy
-literal parsing is used only for this upgrade validation; old hook and alias bodies
-are never executed or retained. Zsh startup context detection skips the managed
-hook source entry. Normal v3 checks never read legacy alias backups.
+including prior deployment paths, and replaces them with the fixed hook. The
+previous owned v3 launcher is also recognized for an explicit safe upgrade. Legacy
+literal parsing is used only for upgrade validation. Old alias commands are never
+run or retained. Zsh startup context detection uses authentic
+login/interactive startup, including normal RCS/GLOBAL_RCS behavior, after exact
+known-hook validation. Sourcing trusted factory hook code only defines functions;
+it never prompts or launches Claude. Normal v3 checks never read legacy alias backups.
 
 Modified/orphaned hooks and corrupt private records fail before startup context
 probing. Follow the error to inspect and move aside the unverified hook and record,
@@ -96,7 +100,8 @@ never migrate or repair an installation.
 EOF and answers other than `y`, `Y` or `yes` cancel before credentials, processes
 or account/session writes. Confirmed cleanup never auto-saves or creates a named
 profile. It asks for no timezone, clears `.active`, removes any legacy
-`.pending-timezone`, and creates no replacement timezone selection.
+`.pending-timezone` and the current launch mode, and creates no replacement
+timezone selection.
 
 Cleanup clears only the default Claude login field from Keychain and an optional
 `.credentials.json`, preserving MCP OAuth and unrelated fields. It resets IDs,
@@ -139,17 +144,29 @@ On every Claude launch the hook reads the current timezone status. A valid activ
 profile requires its saved zone; an unnamed session runs with `TZ` truly unset even
 if the calling shell has a zone. Only the child environment changes.
 `BROWSER=false` is always enforced, and caller arguments and Claude exit status are
-preserved. Invalid named timezone metadata blocks launch before any YOLO prompt.
+preserved. Invalid active metadata blocks launch. The hook never prompts, reads
+stdin, or classifies Claude arguments (including help/version/login/print flags).
 
-For an interactive chat launch with terminal stdin and stderr, the hook asks
-`YOLO? (y/N)` on stderr. `y` or `yes` (case-insensitive) adds
-`--dangerously-skip-permissions` for that launch only. Empty input, any other answer
-or EOF uses normal permissions; Ctrl-C cancels launch. Nothing is persisted to a
-profile or later launch. Non-TTY launches use normal permissions without prompting
-or consuming stdin. `--help`, `--version`, `/login`, and `--print`/`-p` skip the
-prompt. An explicit caller `--dangerously-skip-permissions` is forwarded once,
-without an extra flag or prompt. Interactive answers are read from the terminal,
-leaving redirected/piped CLI stdin untouched.
+`ccacc use <name>` asks `YOLO? (y/N)` on stderr when stdin and stderr are terminals,
+including when the profile is already active. `y` or `yes` (case-insensitive)
+chooses YOLO; empty input, other answers and EOF choose normal permissions. Ctrl-C
+cancels the selection. Noninteractive `use` defaults to normal permissions without
+reading password input. `use <name> --yolo` and `--no-yolo` make the choice explicit
+for automation and skip the question.
+
+A successful selection publishes one private current-selection record,
+`~/.claude/accounts/.launch-mode` (mode `600`), bound to that profile. This is not
+named profile backup data: `save` records only login, timezone and Surge settings.
+The selected mode applies while that profile is active. The next `use` replaces
+it and a successful `new` clears it; failed/cancelled selections leave the prior
+mode unchanged.
+The hook reads this record without passwords, credentials, shell startup or
+installed-check recursion. Only a valid matching `true` adds
+`--dangerously-skip-permissions`; absent, corrupt, stale or unsafe records use
+normal permissions. An unnamed session always uses normal permissions, regardless
+of leftover data. The hook forwards all caller arguments unchanged, including
+any explicit permissions flags. Cleanup snapshots the mode with its other
+session metadata and restores it if cleanup fails.
 
 The private hook directory has mode `700`, its files `600`. The installer adds one
 source block at the end of Bash's `.bashrc` and selected login file, or Zsh's

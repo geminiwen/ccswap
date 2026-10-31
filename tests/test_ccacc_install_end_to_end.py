@@ -57,7 +57,8 @@ class InstallEndToEndTests(unittest.TestCase):
 
             def install():
                 result = subprocess.run(["bash", str(ROOT / "install.sh")], env=env,
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                                        start_new_session=True)
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 self.assertIn("Setup complete", result.stdout)
 

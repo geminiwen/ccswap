@@ -142,8 +142,13 @@ before cleanup; ccacc warns and refuses cleanup while those owners remain live.
 
 ## Settings
 
-ccacc optionally reads `~/.ccacc/settings.json`. It never creates or edits this
-file. The file must contain one JSON object; unknown keys are ignored.
+ccacc optionally reads `~/.ccacc/settings.json`; the `ccacc` command never
+creates or edits it. When the file does not exist, the installer asks once on the
+terminal `Always turn on YOLO (skip Claude permission prompts) when switching
+accounts? (y/N)` and saves the answer as `alwaysYOLO` (blank means No). It never
+asks or writes when the file already exists or no terminal is available, so
+reinstalling keeps your choice. The file must contain one JSON object; unknown
+keys are ignored.
 
 ```json
 {

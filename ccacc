@@ -92,12 +92,10 @@ ${BLUE}ccacc – Claude Code Account Switcher v${VERSION}${NC}
 Usage: $SCRIPT_NAME [COMMAND] [OPTIONS]
 
 Commands:
-  ls                    List saved accounts
+  list, ls              List saved accounts
   current               Show the current Claude account
-  save <name> [--alias <alias-name>] [--timezone <ZONE>]
-                        Back up the current account and its same-named shell alias
-  alias <name> [alias-name]
-                        Back up an existing shell alias (optional, never executed)
+  save <name> [--timezone <ZONE>]
+                        Back up the current account and its timezone
   timezone [name]       Print the saved TZ only (defaults to the active account)
   use <name>            Back up the active account, then switch to <name>
   new
@@ -177,84 +175,9 @@ check_name() {
     fi
 }
 
-check_alias_name() {
-    if [[ ! "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
-        echo "Error: Invalid alias name" >&2
-        return 1
-    fi
-}
-
-# Startup files define aliases in the user's login shell. Only query the alias
-# builtin; never interpolate the name into code, eval its output, or run its body.
-# A framed JSON response separates the result from startup/logout chatter.
-probe_alias() {
-    local alias_name="$1" shell="${SHELL:-/bin/bash}" output marker
-    case "${shell##*/}" in
-        bash|zsh) ;;
-        *) echo "Warning: Alias backup supports bash and zsh; skipped" >&2; return 1 ;;
-    esac
-    marker="ccacc-alias-$RANDOM-$RANDOM-$RANDOM"
-    output=$("$shell" -ilc '
-        \builtin printf "\n%s\n" "$2"
-        if \builtin test -n "${ZSH_VERSION:-}"; then
-            if (( ${+aliases[$1]} )); then
-                \builtin printf "%s" "${aliases[$1]}" | \command jq -Rsc --arg directory "${ZDOTDIR:-$HOME}" "{format: \"raw\", value: ., startupDirectory: \$directory}"
-            else
-                \command jq -cn --arg directory "${ZDOTDIR:-$HOME}" "{missing: true, startupDirectory: \$directory}"
-            fi
-        elif value=$(\builtin alias -- "$1" 2>/dev/null); then
-            \builtin printf "%s" "$value" | \command jq -Rsc --arg directory "$HOME" "{format: \"bash\", value: ., startupDirectory: \$directory}"
-        else
-            \command jq -cn --arg directory "$HOME" "{missing: true, startupDirectory: \$directory}"
-        fi
-        \builtin printf "%s\n" "$2"
-    ' ccacc "$alias_name" "$marker" 2>/dev/null) || return 1
-    printf '%s\n' "$output" | jq -Rsc --arg marker "$marker" --arg name "$alias_name" '
-        split("\n" + $marker + "\n")
-        | if length == 3 then .[1] | fromjson else error("Missing alias response") end
-        | .startupDirectory as $directory
-        | if ($directory | type) != "string" then error("Invalid startup directory")
-          elif .missing == true then {missing: true}
-          elif .format == "raw" and (.value | type) == "string" then {definition: .value}
-          elif .format == "bash" then
-            .value | ltrimstr("alias ") | ltrimstr($name + "=")
-            | if startswith("\u0027") and endswith("\u0027") then
-                {definition: (.[1:-1] | split("\u0027\\\u0027\u0027") | join("\u0027"))}
-              else error("Invalid alias response") end
-          else error("Invalid alias response") end
-        | . + {startupDirectory: $directory}
-    ' 2>/dev/null
-}
-
 valid_timezone() {
     [[ "$1" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] \
         && [ -f "/usr/share/zoneinfo/$1" ]
-}
-
-alias_command() {
-    local name="$1" alias_name="${2-$1}" captured
-    check_name "$name" || return 1
-    check_alias_name "$alias_name" || return 1
-    command -v jq >/dev/null || return 1
-    if ! captured=$(probe_alias "$alias_name"); then
-        echo "Warning: Could not query shell alias; backup unchanged" >&2
-        return 0
-    fi
-    [ "$(printf '%s' "$captured" | jq -r '.missing // false')" != true ] || return 0
-    write_alias_backup "$name" "$alias_name" "$captured"
-}
-
-write_alias_backup() {
-    local name="$1" alias_name="$2" captured="$3" temp_alias
-    mkdir -p -m 700 "$ACCOUNTS_DIR" "$ALIASES_DIR"
-    temp_alias=$(mktemp "$ALIASES_DIR/.alias.XXXXXX") || return 1
-    if ! printf '%s' "$captured" | jq --arg name "$alias_name" \
-        '{aliasName: $name, definition: .definition}' \
-        > "$temp_alias" || ! chmod 600 "$temp_alias" \
-        || ! mv -f "$temp_alias" "$ALIASES_DIR/${name}.json"; then
-        rm -f "$temp_alias"
-        return 1
-    fi
 }
 
 # Intentionally independent of check_ready, passwords, credentials and shell
@@ -362,24 +285,14 @@ configure_shell_command() {
 }
 
 # Preflight only: validate every flag and resolve the required TZ before writes,
-# passwords or account changes. Reuse the captured alias rather than probing twice.
+# passwords or account changes.
 prepare_account_metadata() {
-    local name="${1:-}" requested_zone="" alias_seen="" zone_seen="" zone
+    local name="${1:-}" requested_zone="" zone_seen="" zone
     check_name "$name" || return 1
     shift
-    PREPARED_ALIAS_NAME="$name"
-    PREPARED_ALIAS=""
     PREPARED_TIMEZONE=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --alias)
-                [ "$#" -ge 2 ] && [ -z "$alias_seen" ] || {
-                    echo "Error: --alias requires one value and may appear only once" >&2; return 1;
-                }
-                PREPARED_ALIAS_NAME="$2"
-                check_alias_name "$PREPARED_ALIAS_NAME" || return 1
-                alias_seen=yes
-                ;;
             --timezone)
                 [ "$#" -ge 2 ] && [ -z "$zone_seen" ] || {
                     echo "Error: --timezone requires one value and may appear only once" >&2; return 1;
@@ -388,7 +301,7 @@ prepare_account_metadata() {
                 valid_timezone "$requested_zone" || { echo "Error: Invalid timezone" >&2; return 1; }
                 zone_seen=yes
                 ;;
-            *) echo "Error: Expected --alias <alias-name> or --timezone <ZONE>" >&2; return 1 ;;
+            *) echo "Error: Expected --timezone <ZONE>" >&2; return 1 ;;
         esac
         shift 2
     done
@@ -397,25 +310,10 @@ prepare_account_metadata() {
     if [ -z "$zone" ]; then zone=$(timezone_command "$name") || zone=""; fi
     if [ -z "$zone" ]; then zone=$(choose_timezone "$name") || return 1; fi
     PREPARED_TIMEZONE="$zone"
-    # A save is allowed before installation or while the hook needs repair.
-    # Never let its optional login-shell alias probe source an unverified hook.
-    if [ -e "$HOME/.ccacc-shell" ] && ! ccacc_check_shell_hook "$CCACC_ABSOLUTE_SCRIPT" >/dev/null 2>&1; then
-        echo "Warning: Skipping alias backup until the shell hook is reinstalled" >&2
-        return 0
-    fi
-    if ! PREPARED_ALIAS=$(probe_alias "$PREPARED_ALIAS_NAME"); then
-        echo "Warning: Could not query shell alias; backup unchanged" >&2
-        PREPARED_ALIAS=""
-    elif [ "$(printf '%s' "$PREPARED_ALIAS" | jq -r '.missing // false')" = true ]; then
-        PREPARED_ALIAS=""
-    fi
 }
 
 save_prepared_metadata() {
-    set_timezone "$1" "$PREPARED_TIMEZONE" || return 1
-    if [ -n "$PREPARED_ALIAS" ]; then
-        write_alias_backup "$1" "$PREPARED_ALIAS_NAME" "$PREPARED_ALIAS" || return 1
-    fi
+    set_timezone "$1" "$PREPARED_TIMEZONE"
 }
 
 # Match executable names, not command arguments mentioning Claude paths.
@@ -1487,7 +1385,7 @@ delete_command() {
 # Main function
 main() {
     case "${1:-}" in
-        ls)
+        list|ls)
             list_accounts
             ;;
         current)
@@ -1496,10 +1394,6 @@ main() {
         save)
             shift
             save_command "$@"
-            ;;
-        alias)
-            [ "$#" -ge 2 ] && [ "$#" -le 3 ] || return 1
-            alias_command "$2" "${3-$2}"
             ;;
         timezone)
             [ "$#" -le 3 ] || return 1

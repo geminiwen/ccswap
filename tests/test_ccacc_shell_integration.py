@@ -133,25 +133,19 @@ apply_surge() { :; }
             login.write_text(content)
         return startup, (rc, login)
 
-    def probe(self, alias="claude"):
-        result = self.run_process(["/bin/bash", "-c",
-                                  'source "$FIXTURE_CORE" help >/dev/null\nprobe_alias "$1"',
-                                  "fixture", alias])
-        return json.loads(result.stdout)
-
     def interactive(self, shell, code, startup=True):
         args = ["/bin/" + shell]
         if not startup:
             args += ["--noprofile", "--norc"] if shell == "bash" else ["-f"]
-        # Feed separate input lines like a terminal. In particular, Zsh parses a
-        # whole -c string before a newly sourced alias becomes available.
+        # Feed separate input lines to exercise repeated source and launches
+        # in the same shell, as a terminal caller would.
         args += ["-il" if startup else "-i"]
         return self.run_process(args, stdin=code)
 
     def records(self, path):
         return [json.loads(line) for line in path.read_text().splitlines()]
 
-    def test_real_startup_wrapper_dynamic_timezone_and_repeat_install(self):
+    def test_real_startup_fixed_hook_dynamic_timezone_and_repeat_install(self):
         for shell in ("bash", "zsh"):
             with self.subTest(shell=shell):
                 # Give each shell its own complete HOME fixture.
@@ -161,15 +155,13 @@ apply_surge() { :; }
                               "BROWSER=firefox TZ=UTC CLAUDE_CONFIG_DIR='/fixture config' "
                               "claude --dangerously-skip-permissions --model 'model name'")
                 _, rcs = self.startup(shell, definition, zdotdir=shell == "zsh")
-                self.assertEqual(self.probe()["definition"], definition)
                 result = self.cli("configure-shell")
                 self.assertIn("Claude shell hook installed.", result.stdout)
                 self.assertIn("In your current shell, run: source", result.stdout)
                 self.assertIn("New interactive terminals", result.stdout)
                 self.assertFalse(self.launches.exists())
                 self.assertFalse(self.wrappers.exists())
-                original = json.loads((self.home / ".ccacc-shell/original-alias.json").read_text())
-                self.assertEqual(original["definition"], definition)
+                self.assertFalse((self.home / ".ccacc-shell/original-alias.json").exists())
                 snapshot = {rc: (rc.read_bytes(), rc.stat().st_mtime_ns) for rc in rcs}
                 self.cli("configure-shell", "sydney")
                 self.assertEqual({rc: (rc.read_bytes(), rc.stat().st_mtime_ns) for rc in rcs}, snapshot)
@@ -184,29 +176,51 @@ apply_surge() { :; }
                 self.assertEqual([entry["tz"] for entry in launches], ["Australia/Sydney", "Asia/Tokyo"])
                 for index, entry in enumerate(launches):
                     self.assertEqual(entry["browser"], "false")
-                    self.assertEqual(entry["config"], "/fixture config")
-                    self.assertEqual(entry["outer"], "outer value")
-                    self.assertEqual(entry["inner"], "inside value")
-                    self.assertEqual(entry["args"], ["--dangerously-skip-permissions", "--model",
-                                                     "model name", ("user argument", "next argument")[index]])
-                wrappers = self.records(self.wrappers)
-                self.assertEqual(len(wrappers), 2)
-                self.assertEqual([entry["tz"] for entry in wrappers], ["Australia/Sydney", "Asia/Tokyo"])
-                self.assertTrue(all(entry["outer"] == "outer value" and entry["browser"] == "false"
-                                    and entry["args"][0] == "env" for entry in wrappers))
+                    self.assertIsNone(entry["config"])
+                    self.assertIsNone(entry["outer"])
+                    self.assertIsNone(entry["inner"])
+                    self.assertEqual(entry["args"], [("user argument", "next argument")[index]])
+                self.assertFalse(self.wrappers.exists())
                 self.interactive(shell, "claude 'fresh terminal'\n")
                 self.assertEqual(self.records(self.launches)[-1]["tz"], "Asia/Tokyo")
 
     def test_nonexported_zdotdir_metadata_for_existing_and_missing_alias(self):
         startup, rcs = self.startup("zsh", "TZ=UTC claude", zdotdir=True)
         self.assertNotIn("ZDOTDIR", self.env)
-        self.assertEqual(self.probe(), {"definition": "TZ=UTC claude", "startupDirectory": str(startup)})
-        self.assertEqual(self.probe("missing"), {"missing": True, "startupDirectory": str(startup)})
         self.cli("configure-shell")
         for rc in rcs:
             self.assertIn("# >>> ccacc shell hook >>>", rc.read_text())
         self.assertFalse((self.home / ".zshrc").exists())
         self.assertFalse((self.home / ".zlogin").exists())
+
+    def test_zsh_typeset_zdotdir_keeps_top_level_startup_scope(self):
+        startup = self.home / "typed zsh directory"
+        startup.mkdir()
+        (self.home / ".zshenv").write_text("typeset ZDOTDIR=" + shlex.quote(str(startup)) + "\n")
+        self.env["SHELL"] = "/bin/zsh"
+        self.cli("configure-shell")
+        self.harness("require_shell_hook")
+        self.assertTrue((startup / ".zshrc").exists())
+        self.assertTrue((startup / ".zlogin").exists())
+        self.assertFalse((self.home / ".zshrc").exists())
+
+    def test_zsh_rejects_changed_managed_source_before_evaluating_it(self):
+        for version in (1, 3):
+            with self.subTest(version=version):
+                self.reset_fixture()
+                if version == 1:
+                    self.legacy_install(1, "zsh")
+                else:
+                    self.startup("zsh", zdotdir=True)
+                    self.cli("configure-shell")
+                rc = self.home / "zsh settings/.zshrc"
+                content = rc.read_text()
+                source = next(line for line in content.splitlines() if line.startswith(". "))
+                rc.write_text(content.replace(source, '. "$(printf executed > "$HOME/source-executed")"'))
+                before = self.home_snapshot()
+                self.cli("configure-shell", success=False)
+                self.assertFalse((self.home / "source-executed").exists())
+                self.assertEqual(self.home_snapshot(), before)
 
     def test_missing_alias_installs_default_without_source_time_launch(self):
         for shell in ("bash", "zsh"):
@@ -214,7 +228,6 @@ apply_surge() { :; }
                 if shell == "zsh":
                     self.reset_fixture()
                 startup, _ = self.startup(shell, zdotdir=shell == "zsh")
-                self.assertEqual(self.probe(), {"missing": True, "startupDirectory": str(startup)})
                 self.cli("configure-shell", "tokyo")
                 self.assertFalse((self.home / ".ccacc-shell/original-alias.json").exists())
                 self.interactive(shell, ":")
@@ -348,10 +361,6 @@ apply_surge() { :; }
             (private / "managed.json", None),
             (private / "managed.json", b"{}"),
             (private / "managed.json", b'{"version":2,"originalMissing":true}'),
-            (private / "original-alias.json", None),
-            (private / "original-alias.json", b'{"definition":"claude --changed"}'),
-            (private / "original-alias.json", b'{"definition":7}'),
-            (private / "original-alias.json", b'{"definition":"claude"}\x00'),
             (self.home / ".bashrc", b"# missing entry\n"),
             (self.home / ".bash_profile", b"# missing login entry\n"),
         )
@@ -425,90 +434,114 @@ apply_surge() { :; }
         self.assertFalse((self.home / ".claude").exists())
         self.assertFalse((self.home / ".claude.json").exists())
 
-    def test_legacy_valid_install_is_recognized_and_explicitly_migrated(self):
-        self.startup("bash", "TZ=UTC claude --model fixture")
+    def legacy_install(self, version, shell, missing=False):
+        definition = "OUTER=old _op_agent env INNER=old claude --dangerously-skip-permissions --model old"
+        self.startup(shell, definition, zdotdir=shell == "zsh")
         self.cli("configure-shell")
         private = self.home / ".ccacc-shell"
-        (private / "managed.json").write_text('{"version":1,"originalMissing":false}\n')
-        before = self.home_snapshot()
-        self.harness("require_shell_hook")
-        self.assertEqual(self.home_snapshot(), before)
-        preserved = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
-                     for p in (self.home / ".bashrc", self.home / ".bash_profile", private / "hook.sh")}
+        record = json.loads((private / "managed.json").read_text())
+        record.update(version=version, originalMissing=missing)
+        if version == 1:
+            record = {"version": 1, "originalMissing": missing}
+        (private / "managed.json").write_text(json.dumps(record) + "\n")
+        if not missing:
+            backup = private / "original-alias.json"
+            backup.write_text(json.dumps({"definition": definition}) + "\n")
+            backup.chmod(0o640)
+        quote = lambda value: "'" + str(value).replace("'", "'\\''") + "'"
+        if version == 1:
+            if missing:
+                command = ' BROWSER=false TZ="$__ccacc_tz" \'claude\' "$@"'
+            else:
+                command = (' OUTER=old BROWSER=false TZ="$__ccacc_tz" \'_op_agent\' \'env\' '
+                           'INNER=old BROWSER=false TZ="$__ccacc_tz" \'claude\' '
+                           '\'--dangerously-skip-permissions\' \'--model\' \'old\' "$@"')
+        else:
+            if missing:
+                command = ' BROWSER=false \'env\' "${__ccacc_tz_env[@]}" BROWSER=false \'claude\' "$@"'
+            else:
+                command = (' OUTER=old BROWSER=false \'_op_agent\' \'env\' INNER=old BROWSER=false '
+                           '\'env\' "${__ccacc_tz_env[@]}" BROWSER=false \'claude\' '
+                           '\'--dangerously-skip-permissions\' \'--model\' \'old\' "$@"')
+        template = (ROOT / f"tests/fixtures/ccacc_hook_v{version}.sh.in").read_text()
+        hook = template.replace("@SCRIPT@", quote(self.core)).replace("@COMMAND@", command)
+        hook = hook.replace("@DIRECTORY@", quote(self.core.parent))
+        (private / "hook.sh").write_text(hook)
+        if shell == "zsh":
+            # If the context probe sources the old hook, its function/alias
+            # definitions become visible here even without a Claude launch.
+            with (self.home / "zsh settings/.zlogin").open("a") as stream:
+                stream.write('if (( ${+functions[__ccacc_launch]} )); then '
+                             'printf sourced > "$HOME/legacy-sourced"; fi\n')
+        return private
+
+    def test_v1_v2_upgrades_never_source_or_retain_old_alias_commands(self):
+        for version in (1, 2):
+            for shell in ("bash", "zsh"):
+                for missing in (False, True):
+                    with self.subTest(version=version, shell=shell, missing=missing):
+                        self.reset_fixture()
+                        private = self.legacy_install(version, shell, missing)
+                        backups = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+                                   for p in private.glob("original-alias.json")}
+                        before = self.home_snapshot()
+                        self.harness("require_shell_hook", success=False)
+                        self.assertEqual(self.home_snapshot(), before)
+                        # Reinstall at another path also covers v1 script-word
+                        # decoding and v2 stored deployment-path upgrades.
+                        final = self.fixture / "new tools's"
+                        final.mkdir()
+                        self.core = final / "ccacc"
+                        shutil.copyfile(ROOT / "ccacc", self.core)
+                        shutil.copyfile(ROOT / "ccacc_shell.sh", final / "ccacc_shell.sh")
+                        self.env["FIXTURE_CORE"] = str(self.core)
+                        self.cli("configure-shell")
+                        self.harness("require_shell_hook")
+                        self.assertFalse((self.home / "legacy-sourced").exists())
+                        self.assertEqual(json.loads((private / "managed.json").read_text())["version"], 3)
+                        self.assertNotIn("_op_agent", (private / "hook.sh").read_text())
+                        self.assertEqual(backups, {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+                                                   for p in backups})
+                        self.interactive(shell, "claude /login\n")
+                        self.assertEqual(self.records(self.launches)[0]["args"], ["/login"])
+                        self.assertFalse(self.wrappers.exists())
+
+    def test_corrupt_legacy_code_is_refused_before_startup_or_writes(self):
+        for version in (1, 2):
+            self.reset_fixture()
+            private = self.legacy_install(version, "zsh")
+            with (private / "hook.sh").open("a") as stream:
+                stream.write('printf executed > "$HOME/hook-executed"\n')
+            before = self.home_snapshot()
+            result = self.cli("configure-shell", success=False)
+            self.assertIn("inspect and move aside", result.stderr)
+            self.assertEqual(self.home_snapshot(), before)
+            self.assertFalse((self.home / "hook-executed").exists())
+            self.assertFalse((self.home / "legacy-sourced").exists())
+
+    def test_v3_ignores_and_preserves_unreadable_legacy_backup_contents(self):
+        self.startup("zsh", zdotdir=True)
         self.cli("configure-shell")
-        self.assertEqual(json.loads((private / "managed.json").read_text())["version"], 2)
-        self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
-                          for p in preserved}, preserved)
+        backup = self.home / ".ccacc-shell/original-alias.json"
+        backup.write_bytes(b"unparsed legacy data\x00\n")
+        backup.chmod(0)
+        before = backup.stat().st_mtime_ns, backup.stat().st_mode
+        self.harness("require_shell_hook")
+        self.cli("configure-shell")
+        self.assertEqual((backup.stat().st_mtime_ns, backup.stat().st_mode), before)
+        backup.chmod(0o600)
+        self.assertEqual(backup.read_bytes(), b"unparsed legacy data\x00\n")
 
-    def test_known_prior_hook_requires_explicit_upgrade_and_rejects_modified_bytes(self):
-        template = (ROOT / "tests/fixtures/ccacc_hook_v1.sh.in").read_text()
-        for shell in ("bash", "zsh"):
-            with self.subTest(shell=shell):
-                if shell == "zsh":
-                    self.reset_fixture()
-                self.startup(shell, "KEEP=keep TZ=UTC _op_agent env INNER=inner TZ=UTC claude --model fixture",
-                             zdotdir=shell == "zsh")
-                self.cli("configure-shell")
-                private = self.home / ".ccacc-shell"
-                hook = private / "hook.sh"
-                current = hook.read_bytes()
-                original = (private / "original-alias.json").read_bytes()
-                quoted = "'" + str(self.core).replace("'", "'\\''") + "'"
-                command = (' KEEP=keep BROWSER=false TZ="$__ccacc_tz" \'_op_agent\' \'env\' '
-                           'INNER=inner BROWSER=false TZ="$__ccacc_tz" \'claude\' \'--model\' \'fixture\' "$@"')
-                legacy = template.replace("@SCRIPT@", quoted).replace("@COMMAND@", command)
-                hook.write_text(legacy)
-                before = self.home_snapshot()
-                self.harness("require_shell_hook", success=False)
-                self.assertEqual(self.home_snapshot(), before)
-                hook.write_text(legacy + 'printf executed > "$HOME/hook-executed"\n')
-                before = self.home_snapshot()
-                self.cli("configure-shell", success=False)
-                self.assertEqual(self.home_snapshot(), before)
-                self.assertFalse((self.home / "hook-executed").exists())
-                hook.write_text(legacy)
-                self.cli("configure-shell")
-                self.assertEqual(hook.read_bytes(), current)
-                self.assertEqual((private / "original-alias.json").read_bytes(), original)
-                self.harness("require_shell_hook")
-
-    def test_explicit_setup_migrates_known_old_deployment_for_v1_and_v2_records(self):
-        template = (ROOT / "tests/fixtures/ccacc_hook_v1.sh.in").read_text()
-        for version, shell in ((1, "bash"), (1, "zsh"), (2, "bash"), (2, "zsh")):
-            with self.subTest(version=version, shell=shell):
-                self.reset_fixture()
-                old = self.fixture / "old tools's"
-                old.mkdir()
-                self.core = old / "ccacc"
-                shutil.copyfile(ROOT / "ccacc", self.core)
-                shutil.copyfile(ROOT / "ccacc_shell.sh", old / "ccacc_shell.sh")
-                self.env["FIXTURE_CORE"] = str(self.core)
-                self.startup(shell, "TZ=UTC claude --model fixture", zdotdir=shell == "zsh")
-                self.cli("configure-shell")
-                private = self.home / ".ccacc-shell"
-                hook = private / "hook.sh"
-                quoted = "'" + str(self.core).replace("'", "'\\''") + "'"
-                command = ' BROWSER=false TZ="$__ccacc_tz" \'claude\' \'--model\' \'fixture\' "$@"'
-                hook.write_text(template.replace("@SCRIPT@", quoted).replace("@COMMAND@", command))
-                if version == 1:
-                    (private / "managed.json").write_text('{"version":1,"originalMissing":false}\n')
-                before = {p: p.read_bytes() for p in (self.home / ".claude").rglob("*") if p.is_file()}
-                original = (private / "original-alias.json").read_bytes()
-                final = self.fixture / "new tools's"
-                final.mkdir()
-                self.core = final / "ccacc"
-                shutil.copyfile(ROOT / "ccacc", self.core)
-                shutil.copyfile(ROOT / "ccacc_shell.sh", final / "ccacc_shell.sh")
-                self.env["FIXTURE_CORE"] = str(self.core)
-                self.harness("require_shell_hook", success=False)
-                self.cli("configure-shell")
-                self.harness("require_shell_hook")
-                self.assertIn("new tools", hook.read_text())
-                self.assertNotIn("old tools", hook.read_text())
-                self.assertEqual(json.loads((private / "managed.json").read_text())["script"], str(self.core))
-                self.assertEqual((private / "original-alias.json").read_bytes(), original)
-                self.assertEqual({p: p.read_bytes() for p in before}, before)
-                self.assertFalse(self.launches.exists())
+    def test_fresh_setup_preserves_orphaned_legacy_backup_as_data(self):
+        self.startup("bash")
+        private = self.home / ".ccacc-shell"
+        private.mkdir()
+        backup = private / "original-alias.json"
+        backup.write_bytes(b"legacy backup data\x00\n")
+        before = backup.read_bytes(), backup.stat().st_mtime_ns, backup.stat().st_mode
+        self.cli("configure-shell")
+        self.harness("require_shell_hook")
+        self.assertEqual((backup.read_bytes(), backup.stat().st_mtime_ns, backup.stat().st_mode), before)
 
     def test_unnamed_launch_unsets_inherited_and_runtime_wrapper_timezone(self):
         for shell in ("bash", "zsh"):
@@ -526,8 +559,8 @@ apply_surge() { :; }
                 launched = self.records(self.launches)[0]
                 self.assertEqual(launched["browser"], "false")
                 self.assertIsNone(launched["tz"])
-                self.assertEqual(launched["args"], ["--model", "fixture", "/login"])
-                self.assertEqual((launched["outer"], launched["inner"]), ("outer", "inner"))
+                self.assertEqual(launched["args"], ["/login"])
+                self.assertEqual((launched["outer"], launched["inner"]), (None, None))
                 self.assertFalse((self.accounts / ".pending-timezone").exists())
 
     def test_getter_distinguishes_unnamed_from_invalid_active_metadata(self):
@@ -578,6 +611,7 @@ apply_surge() { :; }
                 # original record and regenerates a missing hook safely.
                 record.write_bytes(saved_record)
                 hook.unlink()
+                record.unlink()
                 self.cli("configure-shell")
                 self.harness("require_shell_hook")
                 self.assertFalse((self.home / "hook-executed").exists())
@@ -613,23 +647,17 @@ apply_surge() { :; }
         self.assertIn("curl -fsSL", result.stderr)
         self.assertFalse((self.home / "operations").exists())
 
-    def test_alias_content_stays_out_of_external_jq_arguments(self):
+    def test_install_and_save_never_query_or_copy_aliases(self):
         secret = "fixture-secret-never-an-argv-value"
-        definition = f"TOKEN={secret} TZ=Asia/Tokyo claude --model fixture"
-        startup, _ = self.startup("zsh", definition, zdotdir=True)
-        for filename in (".zshrc", ".zlogin"):
-            with (startup / filename).open("a") as rc:
-                rc.write("builtin alias " + shlex.quote("work-claude=" + definition) + "\n")
-        self.assertEqual(self.probe()["definition"], definition)
-        # Exercise raw alias backup through real core paths with an explicit timezone.
+        self.startup("zsh", f"TOKEN={secret} claude --dangerously-skip-permissions", zdotdir=True)
         self.cli("configure-shell")
-        self.harness("main save captured --alias work-claude --timezone UTC")
-        backup = json.loads((self.accounts / ".aliases/captured.json").read_text())
-        self.assertEqual(backup["definition"], definition)
-        self.assertNotIn("env", backup)
-        self.assertEqual(self.cli("timezone", "captured").stdout, "UTC\n")
+        self.harness("probe_alias() { return 99; }; main save captured --timezone UTC")
+        self.assertFalse((self.accounts / ".aliases").exists())
+        self.assertFalse((self.home / ".ccacc-shell/original-alias.json").exists())
         self.assertNotIn(secret.encode(), self.argv.read_bytes())
+        self.assertNotIn(secret, (self.home / ".ccacc-shell/hook.sh").read_text())
         self.assertFalse(self.launches.exists())
+
 
 
 if __name__ == "__main__":

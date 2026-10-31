@@ -7,7 +7,7 @@ Built with ❤️ by JUAN MACKIE
 
 -------------
 
-## ccacc account aliases and timezones
+## ccacc accounts and shell hook
 
 `ccacc` switches official Claude Code accounts separately from `ccswap` profiles.
 Install or reinstall with:
@@ -26,22 +26,21 @@ Zsh and regular absolute paths without symlink components; account backups also
 need `openssl`.
 
 ```bash
+ccacc list                                  # List saved accounts (ls also works)
 ccacc save personal                         # Choose timezone on first save
-ccacc save work --alias work-claude          # Back up a different shell alias
 ccacc save work --timezone Australia/Sydney  # Explicit timezone choice
 ccacc new                                   # Confirm prior backup, then clean/logout
 claude /login                               # Unnamed session: BROWSER=false, TZ unset
 ccacc save personal --timezone Europe/London # Name and save the login and timezone
 ccacc use work                              # Restore a saved profile and its timezone
-ccacc alias work work-claude                 # Back up the alias only
 ccacc timezone work                         # Read the named timezone
 ccacc timezone                              # Read the active profile timezone
 ```
 
 Only `save <name>` records a profile timezone and its Surge configuration. Save
-accepts `--alias <alias-name>` and `--timezone <ZONE>` in either order. An explicit
-zone takes priority over that profile's existing `.timezones` choice. A first save
-without either requires a numbered choice: UTC, Asia/Shanghai, Asia/Tokyo,
+accepts `--timezone <ZONE>`. An explicit zone takes priority over that profile's existing `.timezones` choice. A first save
+without a saved or explicit timezone requires a numbered choice: UTC,
+Asia/Shanghai, Asia/Tokyo,
 Australia/Sydney, Europe/London, America/New_York, America/Los_Angeles, or a custom
 IANA timezone. There is no default or detection from aliases, environment `TZ`,
 host settings or account names. Empty, invalid or unanswered choices and malformed
@@ -52,14 +51,14 @@ The legacy `ccacc surge <name>` setter also redirects to `save`.
 
 Timezones are private metadata in
 `~/.claude/accounts/.timezones/<account>` (file `600`, directory `700`). Saved
-profiles can have a timezone without an alias backup. The timezone getter never
-prompts, starts a shell, accesses credentials, stops processes or writes files.
+profiles keep their zone independently of legacy alias data. The timezone getter
+never prompts, starts a shell, accesses credentials, stops processes or writes files.
 It prints one validated zone plus a newline with exit status `0`. The no-argument
 getter returns empty output and status `3` for an unnamed session with no active
 marker; corrupt markers/profiles or missing/invalid active timezone metadata
 return status `1`. A named query never falls back to aliases or legacy session
-metadata. `ccacc rm <account>` also removes that account's alias and timezone
-metadata; metadata alone does not make a profile appear in `ls` or `current`.
+metadata. `ccacc rm <account>` also removes that account's timezone and any legacy
+alias metadata; metadata alone does not make a profile appear in `ls` or `current`.
 
 Only `use`, including its already-active shortcut, requires a verified installed
 hook before passwords, process shutdown or account mutation. Missing, moved,
@@ -70,26 +69,27 @@ safety helpers. Valid installed hooks can be checked with read-only startup
 files. The installer internally invokes the account-independent
 `configure-shell` helper; `ccacc install` redirects to the curl installer.
 
-Hook validation covers its private record, required original-alias backup and
-managed source entries in the actual startup files. Moved deployments, changed
-Zsh startup directories, shadowed Bash login files and missing source entries
-require explicit reinstall. Existing current or exact known prior generated hook
-bytes are verified before any startup probe can source them; the installer can
-upgrade the known prior format. Upgrades also recognize known hooks from a different prior deployment
-path, including v1 records without a stored path, by literal parsing and exact
-template reconstruction. A modified hook is refused before
-probing: inspect it and move it aside manually before reinstalling. Corrupt private
-records also require manual review. Runtime checks never migrate old hook bytes.
+The fixed hook calls the native `claude` executable on PATH, bypassing shell
+aliases and functions. It copies no existing alias commands, wrappers, environment
+assignments or fixed flags. `ccacc alias` and `save --alias` are no longer supported.
+Install and save never query aliases or create alias backups. Existing
+`~/.claude/accounts/.aliases` data and `.ccacc-shell/original-alias.json` are left
+intact; deleting a profile can remove only its own legacy alias metadata.
 
-Alias backup queries the alias builtin in a login/interactive Bash or Zsh using
-`$SHELL` (Bash when unset). Normal startup files run, but captured alias bodies are
-never evaluated. Startup/logout chatter is ignored. Missing aliases, unsupported
-shells and failed probes preserve any existing backup. Save skips its optional
-alias probe when an existing managed hook cannot be verified, so it cannot source
-a damaged hook while saving an account. Raw backups in
-`~/.claude/accounts/.aliases/<account>.json` contain only `aliasName` and
-`definition`, with file mode `600`; legacy `env.TZ` is ignored. The `.aliases`
-directory is separate from account history stashes.
+Hook validation checks the private v3 record, exact generated hook bytes and managed
+source entries in the actual startup files. Moved deployments, changed Zsh startup
+directories, shadowed Bash login files and missing source entries require explicit
+reinstall. An explicit install recognizes exact known v1/v2 copied-alias hooks,
+including prior deployment paths, and replaces them with the fixed hook. Legacy
+literal parsing is used only for this upgrade validation; old hook and alias bodies
+are never executed or retained. Zsh startup context detection skips the managed
+hook source entry. Normal v3 checks never read legacy alias backups.
+
+Modified/orphaned hooks and corrupt private records fail before startup context
+probing. Follow the error to inspect and move aside the unverified hook and record,
+keep legacy backup files, then rerun the installer. Generated files and source
+entries are staged together; a failed publish restores prior files. Readiness checks
+never migrate or repair an installation.
 
 `ccacc new` accepts no arguments. It first asks whether you already ran
 `ccacc save <name>` to back up the current account. The default is No: empty input,
@@ -136,12 +136,20 @@ creating an empty profile. An unsaved Claude OAuth login or unowned history must
 first be preserved with `save <name>`; `use` refuses to discard it.
 
 On every Claude launch the hook reads the current timezone status. A valid active
-profile requires its saved zone; an unnamed session runs with `TZ` unset even if
-the calling shell, copied alias or retained wrapper provides an old zone. Only
-the child environment changes. `BROWSER=false` is enforced in both modes. Literal
-arguments, other assignments and supported `env` / `_op_agent env` wrappers are
-preserved. Dynamic expressions and arbitrary wrappers fail explicitly. Captured
-alias definitions stay on stdin between parsing tools, out of external argv.
+profile requires its saved zone; an unnamed session runs with `TZ` truly unset even
+if the calling shell has a zone. Only the child environment changes.
+`BROWSER=false` is always enforced, and caller arguments and Claude exit status are
+preserved. Invalid named timezone metadata blocks launch before any YOLO prompt.
+
+For an interactive chat launch with terminal stdin and stderr, the hook asks
+`YOLO? (y/N)` on stderr. `y` or `yes` (case-insensitive) adds
+`--dangerously-skip-permissions` for that launch only. Empty input, any other answer
+or EOF uses normal permissions; Ctrl-C cancels launch. Nothing is persisted to a
+profile or later launch. Non-TTY launches use normal permissions without prompting
+or consuming stdin. `--help`, `--version`, `/login`, and `--print`/`-p` skip the
+prompt. An explicit caller `--dangerously-skip-permissions` is forwarded once,
+without an extra flag or prompt. Interactive answers are read from the terminal,
+leaving redirected/piped CLI stdin untouched.
 
 The private hook directory has mode `700`, its files `600`. The installer adds one
 source block at the end of Bash's `.bashrc` and selected login file, or Zsh's
@@ -155,8 +163,8 @@ uv run --no-project python -m unittest discover -s tests
 uv run --no-project python tests/test_mcp_preservation.py
 ```
 
-These use fixture HOME/startup files, fake Claude/wrappers and mocked credential,
-Keychain, process and Surge operations. They never switch a real account.
+These use fixture HOME/startup files, fake Claude CLIs (including PTY interaction),
+and mocked credential, Keychain, process and Surge operations. They never switch a real account.
 
 ## Windows Installation
 

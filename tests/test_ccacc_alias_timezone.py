@@ -1,4 +1,4 @@
-"""Fixture-only CLI and probe checks; run with uv run tests/test_ccacc_alias_timezone.py."""
+"""Fixture-only metadata checks; run with uv run tests/test_ccacc_alias_timezone.py."""
 
 import json
 import os
@@ -33,15 +33,8 @@ class AliasTimezoneTests(unittest.TestCase):
         for name in ("ps", "kill", "security", "osascript", "surge-cli", "openssl"):
             self.executable(name, '#!/bin/bash\nprintf "%s\\n" "$0" >> "$FORBIDDEN"\nexit 98\n')
         for shell in ("bash", "zsh"):
-            # Execute the actual probe code with startup disabled and fixture aliases.
-            # The stub itself never launches an interactive/login shell.
-            self.executable(shell, f'''#!/bin/bash
-printf '%s\\n' "$*" >> "$PROBES"
-[ "$1" = -ilc ] || exit 97
-probe_code="$2"
-shift 2
-exec /bin/{shell} {'--noprofile --norc' if shell == 'bash' else '-f'} -c '. "$ALIAS_FIXTURE"; '"$probe_code" "$@"
-''')
+            # Account metadata operations must not start a shell to query aliases.
+            self.executable(shell, '#!/bin/bash\nprintf "shell probe\\n" >> "$PROBES"\nexit 97\n')
         self.aliases = self.fixture / "aliases.sh"
         self.aliases.write_text("printf 'startup noise\\n'\ntrap \"printf 'logout noise\\n'\" EXIT\n")
         self.env = dict(os.environ, HOME=str(self.home), TMPDIR=str(self.fixture),
@@ -99,84 +92,26 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         self.timezones.mkdir(exist_ok=True)
         (self.timezones / name).write_text(zone + "\n")
 
-    def test_bash_and_zsh_capture_exact_definition_without_execution(self):
-        self.alias_metadata.rmdir()
-        definition = ('TZ="Asia/Tokyo" CLAUDE_CONFIG_DIR="$HOME/fixture dir" '
-                      'claude "don\'t change" "$(touch \'$HOME/executed\')"; '
-                      'touch "$HOME/executed"\n')
-        for shell in ("bash", "zsh"):
-            with self.subTest(shell=shell):
-                self.env["SHELL"] = str(self.bin / shell)
-                self.define("quoted-alias", definition)
-                self.run_cli("alias", "example", "quoted-alias")
-                self.assertEqual(self.metadata(), {"aliasName": "quoted-alias", "definition": definition})
-                self.assertEqual((self.alias_metadata / "example.json").stat().st_mode & 0o777, 0o600)
-                self.assertEqual(self.alias_metadata.stat().st_mode & 0o777, 0o700)
-                self.assertFalse((self.home / "executed").exists())
-
-    def test_missing_alias_does_not_create_or_delete_backup(self):
-        for shell in ("bash", "zsh"):
-            self.env["SHELL"] = str(self.bin / shell)
-            self.run_cli("alias", "missing")
-            self.assertFalse((self.alias_metadata / "missing.json").exists())
-            backup = self.alias_metadata / "example.json"
-            backup.write_text("fixture-unchanged")
-            backup.chmod(0o640)
-            self.run_cli("alias", "example", "missing")
-            self.assertEqual(backup.read_text(), "fixture-unchanged")
-            self.assertEqual(backup.stat().st_mode & 0o777, 0o640)
-
-    def test_alias_definitions_never_supply_runtime_timezone(self):
-        for definition in ("TZ=UTC claude", "TZ='Australia/Sydney' claude",
-                           'env TZ="Asia/Tokyo" claude',
-                           '_op_agent env BROWSER=false TZ=Asia/Tokyo claude',
-                           'TZ="$(touch fixture-executed)" claude'):
-            with self.subTest(definition=definition):
-                self.define("example", definition)
-                self.run_cli("alias", "example")
-                self.assertEqual(self.metadata(), {"aliasName": "example", "definition": definition})
-                self.assertEqual(self.run_cli("timezone", "example", success=False).stdout, "")
-                self.assertFalse((ROOT / "fixture-executed").exists())
-
     def test_timezone_active_lookup_and_no_config_or_password_needed(self):
         self.define("example", "TZ=UTC claude")
-        self.run_cli("alias", "example")
+        self.metadata_path().write_text(json.dumps({"definition":"legacy"}))
         self.run_cli("timezone", success=False)
         self.seed_timezone("example", "UTC")
         (self.accounts / "example.json").write_text("{}")
         (self.accounts / ".active").write_text("example\n")
         self.assertEqual(self.run_cli("timezone").stdout, "UTC\n")
-        self.probes.unlink()
+        self.probes.unlink(missing_ok=True)
         self.assertEqual(self.run_cli("timezone", "example").stdout, "UTC\n")
         self.assertFalse(self.probes.exists())
         (self.accounts / ".active").write_text("../outside\n")
         self.assertEqual(self.run_cli("timezone", success=False).stdout, "")
-
-    def test_dynamic_alias_preserves_saved_timezone_without_execution(self):
-        (self.home / ".claude.json").write_text("{}")
-        self.define("emocode", "TZ=Australia/Sydney claude")
-        self.run_cli("alias", "emocode")
-        self.seed_timezone("emocode", "Australia/Sydney")
-        dynamic = 'TZ="$(_claude_timezone)" claude "$HOME/fixture"'
-        with self.aliases.open("a") as handle:
-            handle.write('_claude_timezone() { touch "$HOME/executed"; printf UTC; }\n')
-        self.define("claude", dynamic)
-        self.define("dynamic", dynamic + " --verbose")
-        self.run_cli("alias", "emocode", "claude")
-        self.assertEqual(self.metadata("emocode"), {
-            "aliasName": "claude", "definition": dynamic})
-        self.run_harness('main save emocode --alias dynamic')
-        self.assertEqual(self.metadata("emocode"), {
-            "aliasName": "dynamic", "definition": dynamic + " --verbose"})
-        self.assertEqual(self.run_cli("timezone", "emocode").stdout, "Australia/Sydney\n")
-        self.assertFalse((self.home / "executed").exists())
 
     def test_use_roundtrip_keeps_alias_metadata_separate_from_dotted_account_stash(self):
         (self.home / ".claude.json").write_text("{}")
         for name, zone in (("foo", "UTC"), ("foo.alias", "Australia/Sydney")):
             (self.accounts / (name + ".json")).write_text("{}")
             self.define(name, "TZ=" + zone + " claude")
-            self.run_cli("alias", name)
+            self.metadata_path(name).write_text(json.dumps({"definition":"legacy"}))
             self.seed_timezone(name, zone)
         history = self.home / ".claude/history.jsonl"
         history.write_text("foo history\n")
@@ -206,16 +141,12 @@ main use foo
         self.assertEqual((self.accounts / "foo.alias/history.jsonl").read_text(), "foo.alias history\n")
         self.assertNotIn("env", self.metadata("foo.alias"))
 
-    def test_timezone_rejects_corrupt_or_invalid_metadata_without_stdout(self):
-        self.define("example", 'TZ="$(_claude_timezone)" claude')
-        for content in ('{bad', 'null', '[]', '{"env":{"TZ":23}}',
-                        '{"env":{"TZ":"UTC\\n"}}', '{"env":{"TZ":"Invalid/Zone"}}',
-                        '{"env":{"TZ":"../UTC"}}', '{"env":{"TZ":"$(touch nope)"}}',
-                        '{"env":{"TZ":"UTC"}} {"env":{"TZ":"UTC"}}'):
-            (self.alias_metadata / "example.json").write_text(content)
+    def test_timezone_rejects_legacy_metadata_without_stdout(self):
+        for content in ('{bad', 'null', '[]', '{"env":{"TZ":"UTC"}}'):
+            self.metadata_path().write_text(content)
             self.assertEqual(self.run_cli("timezone", "example", success=False).stdout, "")
-            self.run_cli("alias", "example")
-            self.assertNotIn("env", self.metadata())
+            self.assertEqual(self.metadata_path().read_text(), content)
+            self.assertFalse(self.probes.exists())
 
     def test_readonly_lookup_ignores_valid_legacy_timezone_without_prompt_or_writes(self):
         self.env["TZ"] = "Australia/Sydney"
@@ -249,14 +180,14 @@ main use foo
     def test_metadata_is_not_an_account_and_dotted_names_remain_valid(self):
         (self.home / ".claude.json").write_text("{}")
         self.define("example", "TZ=UTC claude")
-        self.run_cli("alias", "example")
+        self.metadata_path().write_text(json.dumps({"definition":"legacy"}))
         self.assertIn("No accounts saved", self.run_cli("ls").stdout)
         (self.accounts / ".active").write_text("example\n")
         self.assertIn("(not saved)", self.run_cli("current").stdout)
         self.run_cli("rm", "example", success=False, stdin="y\n")
         self.assertTrue((self.alias_metadata / "example.json").exists())
         (self.accounts / "example.alias.json").write_text("{}")
-        self.run_cli("alias", "example.alias", "example")
+        self.metadata_path("example.alias").write_text(json.dumps({"definition":"legacy"}))
         self.seed_timezone("example.alias", "UTC")
         (self.accounts / ".active").write_text("example.alias\n")
         self.assertEqual(self.run_cli("timezone").stdout, "UTC\n")
@@ -279,26 +210,33 @@ main use foo
         self.assertEqual(sorted(path.name for path in self.alias_metadata.iterdir()), ["other.json"])
         self.assertEqual(sorted(path.name for path in self.timezones.iterdir()), ["other"])
 
-    def test_save_default_explicit_alias_and_argument_compatibility(self):
+    def test_list_and_ls_show_the_same_saved_accounts(self):
         (self.home / ".claude.json").write_text("{}")
-        self.define("example", "TZ=UTC claude")
-        self.define("wrapper", "TZ=Asia/Tokyo claude")
+        self.assertEqual(self.run_cli("list").stdout, self.run_cli("ls").stdout)
+        (self.home / ".claude.json").write_text("{}")
+        (self.accounts / "listed.json").write_text("{}")
+        (self.accounts / ".active").write_text("listed\n")
+        result = self.run_cli("list")
+        self.assertIn("listed", result.stdout)
+        self.assertEqual(result.stdout, self.run_cli("ls").stdout)
+
+    def test_save_preserves_legacy_data_without_probes_or_new_backups(self):
+        (self.home / ".claude.json").write_text("{}")
+        backup = self.metadata_path()
+        backup.write_bytes(b"legacy data is not parsed or rewritten\n")
+        backup.chmod(0o640)
+        before = backup.read_bytes(), backup.stat().st_mtime_ns, backup.stat().st_mode
         self.run_harness('main save example', stdin="1\n")
-        self.assertNotIn("env", self.metadata())
-        self.run_harness('main save example --alias wrapper')
-        self.assertEqual(self.metadata()["aliasName"], "wrapper")
-        self.assertNotIn("env", self.metadata())
-        self.assertEqual(self.run_cli("timezone", "example").stdout, "UTC\n")
-        self.run_harness('main save example --timezone Australia/Sydney --alias wrapper')
-        self.assertEqual(self.run_cli("timezone", "example").stdout, "Australia/Sydney\n")
-        self.run_harness('main save example --alias missing')
-        self.assertEqual(self.metadata()["aliasName"], "wrapper")
+        self.run_harness('main save example --timezone Australia/Sydney')
+        self.assertEqual((backup.read_bytes(), backup.stat().st_mtime_ns, backup.stat().st_mode), before)
         self.run_harness('main save missing', stdin="8\nEurope/London\n")
-        self.assertFalse((self.alias_metadata / "missing.json").exists())
-        self.assertEqual(self.run_cli("timezone", "missing").stdout, "Europe/London\n")
-        self.run_harness('main save example --alias', success=False)
-        self.run_harness('main save example --alias ""', success=False)
+        self.assertFalse(self.metadata_path("missing").exists())
+        self.assertFalse(self.probes.exists())
+        self.assertEqual(self.run_cli("timezone", "example").stdout, "Australia/Sydney\n")
+        self.run_cli("alias", "example", success=False)
+        self.run_harness('main save example --alias wrapper', success=False)
         self.run_harness('main save', success=False)
+        self.assertEqual((backup.read_bytes(), backup.stat().st_mtime_ns, backup.stat().st_mode), before)
 
     def test_first_save_requires_numbered_or_custom_choice_despite_alias_or_environment(self):
         (self.home / ".claude.json").write_text("{}")
@@ -309,7 +247,7 @@ main use foo
         self.assertIn("1) UTC", result.stderr)
         self.assertIn("8) Custom IANA timezone", result.stderr)
         self.assertEqual((self.timezones / "Asia.Tokyo").read_text(), "UTC\n")
-        self.assertNotIn("env", self.metadata("Asia.Tokyo"))
+        self.assertEqual(self.metadata("Asia.Tokyo"), {"env":{"TZ":"Asia/Tokyo"}})
         self.run_harness('main save absent', stdin="8\nEurope/Paris\n")
         self.assertEqual(self.run_cli("timezone", "absent").stdout, "Europe/Paris\n")
         self.assertFalse(self.metadata_path("absent").exists())
@@ -373,7 +311,7 @@ save_account() { printf 'save\\n' >> "$FORBIDDEN"; return 98; }
             self.assertEqual((self.timezones / "example").read_bytes(), before)
         self.run_cli("timezone", ".timezones", "UTC", success=False)
         self.define("example", "TZ=Asia/Tokyo claude")
-        self.run_cli("alias", "example")
+        self.metadata_path().write_text(json.dumps({"definition":"legacy"}))
         self.assertEqual(self.run_cli("timezone", "example").stdout, "Australia/Sydney\n")
         (self.timezones / "example").write_text("UTC\nUTC\n")
         self.assertEqual(self.run_cli("timezone", "example", success=False).stdout, "")
@@ -406,23 +344,6 @@ main new
         self.run_harness("stop_claude() { :; }; replace_credentials() { :; }; reset_account_state() { :; }; main new", stdin="yes\n")
         self.assertEqual(self.run_cli("timezone", success=False).returncode, 3)
         self.assertFalse(self.timezones.exists())
-
-    def test_probe_failure_preserves_backup(self):
-        (self.alias_metadata / "example.json").write_text("fixture-unchanged")
-        self.executable("bash", "#!/bin/bash\nprintf 'startup only\\n'\nexit 2\n")
-        self.run_cli("alias", "example")
-        self.assertEqual((self.alias_metadata / "example.json").read_text(), "fixture-unchanged")
-
-    def test_aliases_named_command_and_builtin_are_never_invoked(self):
-        definition = 'touch "$HOME/executed"'
-        for shell in ("bash", "zsh"):
-            self.env["SHELL"] = str(self.bin / shell)
-            self.aliases.write_text("\\builtin alias " + shlex.quote("command=" + definition)
-                                    + "\n\\builtin alias " + shlex.quote("builtin=" + definition) + "\n")
-            for name in ("command", "builtin"):
-                self.run_cli("alias", "example", name)
-                self.assertEqual(self.metadata()["definition"], definition)
-                self.assertFalse((self.home / "executed").exists())
 
     def test_process_matching_uses_owner_and_executable(self):
         result = self.run_harness(r'''

@@ -2,8 +2,7 @@
 # Companion to ccacc. Source from Bash; generated hooks support Bash and Zsh.
 # Public API: ccacc_install_shell_hook / ccacc_check_shell_hook
 # Arguments: ABSOLUTE_CCACC
-# Requires probe_alias claude (JSON) and jq from the caller.
-# Captured aliases are parsed as literal simple commands, never evaluated.
+# Requires jq. Old alias parsing is isolated to explicit v1/v2 upgrades only.
 
 _ccacc_shell_error() { printf 'ccacc shell hook: %s\n' "$*" >&2; }
 
@@ -35,11 +34,11 @@ _ccacc_shell_path() {
     done
 }
 
-# A deliberately small, non-executing shell lexer. Decode literal quoting to
+# Upgrade-only v1/v2 recognition: a small, non-executing shell lexer. Decode literal quoting to
 # identify assignment names and command boundaries, keeping each original word.
 # Expansions, operators, comments and continuations are unsupported: accepting
 # those without a complete shell parser could change behavior or run code.
-_ccacc_shell_words() {
+_ccacc_shell_legacy_words() {
     local input=$1 i char next state=plain raw='' value='' started=0
     _ccacc_raw=() _ccacc_value=()
     for ((i=0; i<${#input}; i++)); do
@@ -92,12 +91,12 @@ _ccacc_shell_words() {
 # Retain literal leading assignments and the supported env / _op_agent env
 # prefix. Only BROWSER and TZ assignments are removed. Unknown wrappers fail
 # before any files change, rather than losing wrapper options or arguments.
-_ccacc_shell_command() {
+_ccacc_shell_legacy_command() {
     local definition=$1 i=0 token name base prefix='' assignments='' timezone_assignment=''
     # Only used to recognize the exact previous generated hook during an
     # explicit install. Runtime checks accept the current renderer only.
     if [ "${2:-}" = legacy ]; then timezone_assignment=' TZ="$__ccacc_tz"'; fi
-    _ccacc_shell_words "$definition" || return 1
+    _ccacc_shell_legacy_words "$definition" || return 1
     while [ "$i" -lt "${#_ccacc_raw[@]}" ]; do
         token=${_ccacc_value[$i]}
         if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
@@ -172,9 +171,8 @@ _ccacc_shell_rc() {
             after=${middle#*"$end"}
             middle=${middle%%"$end"*}
             case "$before$middle$after" in *'# >>> ccacc shell hook >>>'*|*'# <<< ccacc shell hook <<<'*) return 1 ;; esac
-            # Only replace a block whose body is our one source command.
-            case "$middle" in '. '*$'\n') ;; *) return 1 ;; esac
-            case "${middle%$'\n'}" in *$'\n'*) return 1 ;; esac
+            # Unrecognized code inside our markers requires manual repair.
+            [ "$middle" = ". $(_ccacc_shell_quote "$private/hook.sh")"$'\n' ] || return 1
             # A newline added before the original block may now separate a
             # formerly unterminated last line from text appended afterwards.
             if [ -n "$before" ] && [ -n "$after" ]; then
@@ -196,7 +194,7 @@ _ccacc_shell_replace() {
     mv -f "$1" "$2"
 }
 
-_ccacc_shell_hook_text_legacy() {
+_ccacc_shell_legacy_v1_text() {
     quoted_script=$(_ccacc_shell_quote "$script")
     cat <<HOOK
 # Managed by ccacc. Account timezone is resolved on every launch.
@@ -219,7 +217,7 @@ alias claude='__ccacc_launch'
 HOOK
 }
 
-_ccacc_shell_hook_text() {
+_ccacc_shell_legacy_v2_text() {
     quoted_script=$(_ccacc_shell_quote "$script")
     cat <<HOOK
 # Managed by ccacc. Account timezone is resolved on every launch.
@@ -260,23 +258,73 @@ alias claude='__ccacc_launch'
 HOOK
 }
 
+# Query only startup context, never aliases. Suppress our verified managed
+# source entries while reading Zsh startup files, including during v1/v2 upgrade.
+# -f avoids automatic user rc execution before the suppressors are installed.
 _ccacc_shell_probe_context() {
-    if [ "$check_only" = --installed ] && [ "${SHELL##*/}" = bash ]; then
-        probe='{"missing":true}'
-    else
-        probe=$(probe_alias claude) || { _ccacc_shell_error 'alias probe failed'; return 1; }
-    fi
-    printf '%s' "$probe" | jq -se 'length == 1 and (.[0] | type == "object" and (
-        (.missing == true and (has("definition") | not)) or
-        ((has("missing") | not) and (.definition | type == "string") and
-         (.definition | length > 0) and ((.definition | contains("\u0000")) | not))))' >/dev/null || {
-        _ccacc_shell_error 'malformed alias probe'; return 1;
+    local output marker="ccacc-context-$RANDOM-$RANDOM-$RANDOM"
+    if [ "${SHELL##*/}" = bash ]; then startup_directory=$HOME; return 0; fi
+    output=$("$SHELL" -dfi -c '
+        function __ccacc_context_check {
+            local text remaining
+            if [[ -f "$1" ]]; then
+                text=$(<"$1")
+                if [[ "$text" == *"# >>> ccacc shell hook >>>"* || "$text" == *"# <<< ccacc shell hook <<<"* ]]; then
+                    if [[ "$text" != *"$__ccacc_context_block"* ]]; then
+                        __ccacc_context_invalid=yes; return 1
+                    fi
+                    remaining=${text/"$__ccacc_context_block"/}
+                    if [[ "$remaining" == *"# >>> ccacc shell hook >>>"* || "$remaining" == *"# <<< ccacc shell hook <<<"* ]]; then
+                        __ccacc_context_invalid=yes; return 1
+                    fi
+                fi
+            fi
+        }
+        function . {
+            [[ "$1" != "$__ccacc_context_hook" ]] || return 0
+            __ccacc_context_check "$1" || return 1
+            builtin . "$@"
+        }
+        function source {
+            [[ "$1" != "$__ccacc_context_hook" ]] || return 0
+            __ccacc_context_check "$1" || return 1
+            builtin source "$@"
+        }
+        __ccacc_context_hook=$1
+        __ccacc_context_block=$3
+        __ccacc_context_invalid=no
+        for __ccacc_context_name in .zshenv .zprofile .zshrc .zlogin; do
+            __ccacc_context_file=${ZDOTDIR:-$HOME}/$__ccacc_context_name
+            if [[ -f "$__ccacc_context_file" ]]; then
+                # Source top-level startup files at top level: Zsh typeset
+                # declarations must retain their normal global scope.
+                if __ccacc_context_check "$__ccacc_context_file"; then
+                    builtin . "$__ccacc_context_file"
+                fi
+            fi
+        done
+        [[ "$__ccacc_context_invalid" == no ]] || exit 1
+        \builtin printf "\n%s\n" "$2"
+        \command jq -cn --arg directory "${ZDOTDIR:-$HOME}" "{startupDirectory:\$directory}"
+        \builtin printf "%s\n" "$2"
+    ' ccacc "$private/hook.sh" "$marker" "
+# >>> ccacc shell hook >>>
+. $(_ccacc_shell_quote "$private/hook.sh")
+# <<< ccacc shell hook <<<" </dev/null 2>/dev/null) || {
+        _ccacc_shell_error 'startup context probe failed; inspect Zsh startup files and ccacc managed source blocks before reinstalling'; return 1;
+    }
+    startup_directory=$(printf '%s\n' "$output" | jq -Rser --arg marker "$marker" '
+        split("\n" + $marker + "\n")
+        | if length == 3 then .[1] | fromjson else error("Missing startup context") end
+        | .startupDirectory | select(type == "string" and length > 0)
+        | select(contains("\u0000") or contains("\n") or contains("\r") | not)') || {
+        _ccacc_shell_error 'malformed Zsh startup directory'; return 1;
     }
 }
 
 # Decode one literal script word from the known v1 renderer, without evaluating
 # shell text. The entire hook must still match a reconstructed template below.
-_ccacc_shell_prior_script() {
+_ccacc_shell_legacy_script() {
     local line word prior='' count=0 prefix='    __ccacc_tz=$(command bash '
     local suffix_old=' timezone) || {' suffix_new=' timezone) || __ccacc_status=$?'
     if jq -e '.version == 2' "$private/managed.json" >/dev/null; then
@@ -293,7 +341,7 @@ _ccacc_shell_prior_script() {
                     *"$suffix_new") word=${word%"$suffix_new"} ;;
                     *) return 1 ;;
                 esac
-                _ccacc_shell_words "$word" && [ "${#_ccacc_value[@]}" -eq 1 ] || return 1
+                _ccacc_shell_legacy_words "$word" && [ "${#_ccacc_value[@]}" -eq 1 ] || return 1
                 prior=${_ccacc_value[0]}; count=$((count+1))
                 ;;
         esac
@@ -302,36 +350,110 @@ _ccacc_shell_prior_script() {
     printf '%s' "$prior"
 }
 
+# Exact comparison only: no hook is ever sourced by the installer/checker.
 _ccacc_shell_check_text() {
-    local current_command current_script prior_script
+    local expected current_script=$script prior_script version definition
     [ -f "$private/hook.sh" ] && _ccacc_shell_read "$private/hook.sh" || {
         _ccacc_shell_error 'installed hook is missing or unreadable'; return 1;
     }
-    expected=$(_ccacc_shell_hook_text; printf '.')
-    [ "$_ccacc_content." != "$expected" ] || return 0
-    if [ "$check_only" != --installed ]; then
-        current_command=$_ccacc_command
-        current_script=$script
-        prior_script=$(_ccacc_shell_prior_script) && _ccacc_shell_path "$prior_script" file || {
-            _ccacc_shell_error 'cannot verify the prior hook deployment'; return 1;
-        }
+    version=$(jq -r '.version' "$private/managed.json") || return 1
+    if [ "$check_only" = --installed ] && [ "$version" != 3 ]; then
+        _ccacc_shell_error 'legacy hook requires explicit reinstall'; return 1
+    fi
+    if [ "$version" = 3 ]; then
+        prior_script=$(jq -er '.script' "$private/managed.json") || return 1
+        _ccacc_shell_path "$prior_script" file || return 1
         script=$prior_script
         expected=$(_ccacc_shell_hook_text; printf '.')
-        if [ "$_ccacc_content." = "$expected" ]; then script=$current_script; return 0; fi
-        if ! _ccacc_shell_command "${definition:-claude}" legacy; then script=$current_script; return 1; fi
-        expected=$(_ccacc_shell_hook_text_legacy; printf '.')
-        script=$current_script; _ccacc_command=$current_command
-        [ "$_ccacc_content." != "$expected" ] || return 0
+        script=$current_script
+        [ "$_ccacc_content." = "$expected" ] && return 0
+    else
+        # Upgrade-only compatibility. Read the old backup only to reconstruct
+        # and recognize exact known generated bytes, never to retain its command.
+        if jq -e '.originalMissing' "$private/managed.json" >/dev/null; then
+            definition=claude
+        else
+            _ccacc_shell_path "$private/original-alias.json" file &&
+                _ccacc_shell_read "$private/original-alias.json" || return 1
+            definition=$(printf '%s' "$_ccacc_content" | jq -serj '
+                select(length == 1) | .[0].definition
+                | select(type == "string" and length > 0 and (contains("\u0000") | not))'; printf '.')
+            definition=${definition%.}
+            [ -n "$definition" ] || return 1
+            _ccacc_shell_read "$private/hook.sh" || return 1
+        fi
+        prior_script=$(_ccacc_shell_legacy_script) && _ccacc_shell_path "$prior_script" file || return 1
+        script=$prior_script
+        if [ "$version" = 1 ]; then
+            _ccacc_shell_legacy_command "$definition" legacy || return 1
+            expected=$(_ccacc_shell_legacy_v1_text; printf '.')
+        else
+            _ccacc_shell_legacy_command "$definition" || return 1
+            expected=$(_ccacc_shell_legacy_v2_text; printf '.')
+        fi
+        script=$current_script
+        [ "$_ccacc_content." = "$expected" ] && return 0
     fi
-    _ccacc_shell_error 'installed hook does not match its records; rerun the curl installer for a known prior hook'
+    _ccacc_shell_error "unverified hook; inspect and move aside $private/hook.sh and $private/managed.json, then rerun the curl installer"
     return 1
+}
+
+_ccacc_shell_hook_text() {
+    local quoted_script
+    quoted_script=$(_ccacc_shell_quote "$script")
+    cat <<HOOK
+# Managed by ccacc. Fixed native Claude launcher; no copied alias commands.
+__ccacc_bin=$(_ccacc_shell_quote "${script%/*}")
+case ":\${PATH-}:" in
+    *:"\$__ccacc_bin":*) ;;
+    *) export PATH="\$__ccacc_bin\${PATH:+:\$PATH}" ;;
+esac
+unset __ccacc_bin
+unalias claude 2>/dev/null || :
+function claude { (
+    trap 'exit 130' INT
+    __ccacc_status=0
+    __ccacc_tz=\$(command bash $quoted_script timezone) || __ccacc_status=\$?
+    case "\$__ccacc_status" in
+        0)
+            case "\$__ccacc_tz" in
+                ''|/*|*..*|*[!A-Za-z0-9_+/-]*)
+                    printf '%s\\n' 'ccacc: invalid or missing active account timezone' >&2; return 1 ;;
+            esac
+            if [ ! -f "/usr/share/zoneinfo/\$__ccacc_tz" ] && [ ! -f "/var/db/timezone/zoneinfo/\$__ccacc_tz" ]; then
+                printf '%s\\n' 'ccacc: unknown active account timezone' >&2; return 1
+            fi
+            __ccacc_tz_env=("TZ=\$__ccacc_tz")
+            ;;
+        3) [ -z "\$__ccacc_tz" ] || return 1; __ccacc_tz_env=(-u TZ) ;;
+        *) printf '%s\\n' 'ccacc: cannot read the active account timezone; save its timezone before launching Claude' >&2; return 1 ;;
+    esac
+    __ccacc_prompt=yes
+    for __ccacc_arg in "\$@"; do
+        case "\$__ccacc_arg" in
+            --) break ;;
+            --dangerously-skip-permissions|--help|-h|--version|-v|/login|-p|--print|--print=*) __ccacc_prompt=no ;;
+        esac
+    done
+    if [ "\$__ccacc_prompt" = yes ] && [ -t 0 ] && [ -t 2 ]; then
+        printf 'YOLO? (y/N) ' >&2
+        __ccacc_answer=''
+        if { IFS= read -r __ccacc_answer < /dev/tty; } 2>/dev/null; then
+            case "\$__ccacc_answer" in
+                y|Y|[yY][eE][sS]) set -- --dangerously-skip-permissions "\$@" ;;
+            esac
+        fi
+    fi
+    command env "\${__ccacc_tz_env[@]}" BROWSER=false claude "\$@"
+) }
+HOOK
 }
 
 _ccacc_shell_hook() (
     # Subshell contains umask, temporaries and parser variables, not the user's
     # shell. Never source an rc file or evaluate an alias in this process.
-    local script=${1:-} check_only=${2:-} private probe definition original='' missing=0 expected actual record
-    local quoted_script rc path tmp stage startup_directory index=0
+    local script=${1:-} check_only=${2:-} private actual record
+    local rc path tmp stage startup_directory index=0 committed=0
     local -a rcs stages _ccacc_raw _ccacc_value
     umask 077
     [ "$#" -le 2 ] && { [ -z "$check_only" ] || [ "$check_only" = --validate-only ] || [ "$check_only" = --installed ]; } || return 1
@@ -346,72 +468,32 @@ _ccacc_shell_hook() (
     }
     private="$HOME/.ccacc-shell"
     _ccacc_shell_path "$private" dir || { _ccacc_shell_error 'unsafe private hook directory'; return 1; }
-    for path in "$private/managed.json" "$private/original-alias.json" "$private/hook.sh"; do
+    for path in "$private/managed.json" "$private/hook.sh"; do
         _ccacc_shell_path "$path" file || { _ccacc_shell_error 'unsafe private hook target'; return 1; }
     done
-    if [ ! -f "$private/managed.json" ] && [ "$check_only" != --installed ]; then
-        [ ! -e "$private/original-alias.json" ] && [ ! -e "$private/hook.sh" ] || {
-            _ccacc_shell_error 'orphaned private hook files require manual review'; return 1;
-        }
-        _ccacc_shell_probe_context || return 1
-    fi
     if [ -f "$private/managed.json" ]; then
-        jq -se 'length == 1 and (.[0] | type == "object" and
-            ((.version == 1 and keys == ["originalMissing", "version"]) or .version == 2) and
-            (.originalMissing | type == "boolean"))' "$private/managed.json" >/dev/null || {
-            _ccacc_shell_error 'malformed private hook record'; return 1;
+        jq -se 'length == 1 and (.[0] | type == "object" and (
+            (.version == 1 and keys == ["originalMissing", "version"] and (.originalMissing | type == "boolean")) or
+            (.version == 2 and keys == ["originalMissing", "script", "shell", "startupFiles", "version"] and (.originalMissing | type == "boolean")) or
+            (.version == 3 and keys == ["script", "shell", "startupFiles", "version"])) and
+            (if .version == 1 then true else
+                (.script | type == "string") and (.shell == "bash" or .shell == "zsh") and
+                (.startupFiles | type == "array" and length == 2 and all(.[]; type == "string")) end))' "$private/managed.json" >/dev/null || {
+            _ccacc_shell_error 'malformed private hook record; inspect and move it aside before reinstalling'; return 1;
         }
-        if jq -se '.[0].originalMissing' "$private/managed.json" >/dev/null; then missing=1
-        else
-            [ -f "$private/original-alias.json" ] || { _ccacc_shell_error 'original alias backup is missing'; return 1; }
-            _ccacc_shell_read "$private/original-alias.json" || {
-                _ccacc_shell_error 'unreadable or malformed original alias backup'; return 1;
-            }
-            original=$_ccacc_content
-        fi
+        _ccacc_shell_check_text || {
+            _ccacc_shell_error "inspect and move aside $private/hook.sh and $private/managed.json before rerunning the curl installer; keep legacy backup files"
+            return 1
+        }
     else
         [ "$check_only" != --installed ] || { _ccacc_shell_error 'installation record is missing'; return 1; }
-        [ ! -e "$private/original-alias.json" ] && [ ! -e "$private/hook.sh" ] || {
-            _ccacc_shell_error 'orphaned private hook files require manual review'; return 1;
-        }
-        if printf '%s' "$probe" | jq -se 'length == 1 and (.[0] | type == "object" and .missing == true and (has("definition") | not))' >/dev/null; then missing=1
-        else original=$probe; fi
-    fi
-    if [ "$missing" = 1 ]; then
-        [ ! -e "$private/original-alias.json" ] || { _ccacc_shell_error 'unexpected original alias backup'; return 1; }
-        _ccacc_shell_command claude || return 1
-    else
-        printf '%s' "$original" | jq -se 'length == 1 and (.[0] | type == "object" and (.definition | type == "string") and (.definition | length > 0) and ((.definition | contains("\u0000")) | not))' >/dev/null || {
-            _ccacc_shell_error 'malformed alias probe or backup'; return 1;
-        }
-        # Sentinel preserves trailing newlines so malformed commands cannot be
-        # accepted accidentally after command substitution strips them.
-        definition=$(printf '%s' "$original" | jq -srj '.[0].definition'; printf '.') || return 1
-        definition=${definition%.}
-        _ccacc_shell_command "$definition" || {
-            _ccacc_shell_error 'unsupported Claude alias; use literal assignments, env, or _op_agent env with a claude executable and literal arguments'; return 1;
+        [ ! -e "$private/hook.sh" ] || {
+            _ccacc_shell_error "orphaned hook requires manual review: inspect and move aside $private/hook.sh before reinstalling"; return 1;
         }
     fi
-    if [ "$check_only" = --installed ] || [ -f "$private/hook.sh" ]; then
-        if ! _ccacc_shell_check_text; then
-            _ccacc_shell_error "inspect and move aside the unverified $private/hook.sh manually, then rerun the curl installer"
-            return 1
-        fi
-    fi
-    # Existing Zsh hooks are verified before startup context can source them.
-    if [ -f "$private/managed.json" ]; then
-        _ccacc_shell_probe_context || return 1
-    fi
+    _ccacc_shell_probe_context || return 1
     case "${SHELL##*/}" in
         zsh)
-            if printf '%s' "$probe" | jq -se '.[0] | has("startupDirectory")' >/dev/null; then
-                printf '%s' "$probe" | jq -se '.[0].startupDirectory | select(type == "string")
-                    | length > 0 and (contains("\u0000") | not) and
-                      (contains("\n") | not) and (contains("\r") | not)' >/dev/null || {
-                    _ccacc_shell_error 'malformed probed Zsh startup directory'; return 1;
-                }
-                startup_directory=$(printf '%s' "$probe" | jq -srj '.[0].startupDirectory') || return 1
-            else startup_directory=${ZDOTDIR:-$HOME}; fi
             case "$startup_directory" in *$'\n'*|*$'\r'*)
                 _ccacc_shell_error 'malformed Zsh startup directory'; return 1 ;;
             esac
@@ -445,17 +527,13 @@ _ccacc_shell_hook() (
         fi
         _ccacc_shell_rc "$rc" || { _ccacc_shell_error 'malformed startup file or managed block'; return 1; }
     done
-    # Version 2 binds the record to this deployment and actual startup paths.
-    # Version 1 is recognized by exact hook/source bytes and migrated only on install.
     record=$(jq -cn --arg script "$script" --arg shell "${SHELL##*/}" \
-        --arg first "${rcs[0]}" --arg second "${rcs[1]}" --argjson missing "$([ "$missing" = 1 ] && printf true || printf false)" \
-        '{version:2,originalMissing:$missing,script:$script,shell:$shell,startupFiles:[$first,$second]}') || return 1
+        --arg first "${rcs[0]}" --arg second "${rcs[1]}" \
+        '{version:3,script:$script,shell:$shell,startupFiles:[$first,$second]}') || return 1
     if [ "$check_only" = --installed ]; then
-        if jq -e '.version == 2' "$private/managed.json" >/dev/null; then
-            printf '%s' "$record" | jq -e --slurpfile saved "$private/managed.json" '. == $saved[0]' >/dev/null || {
-                _ccacc_shell_error 'installation record does not match this script or startup paths'; return 1;
-            }
-        fi
+        printf '%s' "$record" | jq -e --slurpfile saved "$private/managed.json" '. == $saved[0]' >/dev/null || {
+            _ccacc_shell_error 'installation record does not match this script or startup paths'; return 1;
+        }
         for rc in "${rcs[@]}"; do
             [ -f "$rc" ] && _ccacc_shell_read "$rc" || return 1
             actual=$_ccacc_content
@@ -472,13 +550,6 @@ _ccacc_shell_hook() (
     trap 'rm -rf "$tmp"' EXIT
     _ccacc_shell_hook_text > "$tmp/hook.sh" || return 1
     printf '%s\n' "$record" > "$tmp/managed.json" || return 1
-    if [ "$missing" = 0 ]; then
-        if [ -f "$private/original-alias.json" ]; then
-            printf '%s' "$original" > "$tmp/original-alias.json" || return 1
-        else
-            printf '%s\n' "$original" > "$tmp/original-alias.json" || return 1
-        fi
-    fi
     for rc in "${rcs[@]}"; do
         _ccacc_shell_rc "$rc" || return 1
         stage="$tmp/rc.$index"
@@ -487,18 +558,44 @@ _ccacc_shell_hook() (
         stages+=("$stage"); index=$((index+1))
     done
     chmod 600 "$tmp/hook.sh" "$tmp/managed.json" || return 1
-    if [ "$missing" = 0 ]; then
-        chmod 600 "$tmp/original-alias.json" || return 1
-        _ccacc_shell_replace "$tmp/original-alias.json" "$private/original-alias.json" || return 1
-    fi
+    # Stage rollback copies before publishing any file. Legacy backup data is
+    # neither rewritten nor removed. A failed publish restores prior code/record.
+    for path in "$private/hook.sh" "$private/managed.json"; do
+        if [ -f "$path" ]; then cp -p "$path" "$tmp/old.${path##*/}" || return 1; fi
+    done
+    index=0
+    for rc in "${rcs[@]}"; do
+        if [ -f "$rc" ]; then cp -p "$rc" "$tmp/old.rc.$index" || return 1; fi
+        index=$((index+1))
+    done
+    trap '
+        rollback_failed=0
+        if [ "$committed" = 0 ]; then
+            for path in "$private/hook.sh" "$private/managed.json"; do
+                if [ -f "$tmp/old.${path##*/}" ]; then
+                    mv -f "$tmp/old.${path##*/}" "$path" || rollback_failed=1
+                else rm -f "$path" || rollback_failed=1; fi
+            done
+            index=0
+            for rc in "${rcs[@]}"; do
+                if [ -f "$tmp/old.rc.$index" ]; then
+                    mv -f "$tmp/old.rc.$index" "$rc" || rollback_failed=1
+                else rm -f "$rc" || rollback_failed=1; fi
+                index=$((index+1))
+            done
+        fi
+        if [ "$rollback_failed" = 0 ]; then rm -rf "$tmp"
+        else _ccacc_shell_error "rollback incomplete; preserve and inspect restore copies in $tmp before reinstalling"; fi
+    ' EXIT
+    trap 'exit 1' HUP INT TERM
     _ccacc_shell_replace "$tmp/hook.sh" "$private/hook.sh" && _ccacc_shell_replace "$tmp/managed.json" "$private/managed.json" || return 1
     chmod 600 "$private/hook.sh" "$private/managed.json" || return 1
-    if [ "$missing" = 0 ]; then chmod 600 "$private/original-alias.json" || return 1; fi
     index=0
     for rc in "${rcs[@]}"; do
         _ccacc_shell_replace "${stages[$index]}" "$rc" || return 1
         index=$((index+1))
     done
+    committed=1
     printf 'Claude shell hook installed.\n'
     printf 'In your current shell, run: source %s\n' "$(_ccacc_shell_quote "$private/hook.sh")"
     printf 'New interactive terminals load it automatically.\n'

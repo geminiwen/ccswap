@@ -1,6 +1,9 @@
 """Isolated shell-hook contract tests. Run: uv run --no-project python -m unittest discover -s tests."""
 import json
 import os
+import pty
+import select
+import time
 from pathlib import Path
 import shlex
 import shutil
@@ -23,7 +26,6 @@ class ShellHookTests(unittest.TestCase):
         self.bin = self.home / "bin space's"
         self.bin.mkdir()
         self.log = self.home / "claude.calls"
-        self.probe = self.home / "probe.json"
         self.ccacc = self.home / "ccacc script's"
         self.zone = self.home / "active-zone"
         self.zone.write_text("Australia/Sydney\n")
@@ -52,19 +54,17 @@ class ShellHookTests(unittest.TestCase):
         if shell == "bash":
             code = "shopt -s expand_aliases\n" + code
         result = subprocess.run([shutil.which(shell), *flags, "-c", code], env=self.env,
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
         if check:
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
-    def install(self, definition=None, shell="bash", check=True, raw_probe=None):
+    def install(self, definition=None, shell="bash", check=True):
         self.env["SHELL"] = f"/bin/{shell}"
-        self.probe.write_text(raw_probe if raw_probe is not None else json.dumps(
-            {"missing": True} if definition is None else {"definition": definition}
-        ))
+        alias = "builtin alias " + shlex.quote("claude=" + definition) + "\n" if definition else ""
         return self.shell(
-            f"set -e\nsource {shlex.quote(str(LIBRARY))}\n"
-            'probe_alias() { [ "$1" = claude ] || return 1; printf "probe\\n" >> "$HOME/probe.calls"; cat "$HOME/probe.json"; }\n'
+            f"set -e\n{alias}source {shlex.quote(str(LIBRARY))}\n"
+            'probe_alias() { printf forbidden > "$HOME/probe.calls"; return 99; }\n'
             f"ccacc_install_shell_hook {shlex.quote(str(self.ccacc))}\n",
             check=check,
         )
@@ -74,21 +74,12 @@ class ShellHookTests(unittest.TestCase):
         return self.home / ".ccacc-shell"
 
     def test_preflight_validates_without_writing_or_launching(self):
-        for definition, success in (("claude --retained", True), ("claude $(unsafe)", False)):
-            self.probe.write_text(json.dumps({"definition": definition}))
-            before = {p.relative_to(self.home): (p.read_bytes(), p.stat().st_mtime_ns)
-                      for p in self.home.rglob("*") if p.is_file()}
-            result = self.shell(
-                f"source {shlex.quote(str(LIBRARY))}\n"
-                'probe_alias() { cat "$HOME/probe.json"; }\n'
-                f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))}\n",
-                check=False,
-            )
-            self.assertEqual(result.returncode == 0, success)
-            self.assertEqual(result.stdout, "")
-            self.assertEqual(before, {p.relative_to(self.home): (p.read_bytes(), p.stat().st_mtime_ns)
-                                      for p in self.home.rglob("*") if p.is_file()})
-            self.assertFalse(self.private.exists())
+        before = {p: p.read_bytes() for p in self.home.rglob("*") if p.is_file()}
+        result = self.shell(f"source {shlex.quote(str(LIBRARY))}\n"
+                            f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))}\n")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertFalse(self.private.exists())
 
     def test_read_only_startup_rejected_during_preflight(self):
         rc = self.home / ".bashrc"
@@ -96,12 +87,10 @@ class ShellHookTests(unittest.TestCase):
         rc.chmod(0o444)
         if os.access(rc, os.W_OK):
             self.skipTest("Current user can write mode-0444 files")
-        self.probe.write_text('{"definition":"claude"}')
         before = {p.relative_to(self.home): p.read_bytes()
                   for p in self.home.rglob("*") if p.is_file()}
         result = self.shell(
             f"source {shlex.quote(str(LIBRARY))}\n"
-            'probe_alias() { cat "$HOME/probe.json"; }\n'
             f"ccacc_preflight_shell_hook {shlex.quote(str(self.ccacc))}\n",
             check=False,
         )
@@ -111,10 +100,8 @@ class ShellHookTests(unittest.TestCase):
         self.assertFalse(self.private.exists())
 
     def launch(self, shell="bash", check=True, args="'user arg' '$(touch should-not-exist)'", prefix=""):
-        # eval is only the test caller's second parse, necessary because aliases
-        # are expanded when a command is read, before source in the same -c.
         return self.shell(prefix + '\nsource "$HOME/.ccacc-shell/hook.sh"\n'
-                          + f"eval {shlex.quote('claude ' + args)}\n", shell, check)
+                          + f"claude {args}\n", shell, check)
 
     def test_missing_alias_dynamic_timezone_and_no_source_execution(self):
         out = self.install()
@@ -138,25 +125,17 @@ class ShellHookTests(unittest.TestCase):
         self.assertIn("ARG=$(touch should-not-exist)", calls)
         self.assertFalse((ROOT / "should-not-exist").exists())
 
-    def test_literal_assignments_executable_flags_and_wrapper_retained(self):
-        definition = f"KEEP='hello world' BROWSER=open TZ=Old _op_agent env WRAPPED=yes TZ=Bad BROWSER=yes {shlex.quote(str(self.claude))} --model 'opus 4' --literal '$HOME;safe'"
-        self.install(definition)
-        saved = json.loads((self.private / "original-alias.json").read_text())
-        self.assertEqual(saved["definition"], definition)
+    def test_aliases_and_functions_do_not_recurse_or_supply_old_flags(self):
+        self.install("KEEP=old _op_agent env claude --dangerously-skip-permissions --model old")
+        self.assertFalse((self.private / "original-alias.json").exists())
+        self.assertFalse((self.home / "probe.calls").exists())
         for shell in ("bash", "zsh"):
-            self.launch(shell, prefix='_op_agent() { "$@"; }')
+            self.launch(shell, prefix="function claude { return 99; }\nalias claude=false")
         calls = self.log.read_text()
-        for expected in ("KEEP=hello world", "WRAPPED=yes", "ARG=--model", "ARG=opus 4", "ARG=$HOME;safe"):
-            self.assertEqual(calls.count(expected), 2)
-        self.assertEqual(calls.count("TZ=Australia/Sydney"), 2)
-        self.assertNotIn("TZ=Bad", calls)
-
-    def test_env_assignments_and_quoting(self):
-        definition = f'env KEEP="a \\"quote\\"" TZ=Bad BROWSER=yes {shlex.quote(str(self.claude))} "arg with spaces"'
-        self.install(definition)
-        for shell in ("bash", "zsh"):
-            self.launch(shell)
-        self.assertEqual(self.log.read_text().count('KEEP=a "quote"'), 2)
+        self.assertEqual(calls.count("BROWSER=false"), 2)
+        self.assertNotIn("ARG=--model", calls)
+        self.assertNotIn("dangerously", calls)
+        self.assertNotIn("KEEP=old", calls)
 
     def test_missing_invalid_and_unknown_timezone_fail_closed(self):
         self.install()
@@ -168,19 +147,28 @@ class ShellHookTests(unittest.TestCase):
                 self.assertIn("timezone", result.stderr)
         self.assertFalse(self.log.exists())
 
-    def test_unnamed_launch_unsets_inherited_and_wrapper_timezone(self):
-        self.install("TZ=Old KEEP=keep _op_agent env TZ=Bad WRAPPED=yes claude --model fixture")
+    def test_unnamed_launch_unsets_inherited_timezone(self):
+        self.install("TZ=Old _op_agent env TZ=Bad claude --model old")
         (self.home / "unnamed").touch()
         self.env["TZ"] = "America/New_York"
         for shell in ("bash", "zsh"):
-            self.launch(shell, prefix='_op_agent() { export TZ=Asia/Tokyo; "$@"; }')
+            self.launch(shell, prefix='_op_agent() { return 99; }')
         calls = self.log.read_text()
         self.assertEqual(calls.count("TZ_SET=\n"), 2)
         self.assertEqual(calls.count("BROWSER=false"), 2)
-        self.assertEqual(calls.count("KEEP=keep"), 2)
-        self.assertEqual(calls.count("WRAPPED=yes"), 2)
-        self.assertEqual(calls.count("ARG=--model"), 2)
-        self.assertNotIn("TZ=Asia/Tokyo", calls)
+        self.assertNotIn("ARG=--model", calls)
+
+    def test_readonly_caller_environment_does_not_override_child_settings(self):
+        self.install()
+        for unnamed in (False, True):
+            if unnamed:
+                (self.home / "unnamed").touch()
+            for shell in ("bash", "zsh"):
+                self.launch(shell, prefix='export TZ=America/New_York BROWSER=open\nreadonly TZ BROWSER')
+        calls = self.log.read_text()
+        self.assertEqual(calls.count("TZ=Australia/Sydney\n"), 2)
+        self.assertEqual(calls.count("TZ_SET=\n"), 2)
+        self.assertEqual(calls.count("BROWSER=false"), 4)
 
     def test_overwrite_once_keeps_original_and_exact_rc_bytes_modes(self):
         rc = self.home / ".bashrc"
@@ -193,7 +181,8 @@ class ShellHookTests(unittest.TestCase):
         rc_once = rc.read_bytes()
         login_once = login.read_bytes()
         hook_once = (self.private / "hook.sh").read_bytes()
-        original = (self.private / "original-alias.json").read_bytes()
+        original = b"legacy fixture backup\n"
+        (self.private / "original-alias.json").write_bytes(original)
         for path in (rc, login, self.private / "hook.sh"):
             os.utime(path, ns=(1_000_000_000, 1_000_000_000))
         self.assertTrue(rc_once.startswith(content))
@@ -206,12 +195,12 @@ class ShellHookTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mtime_ns, 1_000_000_000)
         self.assertEqual(stat.S_IMODE(rc.stat().st_mode), 0o640)
         self.assertEqual(stat.S_IMODE(self.private.stat().st_mode), 0o700)
-        for name in ("hook.sh", "managed.json", "original-alias.json"):
+        for name in ("hook.sh", "managed.json"):
             self.assertEqual(stat.S_IMODE((self.private / name).stat().st_mode), 0o600)
         # Simulate a later user alias and show sourcing our end-of-rc block wins.
         self.launch(prefix="alias claude='false'")
-        self.assertIn("KEEP=first", self.log.read_text())
-        self.assertIn("ARG=--first", self.log.read_text())
+        self.assertNotIn("KEEP=first", self.log.read_text())
+        self.assertNotIn("ARG=--first", self.log.read_text())
 
     def test_managed_block_moves_to_end_without_changing_surrounding_bytes(self):
         self.install()
@@ -276,18 +265,15 @@ class ShellHookTests(unittest.TestCase):
         inherited = self.home / "inherited directory"
         inherited.mkdir()
         self.env["ZDOTDIR"] = str(inherited)
-        original = "KEEP=original claude --retained"
-        for name, definition in (("effective first", original), ("effective second", "__ccacc_launch")):
+        for name in ("effective first", "effective second"):
             dot = self.home / name
             dot.mkdir()
-            self.install(shell="zsh", raw_probe=json.dumps({
-                "definition": definition, "startupDirectory": str(dot),
-            }))
+            (inherited / ".zshenv").write_text("ZDOTDIR=" + shlex.quote(str(dot)) + "\n")
+            self.install(shell="zsh")
             for filename in (".zshrc", ".zlogin"):
                 self.assertTrue((dot / filename).exists())
                 self.assertFalse((inherited / filename).exists())
-        self.assertEqual((self.home / "probe.calls").read_text().count("probe\n"), 2)
-        self.assertEqual(json.loads((self.private / "original-alias.json").read_text())["definition"], original)
+        self.assertFalse((self.home / "probe.calls").exists())
 
     def test_zsh_login_override_repeated_source_and_unchanged_files(self):
         dot = self.home / "login dot's"
@@ -323,7 +309,7 @@ class ShellHookTests(unittest.TestCase):
         self.zone.write_text("Asia/Tokyo\n")
         self.shell(source + "eval 'claude --login'\n", "zsh")
         calls = self.log.read_text()
-        for expected in ("BROWSER=false", "TZ=Asia/Tokyo", "KEEP=original", "ARG=--retained", "ARG=--login"):
+        for expected in ("BROWSER=false", "TZ=Asia/Tokyo", "ARG=--login"):
             self.assertEqual(calls.count(expected), 1)
         self.assertNotIn("--bad-login", calls)
 
@@ -337,7 +323,7 @@ class ShellHookTests(unittest.TestCase):
         # direct all user startup reads to these fixtures.
         def login(code):
             result = subprocess.run([shutil.which("zsh"), "-d", "-ilc", code], env=self.env,
-                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             return result
         result = login('[[ ${(t)ZDOTDIR} != *export* ]] || exit 11\n'
@@ -345,7 +331,7 @@ class ShellHookTests(unittest.TestCase):
                        "'{missing:true,startupDirectory:$directory}'")
         self.assertNotIn("ZDOTDIR", self.env)
         self.assertEqual(json.loads(result.stdout)["startupDirectory"], str(dot))
-        self.install(shell="zsh", raw_probe=result.stdout)
+        self.install(shell="zsh")
         self.assertFalse((self.home / ".zshrc").exists())
         self.assertFalse((self.home / ".zlogin").exists())
         login("claude --fixture\n")
@@ -354,28 +340,12 @@ class ShellHookTests(unittest.TestCase):
         self.assertIn("ARG=--fixture", self.log.read_text())
         self.assertNotIn("--bad-login", self.log.read_text())
 
-    def test_invalid_probed_zsh_startup_directory_does_not_mutate(self):
-        linked = self.home / "linked"
-        linked.symlink_to(self.bin, target_is_directory=True)
-        for directory in (None, 3, "", "relative", str(self.home) + "\n", str(self.home) + "\x00",
-                          str(linked), str(self.home / "absent")):
-            result = self.install(shell="zsh", check=False, raw_probe=json.dumps({
-                "missing": True, "startupDirectory": directory,
-            }))
-            self.assertNotEqual(result.returncode, 0, repr(directory))
+    def test_invalid_zsh_startup_directory_does_not_mutate(self):
+        for directory in ("relative", str(self.home / "absent"), str(self.home) + "\n"):
+            (self.home / ".zshenv").write_text("ZDOTDIR=" + shlex.quote(directory) + "\n")
+            result = self.install(shell="zsh", check=False)
+            self.assertNotEqual(result.returncode, 0)
             self.assertFalse(self.private.exists())
-            self.assertFalse((self.home / ".zshrc").exists())
-            self.assertFalse((self.home / ".zlogin").exists())
-        self.install("KEEP=original claude --retained", shell="zsh")
-        paths = (self.home / ".zshrc", self.home / ".zlogin", self.private / "hook.sh",
-                 self.private / "managed.json", self.private / "original-alias.json")
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino) for path in paths}
-        result = self.install(shell="zsh", check=False, raw_probe=json.dumps({
-            "definition": "__ccacc_launch", "startupDirectory": "relative",
-        }))
-        self.assertNotEqual(result.returncode, 0)
-        for path, expected in before.items():
-            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino), expected)
 
     def test_unsafe_zlogin_leaves_zshrc_and_private_state_untouched(self):
         rc = self.home / ".zshrc"
@@ -385,41 +355,6 @@ class ShellHookTests(unittest.TestCase):
         self.assertNotEqual(self.install(shell="zsh", check=False).returncode, 0)
         self.assertEqual(rc.read_bytes(), b"# unchanged zshrc\n")
         self.assertFalse(self.private.exists())
-
-    def test_double_quoted_backslash_newline_rejected_before_mutation(self):
-        paths = (self.home / ".bashrc", self.home / ".bash_profile")
-        for path in paths:
-            path.write_bytes(b"# original without trailing newline")
-            path.chmod(0o640)
-            os.utime(path, ns=(3_000_000_000, 3_000_000_000))
-        for definition in ('claude "first\\\nsecond"', 'KEEP="first\\\nsecond" claude',
-                           'claude first\\\nsecond'):
-            result = self.install(definition, check=False)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("unsupported", result.stderr)
-            self.assertFalse(self.private.exists())
-            for path in paths:
-                self.assertEqual(path.read_bytes(), b"# original without trailing newline")
-                self.assertEqual(path.stat().st_mtime_ns, 3_000_000_000)
-                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
-
-    def test_unsupported_aliases_leave_rc_and_files_untouched(self):
-        rc = self.home / ".bashrc"
-        rc.write_text("# original\n")
-        aliases = (
-            "claude --flag; touch nope", "TZ=$(touch nope) claude", "env -i claude --arg",
-            "unknown_wrapper claude --arg", "_op_agent --option env claude", "claude | cat",
-            "claude > output", "KEEP=$HOME claude", "claude `touch nope`", "claude\n",
-            "claude && false", "claude 'unterminated", "claude *.txt",
-        )
-        for definition in aliases:
-            result = self.install(definition, check=False)
-            self.assertNotEqual(result.returncode, 0, definition)
-            self.assertIn("unsupported", result.stderr)
-            self.assertNotIn(definition, result.stderr)
-            self.assertEqual(rc.read_text(), "# original\n")
-            self.assertFalse(self.private.exists())
-        self.assertFalse((ROOT / "nope").exists())
 
     def test_symlink_and_malformed_targets_rejected(self):
         target = self.home / "original"
@@ -453,16 +388,142 @@ class ShellHookTests(unittest.TestCase):
         self.assertNotEqual(self.install(check=False).returncode, 0)
         self.assertEqual(self.ccacc.read_bytes(), original)
 
-    def test_corrupt_private_record_and_probe_rejected(self):
-        for probe in ('{"missing":false}', '{"definition":4}', '{"definition":"x\\u0000y"}',
-                      '{"missing":true}\n{"missing":true}', '{"definition":"claude"}\n{"definition":"claude"}', 'invalid'):
-            self.assertNotEqual(self.install(raw_probe=probe, check=False).returncode, 0)
-            self.assertFalse(self.private.exists())
-        self.install("claude --retained")
+    def test_corrupt_private_record_rejected(self):
+        self.install()
         (self.private / "managed.json").write_text("{}")
         before = (self.home / ".bashrc").read_bytes()
         self.assertNotEqual(self.install(check=False).returncode, 0)
         self.assertEqual((self.home / ".bashrc").read_bytes(), before)
+
+    def pty_launch(self, shell, args, answer=None):
+        stdout_path = self.home / "pty.stdout"
+        code = '. "$HOME/.ccacc-shell/hook.sh"\n'
+        if args is not None:
+            code += 'claude ' + shlex.join(args)
+        flags = ["--noprofile", "--norc"] if shell == "bash" else ["-d", "-f"]
+        pid, master = pty.fork()
+        if pid == 0:
+            output = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.dup2(output, 1)
+            os.close(output)
+            os.execve(shutil.which(shell), [shell, *flags, "-i", "-c", code], self.env)
+        output = b""
+        sent = False
+        status = None
+        deadline = time.monotonic() + 8
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.1)
+                if ready:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        chunk = b""
+                    output += chunk
+                if not sent and b"YOLO? (y/N) " in output:
+                    self.assertIsNotNone(answer, output)
+                    os.write(master, answer)
+                    sent = True
+                done, child_status = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    status = os.waitstatus_to_exitcode(child_status)
+                    break
+            self.assertIsNotNone(status, output.decode(errors="replace"))
+        finally:
+            os.close(master)
+        return status, output.decode(errors="replace"), stdout_path.read_text()
+
+    def test_pty_source_never_prompts_or_launches(self):
+        self.install()
+        for shell in ("bash", "zsh"):
+            status, stderr, stdout = self.pty_launch(shell, None)
+            self.assertEqual(status, 0)
+            self.assertNotIn("YOLO", stderr + stdout)
+        self.assertFalse(self.log.exists())
+        self.assertFalse((self.home / "timezone.calls").exists())
+
+    def test_pty_ctrl_c_cancels_without_launch(self):
+        self.install()
+        for shell in ("bash", "zsh"):
+            status, _, _ = self.pty_launch(shell, [], b"\x03")
+            self.assertEqual(status, 130)
+        self.assertFalse(self.log.exists())
+
+    def test_pty_invalid_timezone_fails_before_yolo_prompt(self):
+        self.install()
+        self.zone.write_text("Invalid/Zone\n")
+        for shell in ("bash", "zsh"):
+            status, stderr, _ = self.pty_launch(shell, [])
+            self.assertEqual(status, 1)
+            self.assertNotIn("YOLO", stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_pty_yolo_choice_is_per_launch_and_preserves_stdin_args_status(self):
+        self.claude.write_text(
+            '#!/bin/bash\n'
+            'input=; if [ "${READ_PAYLOAD-}" = yes ]; then IFS= read -r input; fi\n'
+            'command jq -cn --args \'{args:$ARGS.positional, browser:env.BROWSER, '
+            'tz:env.TZ}\' -- "$@" >> "$HOME/pty.calls"\n'
+            'printf "CLI:%s\\n" "$input"\nexit 37\n')
+        args = ["two words", "", "$(touch nope)", "a*b", "--model", "fixture"]
+        self.install()
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.private.iterdir()}
+        for shell in ("bash", "zsh"):
+            for answer, yolo in ((b"y\n", True), (b"YES\n", True), (b"n\n", False),
+                                 (b"\n", False), (b"\x04", False)):
+                with self.subTest(shell=shell, answer=answer):
+                    status, stderr, stdout = self.pty_launch(shell, args, answer)
+                    self.assertEqual(status, 37)
+                    self.assertEqual(stderr.count("YOLO? (y/N) "), 1)
+                    self.assertNotIn("YOLO", stdout)
+                    record = json.loads((self.home / "pty.calls").read_text().splitlines()[-1])
+                    self.assertEqual(record["args"], (["--dangerously-skip-permissions"] if yolo else []) + args)
+                    self.assertEqual(record["browser"], "false")
+                    self.assertEqual(record["tz"], "Australia/Sydney")
+            self.env["READ_PAYLOAD"] = "yes"
+            status, _, stdout = self.pty_launch(shell, args, b"n\npayload survives\n")
+            self.assertEqual(status, 37)
+            self.assertEqual(stdout, "CLI:payload survives\n")
+            self.env.pop("READ_PAYLOAD")
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
+
+    def test_pty_explicit_flag_and_informational_commands_skip_prompt(self):
+        self.install()
+        for shell in ("bash", "zsh"):
+            for args in (["--dangerously-skip-permissions", "two words"], ["--help"],
+                         ["--version"], ["/login"], ["--print", "prompt"]):
+                with self.subTest(shell=shell, args=args):
+                    status, stderr, _ = self.pty_launch(shell, args)
+                    self.assertEqual(status, 0)
+                    self.assertNotIn("YOLO", stderr)
+                    calls = self.log.read_text()
+                    self.assertEqual(calls.count("ARG=--dangerously-skip-permissions"),
+                                     1 if shell == "bash" else 2)
+
+    def test_non_tty_preserves_stdin_and_caller_arguments_without_prompt(self):
+        self.install()
+        self.claude.write_text('#!/bin/bash\nIFS= read -r data\nprintf "%s\\n" "$data"\n'
+                               'printf "[%s]\\n" "$@"\nexit 29\n')
+        for shell in ("bash", "zsh"):
+            flags = ["--noprofile", "--norc"] if shell == "bash" else ["-f"]
+            result = subprocess.run([shutil.which(shell), *flags, "-c",
+                '. "$HOME/.ccacc-shell/hook.sh"; claude "two words" ""'],
+                env=self.env, input="payload survives\n", text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 29)
+            self.assertEqual(result.stdout, "payload survives\n[two words]\n[]\n")
+            self.assertEqual(result.stderr, "")
+
+    def test_publish_failure_rolls_back_hook_record_and_startup_files(self):
+        self.install()
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.home.rglob("*") if p.is_file()}
+        result = self.shell(f"source {shlex.quote(str(LIBRARY))}\n" + r'''
+_ccacc_shell_replace() {
+    if [ "$2" = "$HOME/.bash_profile" ]; then return 91; fi
+    mv -f "$1" "$2"
+}
+''' + f"ccacc_install_shell_hook {shlex.quote(str(self.ccacc))}\n", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
 
     def test_unknown_shell_and_missing_zdotdir(self):
         self.assertNotEqual(self.install(shell="fish", check=False).returncode, 0)

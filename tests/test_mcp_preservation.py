@@ -50,7 +50,6 @@ stop_claude() { :; }
 note_device_keys() { :; }
 setup_surge() { :; }
 apply_surge() { :; }
-probe_alias() { printf '{"missing":true}\n'; }
 MASTER_PASSWORD=fixture-master
 '''
 

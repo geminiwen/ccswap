@@ -69,7 +69,7 @@ class InstallEndToEndTests(unittest.TestCase):
                 self.assertEqual((prefix / name).read_bytes(), (ROOT / name).read_bytes())
             self.assertTrue(os.access(prefix / "ccacc", os.X_OK))
             tracked = [home / ".zshrc", home / ".zlogin", home / ".ccacc-shell/hook.sh",
-                       home / ".ccacc-shell/managed.json", home / ".ccacc-shell/original-alias.json"]
+                       home / ".ccacc-shell/managed.json"]
 
             def snapshot():
                 return {str(path): (hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -90,7 +90,9 @@ class InstallEndToEndTests(unittest.TestCase):
             self.assertIn("CLIENT_BROWSER=false", lines)
             self.assertIn("CLIENT_TZ=", lines)
             self.assertIn("CLIENT_TZ_SET=", lines)
-            for arg in ("--retained-flag", "--probe", "two words"):
+            self.assertNotIn("CLIENT_ARG=--retained-flag", lines)
+            self.assertFalse((home / ".ccacc-shell/original-alias.json").exists())
+            for arg in ("--probe", "two words"):
                 self.assertIn("CLIENT_ARG=" + arg, lines)
             self.assertFalse((home / ".claude").exists())
             self.assertEqual(snapshot(), before)

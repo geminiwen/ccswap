@@ -29,20 +29,21 @@ need `openssl`.
 ccacc list                                  # List saved accounts (ls also works)
 ccacc save personal                         # Choose timezone on first save
 ccacc save work --timezone Australia/Sydney  # Explicit timezone choice
-ccacc new                                   # Confirm prior backup, then clean/logout
-claude /login                               # Unnamed session: BROWSER=false, TZ unset
+ccacc new                                   # Confirm backup, optionally choose TZ, clean/logout
+claude /login                               # BROWSER=false, selected TZ or truly unset
 ccacc save personal --timezone Europe/London # Name and save the login and timezone
 ccacc use                                   # Pick a saved profile on a terminal
 ccacc use work                              # Restore profile/TZ and choose YOLO (y/N)
 ccacc use work --no-yolo                    # Explicit normal permissions; --yolo opts in
 ccacc use work --yes --no-yolo              # Confirm outgoing backup for automation
 ccacc timezone work                         # Read the named timezone
-ccacc timezone                              # Read the active profile timezone
+ccacc timezone                              # Read the active session timezone
 ```
 
 Only `save <name>` records a profile timezone and its Surge configuration. Save
-accepts `--timezone <ZONE>`. An explicit zone takes priority over that profile's existing `.timezones` choice. A first save
-without a saved or explicit timezone requires a numbered choice: UTC,
+accepts `--timezone <ZONE>`. Priority is explicit zone, current unnamed session's
+selected zone, then that profile's existing `.timezones` choice. A first save
+without a selected, saved or explicit timezone requires a numbered choice: UTC,
 Asia/Shanghai, Asia/Tokyo,
 Australia/Sydney, Europe/London, America/New_York, America/Los_Angeles, or a custom
 IANA timezone. There is no default or detection from aliases, environment `TZ`,
@@ -57,8 +58,9 @@ Timezones are private metadata in
 profiles keep their zone independently of legacy alias data. The timezone getter
 never prompts, starts a shell, accesses credentials, stops processes or writes files.
 It prints one validated zone plus a newline with exit status `0`. The no-argument
-getter returns empty output and status `3` for an unnamed session with no active
-marker; corrupt markers/profiles or missing/invalid active timezone metadata
+getter also returns the explicitly selected unnamed-session zone with status `0`,
+or empty output and status `3` for its default/unset choice. Corrupt session
+metadata, markers/profiles or missing/invalid active timezone metadata
 return status `1`. A named query never falls back to aliases or legacy session
 metadata. `ccacc rm <account>` also removes that account's timezone and any legacy
 alias metadata; metadata alone does not make a profile appear in `ls` or `current`.
@@ -101,9 +103,22 @@ never migrate or repair an installation.
 `ccacc save <name>` to back up the current account. The default is No: empty input,
 EOF and answers other than `y`, `Y` or `yes` cancel before credentials, processes
 or account/session writes. Confirmed cleanup never auto-saves or creates a named
-profile. It asks for no timezone, clears `.active`, removes any legacy
-`.pending-timezone` and the current launch mode, and creates no replacement
-timezone selection.
+profile. After backup confirmation, it offers the same numbered/custom timezone
+menu, with blank or EOF meaning default (`TZ` unset) and `q` cancelling cleanup.
+Invalid input or cancellation leaves the account unchanged, before process
+shutdown or credential access. It clears `.active`, legacy `.pending-timezone`
+and the current launch mode. An explicit selection is stored privately in the
+validated `~/.claude/accounts/.unnamed-session` JSON record (file `600`), only
+after cleanup succeeds. Default removes any previous selection; it never inherits
+the old active account's zone or the calling shell's `TZ`.
+
+The next successful `save` inherits this unnamed selection unless `--timezone`
+overrides it, then clears the record. Failed saves retain it. Successful `use`
+also clears it; failed switches retain it. An active named profile always uses
+its own saved zone, even if stale unnamed metadata remains. Malformed or symlinked
+unnamed metadata blocks changes; legacy raw `.pending-timezone` is never trusted.
+Cleanup snapshots the new record for rollback and retains recovery data when
+restoration fails, blocking launch and subsequent account operations.
 
 Cleanup clears only the default Claude login field from Keychain and an optional
 `.credentials.json`, preserving MCP OAuth and unrelated fields. It resets IDs,
@@ -190,8 +205,9 @@ blocks switching, including with `--yes`. This backup keeps the saved timezone
 and Surge choice; only an explicit `save` configures those choices.
 
 On every Claude launch the hook reads the current timezone status. A valid active
-profile requires its saved zone; an unnamed session runs with `TZ` truly unset even
-if the calling shell has a zone. Only the child environment changes.
+profile requires its saved zone; an unnamed session uses its explicit selection,
+or runs with `TZ` truly unset even if the calling shell has a zone. Only the child
+environment changes. The existing v3 hook needs no migration for this selection.
 `BROWSER=false` is always enforced, and caller arguments and Claude exit status are
 preserved. Invalid active metadata blocks launch. The hook never prompts, reads
 stdin, or classifies Claude arguments (including help/version/login/print flags).

@@ -21,6 +21,7 @@ class UnnamedSessionTests(unittest.TestCase):
         self.ops = self.fixture.fixture / "session-operations"
         self.fixture.env["SESSION_OPERATIONS"] = str(self.ops)
         self.pending = self.accounts / ".pending-timezone"
+        self.selection = self.accounts / ".unnamed-session"
         self.credentials = self.home / ".claude/.credentials.json"
         self.config = self.home / ".claude.json"
         self.active = self.accounts / ".active"
@@ -306,7 +307,7 @@ main new
         self.assertEqual((self.accounts / "kept.json").read_bytes(), profile)
         self.assertFalse((self.home / ".claude/projects").exists())
 
-    def test_loggedout_remnants_are_cleaned_without_timezone_selection(self):
+    def test_loggedout_remnants_are_cleaned_with_optional_timezone_selection(self):
         self.accounts.mkdir(parents=True)
         self.config.write_text('{"projects":{"old":{}},"mcpServers":{"shared":{}}}')
         remnants = self.home / ".claude/projects"
@@ -314,7 +315,8 @@ main new
         (remnants / "unowned.txt").write_text("retain this unowned history")
         self.pending.write_text("Europe/Paris\n")
         result = self.run_body("main new", stdin="y\n8\nEurope/Paris\n")
-        self.assertNotIn("Choose timezone", result.stderr)
+        self.assertIn("Choose timezone", result.stderr)
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
         self.assertFalse(self.pending.exists())
         self.assertFalse(remnants.exists())
         hook = self.hook_snapshot()
@@ -333,10 +335,13 @@ main new
             self.assertEqual(self.operations(), [])
         (self.home / ".ccacc-shell/hook.sh").unlink()
         result = self.run_body("new_command")
-        self.assertNotIn("Choose timezone", result.stderr)
+        self.assertIn("Choose timezone", result.stderr)
         self.assertIn("Cleaned current account", result.stdout)
         self.assertFalse((self.home / ".ccacc-shell/hook.sh").exists())
         self.assertFalse(self.pending.exists())
+        self.run_body("new_command", stdin="yes\n8\nEurope/Paris\n")
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
+        self.assertFalse((self.home / ".ccacc-shell/hook.sh").exists())
 
     def test_legacy_pending_is_ignored_by_unnamed_getter_and_launch(self):
         self.run_body("main new")
@@ -347,7 +352,7 @@ main new
             result = self.fixture.cli("timezone", success=False)
             self.assertEqual((result.returncode, result.stdout), (3, ""))
             result = self.fixture.interactive("bash", f". {source}\nclaude /login\nexit 0\n", startup=False)
-            self.assertNotIn("timezone", result.stderr)
+            self.assertNotIn("ccacc: cannot read", result.stderr)
             self.assertIsNone(self.fixture.records(self.fixture.launches)[-1]["tz"])
             self.assertEqual(self.snapshot(), before)
 
@@ -370,10 +375,219 @@ main new
 
     def test_active_zone_is_not_inferred_for_new(self):
         self.saved_active()
-        self.run_body("main new", stdin="yes\n3\n")
+        self.fixture.env["TZ"] = "Australia/Sydney"
+        self.run_body("main new", stdin="yes\n\n")
         self.assertEqual(self.fixture.cli("timezone", success=False).returncode, 3)
         self.assertEqual(self.fixture.cli("timezone", "kept").stdout, "UTC\n")
         self.assertFalse(self.active.exists())
+
+    def test_new_preset_custom_default_and_eof_reset_selection(self):
+        self.saved_active()
+        for answer, expected in (("3\n", "Asia/Tokyo"), ("8\nEurope/Paris\n", "Europe/Paris"),
+                                 ("\n", None), ("1\n", "UTC"), ("", None),
+                                 ("2\n", "Asia/Shanghai"), ("8\n\n", None),
+                                 ("3\n", "Asia/Tokyo"), ("8\n", None)):
+            with self.subTest(answer=answer):
+                self.run_body("main new", stdin="yes\n" + answer)
+                self.assertFalse(self.active.exists())
+                result = self.fixture.cli("timezone", success=expected is not None)
+                self.assertEqual((result.returncode, result.stdout),
+                                 (0, expected + "\n") if expected else (3, ""))
+                if expected:
+                    self.assertEqual(json.loads(self.selection.read_text()), {"version": 1, "timezone": expected})
+                    self.assertEqual(self.selection.stat().st_mode & 0o777, 0o600)
+                else:
+                    self.assertFalse(self.selection.exists())
+                self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+        self.assertEqual(self.fixture.cli("timezone", "kept").stdout, "UTC\n")
+
+    def test_selected_unnamed_session_ignores_stale_yolo_record(self):
+        self.run_body("main new", stdin="yes\n3\n")
+        (self.accounts / ".launch-mode").write_text('{"version":1,"account":"kept","yolo":true}')
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
+        result = self.fixture.cli("launch-mode")
+        self.assertEqual((result.stdout, result.stderr), ("false\n", ""))
+
+    def test_invalid_and_cancelled_timezone_precede_all_account_mutations(self):
+        self.saved_active()
+        before = self.snapshot()
+        for answer in ("q\n", "Q\n", "9\n", "UTC\n", "8\nInvalid/Zone\n", "\x1b\n", "8\n../UTC\n"):
+            with self.subTest(answer=answer):
+                self.run_body("main new", success=False, stdin="yes\n" + answer)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(self.operations(), [])
+
+    def test_selected_timezone_reaches_login_in_bash_and_zsh_without_changing_parent(self):
+        # Verify installed-hook validation against unchanged generated v3 bytes.
+        self.fixture.env.update(TZ="America/New_York", BROWSER="parent-browser")
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                self.fixture.startup(shell)
+                self.fixture.cli("configure-shell")
+                hook = self.hook_snapshot()
+                for answer, expected in (("3\n", "Asia/Tokyo"), ("8\nEurope/Paris\n", "Europe/Paris"), ("\n", None)):
+                    self.run_body("main new; require_shell_hook", stdin="yes\n" + answer)
+                    source = shlex.quote(str(self.home / ".ccacc-shell/hook.sh"))
+                    parent = self.home / "parent-env.json"
+                    code = (f". {source}\nclaude /login\n"
+                            'jq -cn \'{tz:env.TZ,browser:env.BROWSER}\' > "$HOME/parent-env.json"\n')
+                    self.fixture.interactive(shell, code, startup=False)
+                    launch = self.fixture.records(self.fixture.launches)[-1]
+                    self.assertEqual((launch["tz"], launch["browser"], launch["args"]),
+                                     (expected, "false", ["/login"]))
+                    self.assertEqual(json.loads(parent.read_text()),
+                                     {"tz": "America/New_York", "browser": "parent-browser"})
+                    self.assertEqual(self.hook_snapshot(), hook)
+                    self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+
+    def test_selected_timezone_save_priority_override_and_failure_retention(self):
+        self.run_body("main new", stdin="yes\n3\n")
+        self.login()
+        self.fixture.account("chosen", "UTC")
+        before = self.selection.read_bytes()
+        for failure in ("ask_password() { return 1; }", "save_account() { return 1; }",
+                        'setup_surge() { return 1; }'):
+            with self.subTest(failure=failure):
+                self.run_body(failure + "; main save chosen", success=False)
+                self.assertEqual(self.selection.read_bytes(), before)
+                self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
+                self.assertFalse(self.active.exists())
+                self.assertEqual(self.fixture.cli("timezone", "chosen").stdout, "UTC\n")
+        self.run_body("main save chosen")
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
+        self.assertFalse(self.selection.exists())
+        self.run_body("main new", stdin="yes\n2\n")
+        self.login()
+        self.run_body("main save chosen --timezone Europe/Paris")
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
+        self.assertFalse(self.selection.exists())
+
+    def test_first_save_inherits_selected_zone_without_picker(self):
+        self.run_body("main new", stdin="yes\n8\nEurope/Paris\n")
+        self.login()
+        result = self.run_body("main save first", stdin="")
+        self.assertNotIn("Choose timezone", result.stderr)
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
+        self.assertFalse(self.selection.exists())
+
+    def test_use_retains_selection_on_failure_and_clears_on_success(self):
+        self.saved_active()
+        self.run_body("main new", stdin="yes\n3\n")
+        before = self.selection.read_bytes()
+        for failure in ("ask_password() { return 1; }", "load_account() { return 1; }",
+                        "unstash_paths() { return 1; }", "apply_surge() { return 1; }"):
+            self.run_body(failure + "; main use kept", success=False)
+            self.assertEqual(self.selection.read_bytes(), before)
+            # Some existing use failure paths already activate the target; its
+            # named timezone still wins a retained stale unnamed selection.
+            if self.active.exists():
+                self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
+            self.run_body("main new", stdin="yes\n3\n")
+        self.run_body("main use kept")
+        self.assertFalse(self.selection.exists())
+        self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
+
+    def test_named_zone_and_save_ignore_stale_unnamed_zone(self):
+        self.saved_active()
+        self.selection.write_text('{"version":1,"timezone":"Asia/Tokyo"}\n')
+        self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
+        self.run_body("main save kept")
+        self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
+        self.assertFalse(self.selection.exists())
+
+    def test_malformed_session_metadata_blocks_getter_launch_and_mutations(self):
+        self.run_body("main new")
+        for content in ("", "{}", "[]", '{"version":2,"timezone":"UTC"}',
+                        '{"version":1,"timezone":"UTC","extra":true}',
+                        '{"version":1,"timezone":"Invalid/Zone"}',
+                        '{"version":1,"timezone":"UTC\\n"}',
+                        '{"version":1,"timezone":null}',
+                        '{"version":1,"timezone":"UTC"} {}'):
+            with self.subTest(content=content):
+                self.selection.write_text(content)
+                before = self.snapshot()
+                operations = self.operations()
+                result = self.fixture.cli("timezone", success=False)
+                self.assertEqual((result.returncode, result.stdout), (1, ""))
+                for command in ("main new", "main save first --timezone UTC"):
+                    self.run_body(command, success=False)
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertEqual(self.operations(), operations)
+                source = shlex.quote(str(self.home / ".ccacc-shell/hook.sh"))
+                self.fixture.interactive("bash", f". {source}\nclaude /login\nexit 0\n", startup=False)
+                self.assertFalse(self.fixture.launches.exists())
+
+    def test_unsafe_and_readonly_selection_fail_before_cleanup(self):
+        self.run_body("main new", stdin="yes\n3\n")
+        saved = self.selection.read_bytes()
+        self.selection.chmod(0o400)
+        before = self.snapshot()
+        for command in ("main new", "main save first --timezone UTC"):
+            self.run_body(command, success=False)
+            self.assertEqual(self.snapshot(), before)
+        self.selection.chmod(0o600)
+        self.selection.unlink()
+        outside = self.fixture.fixture / "external-selection"
+        outside.write_bytes(saved)
+        self.selection.symlink_to(outside)
+        before = self.snapshot()
+        for command in ("main new", "main save first --timezone UTC"):
+            self.run_body(command, success=False)
+            self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.fixture.cli("timezone", success=False).returncode, 1)
+        self.assertEqual(outside.read_bytes(), saved)
+
+    def test_unnamed_getter_rejects_symlinked_parent_and_nonregular_metadata(self):
+        self.run_body("main new", stdin="yes\n3\n")
+        self.selection.unlink()
+        self.selection.mkdir()
+        self.assertEqual(self.fixture.cli("timezone", success=False).returncode, 1)
+        self.selection.rmdir()
+        self.selection.write_text('{"version":1,"timezone":"Asia/Tokyo"}')
+        real_accounts = self.home / ".claude/moved-accounts"
+        self.accounts.rename(real_accounts)
+        self.accounts.symlink_to(real_accounts, target_is_directory=True)
+        self.assertEqual(self.fixture.cli("timezone", success=False).returncode, 1)
+        before = self.snapshot()
+        self.run_body("main new", success=False)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_new_metadata_publish_failure_restores_previous_selection(self):
+        self.run_body("main new", stdin="yes\n3\n")
+        before = self.selection.read_bytes(), self.selection.stat().st_mtime_ns
+        self.run_body(r'''
+mv() {
+    if [ "$1" = "$CLEANUP_RECOVERY_DIR/selected-session" ]; then return 1; fi
+    command mv "$@"
+}
+main new
+''', success=False, stdin="yes\n2\n")
+        self.assertEqual((self.selection.read_bytes(), self.selection.stat().st_mtime_ns), before)
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+
+    def test_metadata_rollback_failure_retains_recovery_and_blocks_launch(self):
+        self.run_body("main new", stdin="yes\n3\n")
+        self.run_body(r'''
+mv() {
+    if [ "$1" = "$CLEANUP_RECOVERY_DIR/selected-session" ]; then return 1; fi
+    command mv "$@"
+}
+cp() {
+    if [ "$2" = "$CLEANUP_RECOVERY_DIR/unnamed-session" ]; then return 1; fi
+    command cp "$@"
+}
+main new
+''', success=False, stdin="yes\n2\n")
+        recovery = self.accounts / ".cleanup-recovery"
+        self.assertTrue(recovery.exists())
+        self.assertEqual(json.loads((recovery / "unnamed-session").read_text())["timezone"], "Asia/Tokyo")
+        self.assertEqual(self.fixture.cli("timezone", success=False).returncode, 1)
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+        before = self.snapshot()
+        for command in ("main new", "main save first --timezone UTC"):
+            self.run_body(command, success=False)
+            self.assertEqual(self.snapshot(), before)
 
     def test_stop_and_stash_conflicts_do_not_clear_login(self):
         self.saved_active()

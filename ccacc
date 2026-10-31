@@ -28,6 +28,7 @@ ACCOUNTS_DIR="$CONFIG_DIR/accounts"
 ALIASES_DIR="$ACCOUNTS_DIR/.aliases"
 TIMEZONES_DIR="$ACCOUNTS_DIR/.timezones"
 LEGACY_PENDING_TIMEZONE_FILE="$ACCOUNTS_DIR/.pending-timezone"
+UNNAMED_SESSION_FILE="$ACCOUNTS_DIR/.unnamed-session"
 ACTIVE_FILE="$ACCOUNTS_DIR/.active"
 LAUNCH_MODE_FILE="$ACCOUNTS_DIR/.launch-mode"
 CLEANUP_RECOVERY_DIR="$ACCOUNTS_DIR/.cleanup-recovery"
@@ -98,11 +99,11 @@ Commands:
   current               Show the current Claude account
   save <name> [--timezone <ZONE>]
                         Back up the current account and its timezone
-  timezone [name]       Print the saved TZ only (defaults to the active account)
+  timezone [name]       Print the current session TZ or a named account's saved TZ
   use [name] [--yes] [--yolo|--no-yolo]
                         Pick a saved account, confirm backup, and choose launch mode
   new
-                        Confirm prior backup, then clean to an unnamed logged-out session
+                        Confirm prior backup, optionally choose TZ, then clean/logout
                         (logged out; run 'claude /login', then 'ccacc save <name>')
   rm <name>             Delete a saved account and its saved history
   help                  Show this help message
@@ -125,10 +126,10 @@ Noninteractive switches between saved accounts require --yes to confirm that bac
 Without a name, use requires a terminal: arrows or j/k move, Return selects,
 q, Esc, Ctrl-C or EOF cancel. --yes never automatically selects a profile.
 Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
-Only save records a timezone; use 'save <name> --timezone <ZONE>' to change it.
-New clears the active timezone. Unnamed sessions launch Claude with TZ unset.
-First save requires a numbered timezone choice or custom IANA entry, with no default.
-Invalid or unanswered choices fail before account changes. Aliases never choose TZ.
+New offers a timezone for the unnamed session; blank or EOF leaves TZ unset.
+Save inherits that selection unless --timezone overrides it, then the saved zone.
+Without a selected or saved zone, save requires a timezone choice, with no default.
+Invalid choices fail before account changes; save requires an answer. Aliases never choose TZ.
 
 Left alone: CLAUDE_CONFIG_DIR, suffixed keychain items, the shared Cowork device keys,
 mcpOAuth, unrelated credential fields, mcpServers, settings and the Claude desktop app.
@@ -201,6 +202,38 @@ read_timezone_file() {
     printf '%s\n' "$zone"
 }
 
+# A new, structured record is the only trusted unnamed-session selection. Never
+# read legacy .pending-timezone or infer TZ from the caller. Keep this getter
+# independent of the installed companion and reject links at every component.
+unnamed_session_timezone() {
+    local path="$UNNAMED_SESSION_FILE" zone
+    case "$path" in /*) ;; *) return 1 ;; esac
+    case "$path/" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
+    while [ -n "$path" ]; do
+        [ ! -L "$path" ] || return 1
+        if [ "$path" != "$UNNAMED_SESSION_FILE" ]; then
+            [ ! -e "$path" ] || [ -d "$path" ] || return 1
+        fi
+        path=${path%/*}
+    done
+    [ -e "$UNNAMED_SESSION_FILE" ] || return 3
+    [ -f "$UNNAMED_SESSION_FILE" ] && [ -r "$UNNAMED_SESSION_FILE" ] || return 1
+    zone=$(jq -ser 'select(length == 1) | .[0] | select(type == "object")
+        | select(keys == ["timezone", "version"] and .version == 1)
+        | .timezone | select(type == "string")
+        | select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\z"))' "$UNNAMED_SESSION_FILE" 2>/dev/null) || return 1
+    valid_timezone "$zone" || return 1
+    printf '%s\n' "$zone"
+}
+
+validate_unnamed_session() {
+    local status=0
+    unnamed_session_timezone >/dev/null || status=$?
+    case "$status" in 0|3) return 0 ;; esac
+    echo "Error: Unsafe or malformed unnamed session metadata; account unchanged" >&2
+    return 1
+}
+
 timezone_command() {
     local name="${1:-}"
     if [ -z "$name" ]; then
@@ -208,7 +241,10 @@ timezone_command() {
         if profile_recovery_path >/dev/null; then return 1; fi
         # Exit 3 means a legitimate unnamed session, never corrupt metadata.
         # The generated hook uses it to unset TZ without prompting or writing.
-        [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] && return 3
+        if [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ]; then
+            unnamed_session_timezone
+            return $?
+        fi
         [ -f "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] || return 1
         name=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z")) | rtrimstr("\n")' "$ACTIVE_FILE" 2>/dev/null) || return 1
         [ -f "$ACCOUNTS_DIR/$name.json" ] && [ ! -L "$ACCOUNTS_DIR/$name.json" ] || return 1
@@ -227,7 +263,7 @@ launch_mode_command() {
         if [ -L "$path" ]; then printf 'false\n'; return 0; fi
         path=${path%/*}
     done
-    if ! timezone_command >/dev/null 2>&1 || [ ! -f "$LAUNCH_MODE_FILE" ]; then
+    if [ ! -f "$ACTIVE_FILE" ] || ! timezone_command >/dev/null 2>&1 || [ ! -f "$LAUNCH_MODE_FILE" ]; then
         printf 'false\n'; return 0
     fi
     active=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z"))
@@ -242,25 +278,37 @@ launch_mode_command() {
 # An explicit first-setup choice only; never infer a zone from the environment,
 # host settings, account name or alias. stdout contains only the validated zone.
 choose_timezone() {
-    local name="$1" choice zone index
+    local name="$1" optional="${2:-}" choice zone index
     local zones=(UTC Asia/Shanghai Asia/Tokyo Australia/Sydney Europe/London America/New_York America/Los_Angeles)
-    printf "Timezone setup for '%s' (required, no default):\n" "$name" >&2
+    if [ "$optional" = optional ]; then
+        printf "Timezone setup for '%s' (optional; blank/EOF = default, TZ unset):\n" "$name" >&2
+    else
+        printf "Timezone setup for '%s' (required, no default):\n" "$name" >&2
+    fi
     for ((index = 0; index < ${#zones[@]}; index++)); do
         printf '  %s) %s\n' "$((index + 1))" "${zones[$index]}" >&2
     done
-    printf '  8) Custom IANA timezone\nChoose timezone (1-8): ' >&2
+    printf '  8) Custom IANA timezone\n' >&2
+    if [ "$optional" = optional ]; then printf '  q) Cancel cleanup\n' >&2; fi
+    printf 'Choose timezone (1-8): ' >&2
     if ! IFS= read -r choice; then
+        [ "$optional" != optional ] || return 0
         echo "Error: Timezone required; use --timezone <ZONE>" >&2
         return 1
     fi
     case "$choice" in
+        '') [ "$optional" != optional ] || return 0
+            echo "Error: Timezone required; use --timezone <ZONE>" >&2; return 1 ;;
+        q|Q) echo "Timezone selection cancelled" >&2; return 1 ;;
         [1-7]) zone="${zones[$((choice - 1))]}" ;;
         8)
             printf 'IANA timezone (e.g. Europe/Paris): ' >&2
             if ! IFS= read -r zone; then
+                [ "$optional" != optional ] || return 0
                 echo "Error: Timezone required; use --timezone <ZONE>" >&2
                 return 1
             fi
+            if [ -z "$zone" ] && [ "$optional" = optional ]; then return 0; fi
             ;;
         *) echo "Error: Invalid timezone choice; select a number from 1 to 8" >&2; return 1 ;;
     esac
@@ -338,7 +386,11 @@ prepare_account_metadata() {
         shift 2
     done
     command -v jq >/dev/null || return 1
+    validate_unnamed_session || return 1
     zone="$requested_zone"
+    if [ -z "$zone" ] && [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ]; then
+        zone=$(unnamed_session_timezone) || zone=''
+    fi
     if [ -z "$zone" ]; then zone=$(timezone_command "$name") || zone=""; fi
     if [ -z "$zone" ]; then zone=$(choose_timezone "$name") || return 1; fi
     PREPARED_TIMEZONE="$zone"
@@ -1089,7 +1141,7 @@ save_command() (
     # launch permissions is stored in the named profile backup.
     _ccacc_profile_tx_entries=("file|$LAUNCH_MODE_FILE" "file|$ACTIVE_FILE"
         "file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials.enc"
-        "file|$TIMEZONES_DIR/$name" "file|$LEGACY_PENDING_TIMEZONE_FILE")
+        "file|$TIMEZONES_DIR/$name" "file|$LEGACY_PENDING_TIMEZONE_FILE" "file|$UNNAMED_SESSION_FILE")
     if [ ! -f "$ACCOUNTS_DIR/$name.surge" ]; then
         _ccacc_profile_tx_entries+=("file|$ACCOUNTS_DIR/$name.surge")
     fi
@@ -1102,7 +1154,7 @@ save_command() (
     save_prepared_metadata "$name" || return 1
     save_account "$name" || return 1
     printf '%s\n' "$name" > "$ACTIVE_FILE" || return 1
-    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" || return 1
+    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" "$UNNAMED_SESSION_FILE" || return 1
     if [ ! -f "$ACCOUNTS_DIR/${name}.surge" ]; then
         setup_surge "$name" || return 1
         apply_surge "$name" || return 1
@@ -1360,6 +1412,7 @@ use_command() (
     _ccacc_shell_path "$LAUNCH_MODE_FILE" file && cleanup_file_is_writable "$LAUNCH_MODE_FILE" || {
         echo "Error: Current launch mode cannot be safely updated; account unchanged" >&2; return 1;
     }
+    validate_unnamed_session && cleanup_file_is_writable "$UNNAMED_SESSION_FILE" || return 1
     trap '[ -z "$staged_mode" ] || rm -f "$staged_mode"' EXIT
     if [ -z "$mode_option" ] && [ -t 0 ] && [ -t 2 ]; then
         printf 'YOLO? (y/N) ' >&2
@@ -1372,6 +1425,7 @@ use_command() (
         '{version:1,account:$account,yolo:$yolo}' > "$staged_mode" && chmod 600 "$staged_mode" || return 1
     if [ "$active" = "$name" ]; then
         mv -f "$staged_mode" "$LAUNCH_MODE_FILE" || return 1
+        rm -f "$UNNAMED_SESSION_FILE" || return 1
         echo -e "${YELLOW}'${name}' is already active${NC}"
         return 0
     fi
@@ -1386,6 +1440,7 @@ use_command() (
     rm -f "$LEGACY_PENDING_TIMEZONE_FILE" || return 1
     apply_surge "$name" || return 1
     mv -f "$staged_mode" "$LAUNCH_MODE_FILE" || return 1
+    rm -f "$UNNAMED_SESSION_FILE" || return 1
     echo -e "${GREEN}Switched to Claude account: ${name} ($(current_email))${NC}"
 )
 
@@ -1565,7 +1620,12 @@ cleanup_stage_and_reset() {
         done
     fi
     metadata_attempted=yes
-    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" && rm -f "$ACTIVE_FILE" && rm -f "$LAUNCH_MODE_FILE"
+    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" && rm -f "$ACTIVE_FILE" && rm -f "$LAUNCH_MODE_FILE" \
+        && rm -f "$UNNAMED_SESSION_FILE" || return 1
+    if [ -n "$selected_zone" ]; then
+        mv "$CLEANUP_RECOVERY_DIR/selected-session" "$UNNAMED_SESSION_FILE" || return 1
+    fi
+    return 0
 }
 
 cleanup_restore_snapshot() {
@@ -1597,6 +1657,7 @@ cleanup_rollback() {
     if [ -n "$metadata_attempted" ]; then
         cleanup_restore_snapshot active "$ACTIVE_FILE" || failed=yes
         cleanup_restore_snapshot pending-timezone "$LEGACY_PENDING_TIMEZONE_FILE" || failed=yes
+        cleanup_restore_snapshot unnamed-session "$UNNAMED_SESSION_FILE" || failed=yes
         cleanup_restore_snapshot launch-mode "$LAUNCH_MODE_FILE" || failed=yes
     fi
     if [ -z "$failed" ] && rm -rf -- "$CLEANUP_RECOVERY_DIR"; then
@@ -1609,19 +1670,21 @@ cleanup_rollback() {
 
 # Full current-account cleanup after explicit backup confirmation; never auto-save.
 new_command() {
-    local active confirmation credentials entry path label
+    local active confirmation credentials entry path label selected_zone
     local optional_credentials='' optional_existed='' credentials_attempted='' config_attempted='' metadata_attempted=''
     local index destination
     local -a cleanup_paths staged_locations
     load_shell_companion || return 1
     cleanup_is_complete || return 1
-    [ "$#" -eq 0 ] || { echo "Error: new accepts no arguments; choose timezone with 'ccacc save <name> --timezone <ZONE>'" >&2; return 1; }
+    [ "$#" -eq 0 ] || { echo "Error: new accepts no arguments; choose timezone in its menu" >&2; return 1; }
     printf "Have you already run '$SCRIPT_NAME save <name>' to back up this account? (y/N): " >&2
     if ! IFS= read -r confirmation; then confirmation=''; fi
     case "$confirmation" in y|Y|yes) ;; *) echo "Cleanup cancelled; run '$SCRIPT_NAME save <name>' first." >&2; return 1 ;; esac
+    selected_zone=$(choose_timezone 'unnamed session' optional) || return 1
+    validate_unnamed_session || return 1
     # Validate the entire bounded cleanup set, including optional credentials,
     # before stopping processes or modifying any account/session metadata.
-    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE"; do
+    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE" "$UNNAMED_SESSION_FILE"; do
         _ccacc_shell_path "$path" file || { echo "Error: Unsafe cleanup path; cleanup incomplete: $path" >&2; return 1; }
     done
     if [ -f "$CLAUDE_JSON" ]; then
@@ -1671,7 +1734,7 @@ new_command() {
     # No probe writes: permission and ancestor checks are read-only. Check all
     # metadata/config/stash destinations before any irreversible work begins.
     _ccacc_shell_path "$CLEANUP_RECOVERY_DIR" dir || return 1
-    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE"; do
+    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE" "$UNNAMED_SESSION_FILE"; do
         cleanup_file_is_writable "$path" || { echo "Error: Cleanup destination is not writable: $path" >&2; return 1; }
     done
     cleanup_parent_is_writable "$CLEANUP_RECOVERY_DIR/data" || return 1
@@ -1696,7 +1759,7 @@ new_command() {
     # process exits or rollback fails. Its manifest contains paths, never secrets.
     mkdir -m 700 "$CLEANUP_RECOVERY_DIR" || return 1
     if ! mkdir -m 700 "$CLEANUP_RECOVERY_DIR/data"; then return 1; fi
-    for entry in "config.json|$CLAUDE_JSON" "active|$ACTIVE_FILE" "pending-timezone|$LEGACY_PENDING_TIMEZONE_FILE" "launch-mode|$LAUNCH_MODE_FILE"; do
+    for entry in "config.json|$CLAUDE_JSON" "active|$ACTIVE_FILE" "pending-timezone|$LEGACY_PENDING_TIMEZONE_FILE" "launch-mode|$LAUNCH_MODE_FILE" "unnamed-session|$UNNAMED_SESSION_FILE"; do
         label=${entry%%|*}; path=${entry#*|}
         if [ -f "$path" ] && ! cp -p "$path" "$CLEANUP_RECOVERY_DIR/$label"; then
             rm -rf -- "$CLEANUP_RECOVERY_DIR"
@@ -1716,6 +1779,13 @@ new_command() {
                 --arg saved "$destination" '{source:$source, staged:$staged, saved:$saved}' || exit 1
         done | jq -s . > "$CLEANUP_RECOVERY_DIR/manifest.json"
     ); then rm -rf -- "$CLEANUP_RECOVERY_DIR"; return 1; fi
+    if [ -n "$selected_zone" ]; then
+        if ! (umask 077; jq -cn --arg zone "$selected_zone" '{version:1,timezone:$zone}' \
+            > "$CLEANUP_RECOVERY_DIR/selected-session" && chmod 600 "$CLEANUP_RECOVERY_DIR/selected-session"); then
+            rm -rf -- "$CLEANUP_RECOVERY_DIR"
+            return 1
+        fi
+    fi
     if ! cleanup_stage_and_reset; then
         cleanup_rollback
         return 1

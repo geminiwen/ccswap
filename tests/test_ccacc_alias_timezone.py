@@ -319,7 +319,7 @@ save_account() { printf 'save\\n' >> "$FORBIDDEN"; return 98; }
         self.metadata_path().unlink()
         self.assertEqual(self.run_cli("timezone", "example", success=False).stdout, "")
 
-    def test_new_never_selects_timezone_and_clears_legacy_pending_selection(self):
+    def test_new_default_clears_legacy_pending_selection(self):
         (self.home / ".claude.json").write_text("{}")
         (self.accounts / "original.json").write_text("{}")
         (self.accounts / ".active").write_text("original\n")
@@ -340,7 +340,7 @@ main new
         self.assertEqual((result.returncode, result.stdout), (3, ""))
         self.assertFalse(legacy.exists())
         self.assertFalse((self.accounts / "fresh.json").exists())
-        # Repeating cleanup never asks for or writes any timezone selection.
+        # Repeating cleanup with EOF chooses default and creates no selection.
         self.run_harness("stop_claude() { :; }; replace_credentials() { :; }; reset_account_state() { :; }; main new", stdin="yes\n")
         self.assertEqual(self.run_cli("timezone", success=False).returncode, 3)
         self.assertFalse(self.timezones.exists())

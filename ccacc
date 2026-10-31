@@ -127,8 +127,8 @@ Without a name, use requires a terminal: arrows or j/k move, Return selects,
 q, Esc, Ctrl-C or EOF cancel. --yes never automatically selects a profile.
 Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
 New offers a timezone for the unnamed session; blank or EOF leaves TZ unset.
-Save inherits that selection unless --timezone overrides it, then the saved zone.
-Without a selected or saved zone, save requires a timezone choice, with no default.
+Save uses --timezone, then the saved account zone, then its own required picker.
+The unnamed selection applies only to the current session, never to save.
 Invalid choices fail before account changes; save requires an answer. Aliases never choose TZ.
 
 Left alone: CLAUDE_CONFIG_DIR, suffixed keychain items, the shared Cowork device keys,
@@ -388,9 +388,6 @@ prepare_account_metadata() {
     command -v jq >/dev/null || return 1
     validate_unnamed_session || return 1
     zone="$requested_zone"
-    if [ -z "$zone" ] && [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ]; then
-        zone=$(unnamed_session_timezone) || zone=''
-    fi
     if [ -z "$zone" ]; then zone=$(timezone_command "$name") || zone=""; fi
     if [ -z "$zone" ]; then zone=$(choose_timezone "$name") || return 1; fi
     PREPARED_TIMEZONE="$zone"

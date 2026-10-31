@@ -41,9 +41,9 @@ ccacc timezone                              # Read the active session timezone
 ```
 
 Only `save <name>` records a profile timezone and its Surge configuration. Save
-accepts `--timezone <ZONE>`. Priority is explicit zone, current unnamed session's
-selected zone, then that profile's existing `.timezones` choice. A first save
-without a selected, saved or explicit timezone requires a numbered choice: UTC,
+accepts `--timezone <ZONE>`. Priority is explicit zone, then that profile's
+existing `.timezones` choice. A first save without a saved or explicit timezone
+requires its own numbered choice: UTC,
 Asia/Shanghai, Asia/Tokyo,
 Australia/Sydney, Europe/London, America/New_York, America/Los_Angeles, or a custom
 IANA timezone. There is no default or detection from aliases, environment `TZ`,
@@ -112,10 +112,11 @@ validated `~/.claude/accounts/.unnamed-session` JSON record (file `600`), only
 after cleanup succeeds. Default removes any previous selection; it never inherits
 the old active account's zone or the calling shell's `TZ`.
 
-The next successful `save` inherits this unnamed selection unless `--timezone`
-overrides it, then clears the record. Failed saves retain it. Successful `use`
-also clears it; failed switches retain it. An active named profile always uses
-its own saved zone, even if stale unnamed metadata remains. Malformed or symlinked
+The unnamed selection applies only to the current session. Save uses its own
+explicit/saved zone or required picker and clears the record on success. Failed
+saves retain it. Successful `use` also clears it; failed switches retain it. An
+active named profile always uses its own saved zone, even if stale unnamed
+metadata remains. Malformed or symlinked
 unnamed metadata blocks changes; legacy raw `.pending-timezone` is never trusted.
 Cleanup snapshots the new record for rollback and retains recovery data when
 restoration fails, blocking launch and subsequent account operations.

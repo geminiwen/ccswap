@@ -440,7 +440,7 @@ main new
                     self.assertEqual(self.hook_snapshot(), hook)
                     self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
 
-    def test_selected_timezone_save_priority_override_and_failure_retention(self):
+    def test_save_uses_saved_zone_or_explicit_override_and_retains_pending_on_failure(self):
         self.run_body("main new", stdin="yes\n3\n")
         self.login()
         self.fixture.account("chosen", "UTC")
@@ -453,8 +453,9 @@ main new
                 self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
                 self.assertFalse(self.active.exists())
                 self.assertEqual(self.fixture.cli("timezone", "chosen").stdout, "UTC\n")
-        self.run_body("main save chosen")
-        self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
+        result = self.run_body("main save chosen", stdin="")
+        self.assertNotIn("Choose timezone", result.stderr)
+        self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
         self.assertFalse(self.selection.exists())
         self.run_body("main new", stdin="yes\n2\n")
         self.login()
@@ -462,12 +463,23 @@ main new
         self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
         self.assertFalse(self.selection.exists())
 
-    def test_first_save_inherits_selected_zone_without_picker(self):
+    def test_selected_unnamed_login_then_first_save_requires_its_own_picker(self):
         self.run_body("main new", stdin="yes\n8\nEurope/Paris\n")
+        source = shlex.quote(str(self.home / ".ccacc-shell/hook.sh"))
+        self.fixture.interactive("bash", f". {source}\nclaude /login\n", startup=False)
+        launch = self.fixture.records(self.fixture.launches)[-1]
+        self.assertEqual((launch["tz"], launch["browser"], launch["args"]),
+                         ("Europe/Paris", "false", ["/login"]))
         self.login()
-        result = self.run_body("main save first", stdin="")
-        self.assertNotIn("Choose timezone", result.stderr)
-        self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
+        before = self.snapshot()
+        for answer in ("", "\n", "9\n"):
+            result = self.run_body("main save first", stdin=answer, success=False)
+            self.assertIn("Choose timezone", result.stderr)
+            self.assertEqual(self.snapshot(), before)
+            self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
+        result = self.run_body("main save first", stdin="3\n")
+        self.assertIn("Choose timezone", result.stderr)
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
         self.assertFalse(self.selection.exists())
 
     def test_use_retains_selection_on_failure_and_clears_on_success(self):

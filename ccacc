@@ -6,7 +6,8 @@
 # Keychain items with a suffix (other CLAUDE_CONFIG_DIRs, Orca accounts), the shared Cowork
 # device keys and the Claude desktop app are never touched. MCP OAuth and other
 # unrelated credential fields remain shared and are never restored from account backups.
-# Login backups are files encrypted with one master password (AES-256-CBC, PBKDF2)
+# Login backups are plain JSON files (<name>.credentials, mode 600) without encryption.
+# Older encrypted backups (<name>.credentials.enc) are migrated once with their master password.
 # Install with install.sh, which keeps ccacc beside its sourced companion ccacc_shell.sh
 
 set -e
@@ -33,10 +34,10 @@ UNNAMED_SESSION_FILE="$ACCOUNTS_DIR/.unnamed-session"
 ACTIVE_FILE="$ACCOUNTS_DIR/.active"
 LAUNCH_MODE_FILE="$ACCOUNTS_DIR/.launch-mode"
 CLEANUP_RECOVERY_DIR="$ACCOUNTS_DIR/.cleanup-recovery"
-CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
+# Left over from encrypted backups; only read and removed by migrate_encrypted_backups.
+LEGACY_CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
 # Optional user settings; ccacc only reads this file. The installer may create it.
 SETTINGS_FILE="$HOME/.ccacc/settings.json"
-MASTER_PASSWORD=""
 SURGE_CLI=""
 
 # Account-bound keys of ~/.claude.json: everything cccleaner clears or resets (identity IDs,
@@ -127,7 +128,9 @@ An account is everything cccleaner would wipe:
   - the account-bound keys of ~/.claude.json (IDs, oauthAccount, caches, counters, projects, ...)
   - ~/.claude history/state folders (projects, file-history, statsig, telemetry, history.jsonl, ...)
   - ~/Library/Caches/claude-cli-nodejs
-Login backups use one master password for save/use. New never saves credentials.
+Login backups are plain files (~/.claude/accounts/<name>.credentials, mode 600), not encrypted.
+Older encrypted backups ask for their master password once, then become plain files.
+New never saves credentials.
 Folders are moved, not copied, so switching is instant.
 With Surge installed, save asks which policies the account uses and use applies them;
 without Surge no policy selection is asked.
@@ -169,10 +172,10 @@ version() {
     echo "${SCRIPT_NAME} v${VERSION}"
 }
 
-# Function to check that jq, openssl and Claude Code's config are available
+# Function to check that jq and Claude Code's config are available
 check_ready() {
-    if ! command -v jq &> /dev/null || ! command -v openssl &> /dev/null; then
-        echo -e "${RED}Error: jq and openssl are required${NC}"
+    if ! command -v jq &> /dev/null; then
+        echo -e "${RED}Error: jq is required${NC}"
         return 1
     fi
 
@@ -587,66 +590,33 @@ replace_credentials() {
     fi
 }
 
-# Functions to encrypt stdin into a file / decrypt a file to stdout with the master password
-# (the password goes through fd 3, so it never shows up in the process list or on disk)
-encrypt_to() {
-    local temp_file=$(mktemp)
+# Login backups are plain JSON files: <name>.credentials, mode 600, not encrypted.
+# Earlier versions encrypted them as <name>.credentials.enc with one master password;
+# migrate_encrypted_backups converts those once.
+credentials_backup_file() {
+    printf '%s/%s.credentials' "$ACCOUNTS_DIR" "$1"
+}
 
-    if ! openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -salt -pass fd:3 \
-        -out "$temp_file" 3< <(printf '%s\n' "$MASTER_PASSWORD") 2>/dev/null; then
+read_backup() {
+    local backup_file
+    backup_file=$(credentials_backup_file "$1")
+
+    if [ -f "$backup_file" ]; then
+        cat "$backup_file"
+    fi
+}
+
+# Write through a private temporary file in the same folder, then rename it into place.
+write_plain_backup() {
+    local target="$1" content="$2" temp_file
+
+    temp_file=$(umask 077; mktemp "$ACCOUNTS_DIR/.credentials.XXXXXXXX") || return 1
+    if ! printf '%s' "$content" > "$temp_file" || ! chmod 600 "$temp_file" \
+        || ! mv -f "$temp_file" "$target"; then
         rm -f "$temp_file"
         return 1
     fi
-
-    chmod 600 "$temp_file"
-    mv "$temp_file" "$1"
-}
-
-decrypt_from() {
-    openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -pass fd:3 \
-        -in "$1" 3< <(printf '%s\n' "$MASTER_PASSWORD") 2>/dev/null
-}
-
-# Function to ask for the master password once per run.
-# The first one is confirmed and recorded in a check file, so a typo can't split backups across passwords
-ask_password() {
-    if [ -n "$MASTER_PASSWORD" ]; then
-        return 0
-    fi
-
-    if [ -f "$CHECK_FILE" ]; then
-        IFS= read -r -s -p "ccacc master password: " MASTER_PASSWORD
-        echo
-        if [ "$(decrypt_from "$CHECK_FILE")" != "ccacc" ]; then
-            MASTER_PASSWORD=""
-            echo -e "${RED}Error: Wrong master password${NC}"
-            return 1
-        fi
-        return 0
-    fi
-
-    local confirm
-    IFS= read -r -s -p "Set a ccacc master password: " MASTER_PASSWORD
-    echo
-    IFS= read -r -s -p "Confirm master password: " confirm
-    echo
-
-    if [ -z "$MASTER_PASSWORD" ] || [ "$MASTER_PASSWORD" != "$confirm" ]; then
-        MASTER_PASSWORD=""
-        echo -e "${RED}Error: Passwords are empty or do not match${NC}"
-        return 1
-    fi
-
-    printf 'ccacc' | encrypt_to "$CHECK_FILE"
-}
-
-# Functions to keep an account's encrypted backups as <name>.<kind>.enc (kind: credentials)
-read_backup() {
-    local backup_file="$ACCOUNTS_DIR/$1.$2.enc"
-
-    if [ -f "$backup_file" ]; then
-        decrypt_from "$backup_file"
-    fi
+    [ "$(cat "$target")" = "$content" ]
 }
 
 write_backup() {
@@ -667,12 +637,74 @@ write_backup() {
         return 0
     fi
 
-    printf '%s' "$content" | encrypt_to "$ACCOUNTS_DIR/${name}.${kind}.enc" \
-        && [ "$(read_backup "$name" "$kind")" = "$content" ]
+    write_plain_backup "$(credentials_backup_file "$name")" "$content"
 }
 
 delete_backup() {
-    rm -f "$ACCOUNTS_DIR/$1.$2.enc"
+    rm -f "$(credentials_backup_file "$1")"
+}
+
+# Decrypt one legacy backup with the master password. The password goes through
+# fd 3, so it never shows up in the process list or on disk.
+decrypt_legacy_backup() {
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -pass fd:3 \
+        -in "$1" 3< <(printf '%s\n' "$2") 2>/dev/null
+}
+
+# One-time migration of encrypted backups to plain files. Asks for the old master
+# password only when <name>.credentials.enc files exist. Every backup is decrypted,
+# checked and written before any encrypted file is removed, so a wrong password or
+# a failure leaves the encrypted backups in place.
+migrate_encrypted_backups() {
+    local -a encrypted=()
+    local file name target content password
+
+    for file in "$ACCOUNTS_DIR"/*.credentials.enc; do
+        if [ -f "$file" ] && [ ! -L "$file" ]; then encrypted+=("$file"); fi
+    done
+    if [ "${#encrypted[@]}" -eq 0 ]; then
+        rm -f "$LEGACY_CHECK_FILE" || return 1
+        return 0
+    fi
+
+    if ! command -v openssl > /dev/null 2>&1; then
+        echo -e "${RED}Error: openssl is required once to migrate encrypted login backups; account unchanged${NC}"
+        return 1
+    fi
+    echo "ccacc no longer encrypts login backups. Enter the old master password once to convert ${#encrypted[@]} encrypted backup(s) to plain files." >&2
+    if ! IFS= read -r -s -p "ccacc master password: " password; then
+        echo
+        echo -e "${RED}Error: No master password given; encrypted backups unchanged${NC}"
+        return 1
+    fi
+    echo
+    if [ -f "$LEGACY_CHECK_FILE" ] && [ "$(decrypt_legacy_backup "$LEGACY_CHECK_FILE" "$password")" != "ccacc" ]; then
+        echo -e "${RED}Error: Wrong master password; encrypted backups unchanged${NC}"
+        return 1
+    fi
+
+    for file in "${encrypted[@]}"; do
+        name=$(basename "$file" .credentials.enc)
+        target=$(credentials_backup_file "$name")
+        if ! content=$(decrypt_legacy_backup "$file" "$password") \
+            || ! printf '%s' "$content" | jq -e 'type == "object"' > /dev/null 2>&1; then
+            echo -e "${RED}Error: Could not decrypt the login backup of '${name}'; encrypted backups unchanged${NC}"
+            return 1
+        fi
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            # Left by an interrupted earlier migration: keep it only if identical.
+            if [ -f "$target" ] && [ ! -L "$target" ] && [ "$(cat "$target")" = "$content" ]; then continue; fi
+            echo -e "${RED}Error: Both $target and its encrypted backup exist and differ; encrypted backups unchanged${NC}"
+            return 1
+        fi
+        if ! write_plain_backup "$target" "$content"; then
+            echo -e "${RED}Error: Could not write the login backup of '${name}'; encrypted backups unchanged${NC}"
+            return 1
+        fi
+    done
+
+    rm -f "${encrypted[@]}" "$LEGACY_CHECK_FILE" || return 1
+    echo -e "${GREEN}Converted ${#encrypted[@]} login backup(s) to plain files in ~/.claude/accounts (not encrypted).${NC}" >&2
 }
 
 # Function to generate a fresh Claude Code identity (userID + anonymousId + machineID)
@@ -1141,7 +1173,7 @@ save_command() (
     # same name: the current login may be a different identity. Nothing about
     # launch permissions is stored in the named profile backup.
     _ccacc_profile_tx_entries=("file|$LAUNCH_MODE_FILE" "file|$ACTIVE_FILE"
-        "file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials.enc"
+        "file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials"
         "file|$TIMEZONES_DIR/$name" "file|$LEGACY_PENDING_TIMEZONE_FILE" "file|$UNNAMED_SESSION_FILE")
     if [ ! -f "$ACCOUNTS_DIR/$name.surge" ]; then
         _ccacc_profile_tx_entries+=("file|$ACCOUNTS_DIR/$name.surge")
@@ -1149,7 +1181,8 @@ save_command() (
     _ccacc_profile_tx_preflight || return 1
     trap '_ccacc_profile_tx_finish' EXIT
     trap 'exit 130' INT
-    ask_password || return 1
+    # Before staging, so the transaction stages and can restore the converted backup.
+    migrate_encrypted_backups || return 1
     _ccacc_profile_tx_stage || return 1
     _ccacc_profile_tx_writes=yes
     save_prepared_metadata "$name" || return 1
@@ -1170,10 +1203,10 @@ report_outgoing_backup() {
     local outgoing="$1" stash="$ACCOUNTS_DIR/$1" entry label path found=false
     printf "Backed up outgoing account to profile '%s'.\n" "$outgoing" >&2
     printf 'Saved contents:\n' >&2
-    if [ -f "$ACCOUNTS_DIR/$outgoing.credentials.enc" ]; then
-        printf '  - Encrypted Claude login backup: ~/.claude/accounts/%s.credentials.enc\n' "$outgoing" >&2
+    if [ -f "$ACCOUNTS_DIR/$outgoing.credentials" ]; then
+        printf '  - Claude login backup (plain file, not encrypted): ~/.claude/accounts/%s.credentials\n' "$outgoing" >&2
     else
-        printf '  - No Claude login to back up (logged out); no encrypted login backup.\n' >&2
+        printf '  - No Claude login to back up (logged out); no login backup.\n' >&2
     fi
     printf '  - Account configuration snapshot: ~/.claude/accounts/%s.json\n' "$outgoing" >&2
     printf '  - Archived account history/session/cache paths:\n' >&2
@@ -1193,7 +1226,7 @@ report_outgoing_backup() {
 # broken symlink, means the name is taken.
 profile_exists() {
     local path
-    for path in "$ACCOUNTS_DIR/$1.json" "$ACCOUNTS_DIR/$1.credentials.enc" \
+    for path in "$ACCOUNTS_DIR/$1.json" "$ACCOUNTS_DIR/$1.credentials" "$ACCOUNTS_DIR/$1.credentials.enc" \
         "$TIMEZONES_DIR/$1" "$ACCOUNTS_DIR/$1"; do
         if [ -e "$path" ] || [ -L "$path" ]; then return 0; fi
     done
@@ -1430,7 +1463,7 @@ use_command() (
         echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
         return 1
     fi
-    # Validate and stage this session record before passwords or process/account
+    # Validate and stage this session record before migration or process/account
     # mutations. A failed selection leaves the previous launch mode untouched.
     _ccacc_shell_path "$LAUNCH_MODE_FILE" file && cleanup_file_is_writable "$LAUNCH_MODE_FILE" || {
         echo "Error: Current launch mode cannot be safely updated; account unchanged" >&2; return 1;
@@ -1456,7 +1489,7 @@ use_command() (
         echo -e "${YELLOW}'${name}' is already active${NC}"
         return 0
     fi
-    ask_password || return 1
+    migrate_encrypted_backups || return 1
     stop_claude || return 1
     note_device_keys
     if [ -n "$active" ]; then backup_active || return 1; fi
@@ -1577,7 +1610,7 @@ cleanup_is_complete() {
     local recovery
     if [ -e "$CLEANUP_RECOVERY_DIR" ] || [ -L "$CLEANUP_RECOVERY_DIR" ]; then
         echo "Error: Previous cleanup incomplete; recovery data retained at $CLEANUP_RECOVERY_DIR" >&2
-        echo "Restore the paths in manifest.json and config/metadata copies before removing that directory; credentials may require a saved encrypted profile or login." >&2
+        echo "Restore the paths in manifest.json and config/metadata copies before removing that directory; credentials may require a saved profile or login." >&2
         return 1
     fi
     if recovery=$(profile_recovery_path); then
@@ -1703,7 +1736,7 @@ cleanup_rollback() {
         echo "Error: Account cleanup failed; previous account, credentials and history restored" >&2
     else
         echo "Error: Account cleanup incomplete; rollback incomplete, recovery data retained at $CLEANUP_RECOVERY_DIR" >&2
-        echo "No Keychain secrets were stored on disk; restore manifest.json paths and config/metadata copies, then use a saved encrypted profile or login if credentials could not be restored." >&2
+        echo "No Keychain secrets were stored on disk; restore manifest.json paths and config/metadata copies, then use a saved profile or login if credentials could not be restored." >&2
     fi
 }
 
@@ -1878,8 +1911,8 @@ delete_command() (
     if ! IFS= read -r -n 1 -p "Delete anyway? (y/N): " reply; then reply=''; fi
     echo
     case "$reply" in y|Y) ;; *) return 1 ;; esac
-    _ccacc_profile_tx_entries+=("file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials.enc"
-        "file|$ACCOUNTS_DIR/$name.surge" "file|$ALIASES_DIR/$name.json" "file|$TIMEZONES_DIR/$name"
+    _ccacc_profile_tx_entries+=("file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials"
+        "file|$ACCOUNTS_DIR/$name.credentials.enc" "file|$ACCOUNTS_DIR/$name.surge" "file|$ALIASES_DIR/$name.json" "file|$TIMEZONES_DIR/$name"
         "dir|$ACCOUNTS_DIR/$name")
     _ccacc_profile_tx_preflight || return 1
     trap '_ccacc_profile_tx_finish' EXIT

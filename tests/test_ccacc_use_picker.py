@@ -218,10 +218,9 @@ class ProfilePickerTests(unittest.TestCase):
         self.assertEqual(self.case.snapshot(), before)
 
     def test_password_prompt_follows_primary_screen_restore(self):
-        body = r'''ask_password() {
+        body = r'''migrate_encrypted_backups() {
             printf 'Fixture password? ' >&2
             printf 'password\n' >> "$OPS"
-            MASTER_PASSWORD=fixture
         }; main use --no-yolo'''
         status, menu, _ = self.run_pty(body=body, keys=b'j\r')
         self.assertEqual(status, 0, menu)

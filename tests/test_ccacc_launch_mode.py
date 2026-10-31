@@ -38,7 +38,7 @@ class LaunchModeTests(unittest.TestCase):
         # installed checks and active-marker writes use the actual core code.
         code = r'''
 source "$FIXTURE_CORE" help >/dev/null
-ask_password() { printf 'password\n' >> "$HOME/selection-operations"; }
+migrate_encrypted_backups() { printf 'password\n' >> "$HOME/selection-operations"; }
 stop_claude() { printf 'stop\n' >> "$HOME/selection-operations"; }
 note_device_keys() { :; }
 backup_active() { :; }
@@ -107,7 +107,7 @@ apply_surge() { :; }
         before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths}
         for answer, enabled in ((b"y\n", True), (b"\n", False), (b"n\n", False)):
             status, stderr, _ = self.selection_pty("sydney", answer,
-                "ask_password() { return 97; }; stop_claude() { return 98; }")
+                "migrate_encrypted_backups() { return 97; }; stop_claude() { return 98; }")
             self.assertEqual(status, 0, stderr)
             self.assertEqual(self.record()["yolo"], enabled)
         self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths})
@@ -116,7 +116,7 @@ apply_surge() { :; }
     def test_non_tty_defaults_no_without_consuming_password_input(self):
         self.seed()
         result = self.fixture.harness(r'''
-ask_password() { IFS= read -r password; printf '%s\n' "$password" > "$HOME/password-input"; }
+migrate_encrypted_backups() { IFS= read -r password; printf '%s\n' "$password" > "$HOME/password-input"; }
 main use tokyo
 ''', stdin="fixture-password\n")
         self.assertNotIn("YOLO", result.stderr)
@@ -128,7 +128,7 @@ main use tokyo
         self.assertFalse(self.record()["yolo"])
 
     def test_failed_use_keeps_previous_mode_and_cleans_staging(self):
-        for failure in ("ask_password", "stop_claude", "backup_active", "load_account",
+        for failure in ("migrate_encrypted_backups", "stop_claude", "backup_active", "load_account",
                         "stash_paths", "unstash_paths", "apply_surge"):
             with self.subTest(failure=failure):
                 (self.accounts / ".active").write_text("sydney\n")
@@ -329,7 +329,7 @@ main save sydney --timezone UTC
         for answer in ("n\n", "\n", ""):
             self.remove_profile("sydney", stdin=answer, success=False)
             self.assertEqual(self.fixture.home_snapshot(), before)
-        self.fixture.harness("ask_password() { return 91; }; main save renamed --timezone UTC", success=False)
+        self.fixture.harness("migrate_encrypted_backups() { return 91; }; main save renamed --timezone UTC", success=False)
         self.assertEqual(self.fixture.home_snapshot(), before)
         self.assertEqual(self.fixture.cli("launch-mode").stdout, "true\n")
 
@@ -351,7 +351,7 @@ main save sydney --timezone UTC
         profile.write_text('{"userID":"prior-identity"}')
         before = self.fixture.home_snapshot()
         self.fixture.harness(r'''
-ask_password() { :; }
+migrate_encrypted_backups() { :; }
 save_account() { printf '{"userID":"replacement"}' > "$ACCOUNTS_DIR/$1.json"; return 91; }
 main save sydney --timezone UTC
 ''', success=False)
@@ -361,10 +361,10 @@ main save sydney --timezone UTC
 
     def test_failed_delete_staging_restores_target_and_runtime_choice(self):
         self.fixture.harness("main use sydney --yolo")
-        (self.accounts / "sydney.credentials.enc").write_text("fixture encrypted backup")
+        (self.accounts / "sydney.credentials").write_text("fixture encrypted backup")
         before = self.fixture.home_snapshot()
         self.fixture.harness(r'''
-mv() { if [ "$1" = "$ACCOUNTS_DIR/sydney.credentials.enc" ]; then return 91; fi; command mv "$@"; }
+mv() { if [ "$1" = "$ACCOUNTS_DIR/sydney.credentials" ]; then return 91; fi; command mv "$@"; }
 main rm sydney
 ''', success=False)
         self.assertEqual(self.fixture.home_snapshot(), before)
@@ -374,7 +374,7 @@ main rm sydney
     def test_incomplete_rollback_keeps_choice_disabled_and_private_restore_paths(self):
         self.fixture.harness("main use sydney --yolo")
         result = self.fixture.harness(r'''
-ask_password() { :; }
+migrate_encrypted_backups() { :; }
 save_account() { printf '{"userID":"replacement"}' > "$ACCOUNTS_DIR/$1.json"; return 91; }
 mv() {
     case "$1" in

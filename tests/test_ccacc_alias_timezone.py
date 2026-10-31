@@ -63,7 +63,7 @@ class AliasTimezoneTests(unittest.TestCase):
 
     def run_harness(self, body, stdin="", success=True):
         mocks = '''
-ask_password() { MASTER_PASSWORD=fixture-only; }
+migrate_encrypted_backups() { :; }
 require_shell_hook() { :; }
 load_shell_companion() { :; }
 ccacc_check_shell_hook() { return 1; }
@@ -201,12 +201,12 @@ main use foo
             (self.accounts / (name + ".json")).write_text("{}")
             (self.alias_metadata / (name + ".json")).write_text("fixture-metadata")
             (self.accounts / (name + ".surge")).write_text("{}")
-            (self.accounts / (name + ".credentials.enc")).write_text("fixture-encrypted")
+            (self.accounts / (name + ".credentials")).write_text("fixture-encrypted")
             (self.accounts / name).mkdir()
         (self.accounts / ".active").write_text("example\n")
         self.run_cli("rm", "example", stdin="y\n")
         self.assertEqual(sorted(path.name for path in self.accounts.iterdir()),
-                         [".aliases", ".timezones", "other", "other.credentials.enc", "other.json", "other.surge"])
+                         [".aliases", ".timezones", "other", "other.credentials", "other.json", "other.surge"])
         self.assertEqual(sorted(path.name for path in self.alias_metadata.iterdir()), ["other.json"])
         self.assertEqual(sorted(path.name for path in self.timezones.iterdir()), ["other"])
 
@@ -275,7 +275,7 @@ main use foo
         before = {path.relative_to(self.home): path.read_bytes()
                   for path in self.home.rglob("*") if path.is_file()}
         forbidden = '''
-ask_password() { printf 'password\\n' >> "$FORBIDDEN"; return 98; }
+migrate_encrypted_backups() { printf 'password\\n' >> "$FORBIDDEN"; return 98; }
 stop_claude() { printf 'process\\n' >> "$FORBIDDEN"; return 98; }
 replace_credentials() { printf 'credentials\\n' >> "$FORBIDDEN"; return 98; }
 save_account() { printf 'save\\n' >> "$FORBIDDEN"; return 98; }

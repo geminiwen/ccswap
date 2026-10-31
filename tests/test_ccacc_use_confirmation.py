@@ -16,9 +16,7 @@ source "$FIXTURE_CORE" help >/dev/null
 read_credentials() { printf 'read\n' >> "$OPS"; cat "$STRAY_CREDENTIALS_FILE"; }
 write_credentials() { printf 'write\n' >> "$OPS"; printf '%s\n' "$1" > "$STRAY_CREDENTIALS_FILE"; }
 delete_credentials() { printf 'delete\n' >> "$OPS"; rm -f "$STRAY_CREDENTIALS_FILE"; }
-encrypt_to() { cat > "$1"; }
-decrypt_from() { cat "$1"; }
-ask_password() { printf 'password\n' >> "$OPS"; MASTER_PASSWORD=fixture; }
+migrate_encrypted_backups() { printf 'password\n' >> "$OPS"; }
 stop_claude() { printf 'stop\n' >> "$OPS"; }
 note_device_keys() { :; }
 apply_surge() { printf 'surge\n' >> "$OPS"; }
@@ -44,9 +42,9 @@ class UseConfirmationTests(unittest.TestCase):
             "numStartups": 42, "projects": {"private-project-secret": {}},
             "mcpServers": {"shared": {"url": "shared-url-secret"}}}))
         (self.accounts / "sydney.json").write_text('{"userID":"old-saved-id"}')
-        (self.accounts / "sydney.credentials.enc").write_text('{"claudeAiOauth":{"accessToken":"old-secret"}}')
+        (self.accounts / "sydney.credentials").write_text('{"claudeAiOauth":{"accessToken":"old-secret"}}')
         (self.accounts / "tokyo.json").write_text('{"userID":"target-id"}')
-        (self.accounts / "tokyo.credentials.enc").write_text('{"claudeAiOauth":{"accessToken":"target-secret"}}')
+        (self.accounts / "tokyo.credentials").write_text('{"claudeAiOauth":{"accessToken":"target-secret"}}')
         for name in ("sydney", "tokyo"):
             (self.accounts / (name + ".surge")).write_text('{"Claude":"saved-route"}')
         (self.accounts / ".launch-mode").write_text('{"version":1,"account":"sydney","yolo":true}\n')
@@ -144,7 +142,7 @@ class UseConfirmationTests(unittest.TestCase):
         self.assertEqual(saved["userID"], "latest-id-secret")
         self.assertEqual(saved["numStartups"], 42)
         self.assertNotIn("mcpServers", saved)
-        self.assertEqual(json.loads((self.accounts / "sydney.credentials.enc").read_text()),
+        self.assertEqual(json.loads((self.accounts / "sydney.credentials").read_text()),
                          {"claudeAiOauth": {"accessToken": "latest-login-secret"}})
         self.assertEqual((self.accounts / "sydney/history.jsonl").read_text(), "latest-history-secret\n")
         self.assertFalse((self.home / ".claude/history.jsonl").exists())
@@ -182,7 +180,7 @@ class UseConfirmationTests(unittest.TestCase):
 
     def assert_report(self, stderr):
         self.assertEqual(stderr.count("Backed up outgoing account to profile 'sydney'."), 1)
-        self.assertIn("Encrypted Claude login backup: ~/.claude/accounts/sydney.credentials.enc", stderr)
+        self.assertIn("Claude login backup (plain file, not encrypted): ~/.claude/accounts/sydney.credentials", stderr)
         self.assertIn("Account configuration snapshot: ~/.claude/accounts/sydney.json", stderr)
         for label in ("history.jsonl", "feedback-drafts", "plans", "sessions", "cli-nodejs-cache"):
             self.assertIn(label + ": ~/.claude/accounts/sydney/" + label, stderr)
@@ -269,7 +267,7 @@ class UseConfirmationTests(unittest.TestCase):
 
     def test_nonterminal_without_yes_password_reads_stdin_once(self):
         result = self.run_body(r'''
-ask_password() {
+migrate_encrypted_backups() {
     printf 'password\n' >> "$OPS"
     IFS= read -r password
     [ "$password" = password-stdin-sentinel ] || return 98
@@ -297,19 +295,19 @@ printf '%s\n' "$remaining"
     def test_logged_out_named_profile_reports_no_encrypted_login_backup(self):
         self.credentials.write_text('{"mcpOAuth":{"shared":"shared-secret"}}')
         result = self.run_body("main use tokyo --no-yolo")
-        self.assertIn("No Claude login to back up (logged out); no encrypted login backup", result.stderr)
+        self.assertIn("No Claude login to back up (logged out); no login backup", result.stderr)
         self.assertNotIn("Encrypted Claude login backup:", result.stderr)
-        self.assertFalse((self.accounts / "sydney.credentials.enc").exists())
+        self.assertFalse((self.accounts / "sydney.credentials").exists())
         self.assertIn("Account configuration snapshot:", result.stderr)
         self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"], {"shared": "shared-secret"})
 
     def test_logged_out_backup_delete_failure_blocks_switch_and_report(self):
         self.credentials.write_text('{"mcpOAuth":{"shared":"shared-secret"}}')
-        stale_login = (self.accounts / "sydney.credentials.enc").read_bytes()
+        stale_login = (self.accounts / "sydney.credentials").read_bytes()
         before = {path: metadata for path, metadata in self.snapshot().items() if metadata[0] is not None}
         result = self.run_body(r'''
 rm() {
-    if [ "$#" = 2 ] && [ "$1" = -f ] && [ "$2" = "$ACCOUNTS_DIR/sydney.credentials.enc" ]; then
+    if [ "$#" = 2 ] && [ "$1" = -f ] && [ "$2" = "$ACCOUNTS_DIR/sydney.credentials" ]; then
         printf 'delete_backup_failed\n' >> "$OPS"
         return 91
     fi
@@ -322,14 +320,14 @@ main use tokyo --no-yolo
             self.assertNotIn(operation, self.operations())
         self.assertNotIn("Backed up outgoing", result.stderr)
         self.assertNotIn("Switched to", result.stdout)
-        self.assertEqual((self.accounts / "sydney.credentials.enc").read_bytes(), stale_login)
+        self.assertEqual((self.accounts / "sydney.credentials").read_bytes(), stale_login)
         self.assertEqual({path: metadata for path, metadata in self.snapshot().items() if metadata[0] is not None}, before)
 
     def test_report_reads_only_metadata_and_leaves_files_unchanged(self):
         result = self.run_body(r'''
 stash_paths sydney
 read_credentials() { return 98; }
-decrypt_from() { return 99; }
+read_backup() { return 99; }
 report_outgoing_backup sydney
 ''')
         self.assert_report(result.stderr)
@@ -370,7 +368,7 @@ main use tokyo --no-yolo
         self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
 
     def test_login_save_failure_blocks_load_stash_report(self):
-        result = self.run_body("encrypt_to() { return 91; }; main use tokyo --no-yolo", success=False)
+        result = self.run_body("write_plain_backup() { return 91; }; main use tokyo --no-yolo", success=False)
         self.assertIn("save_account", self.operations())
         for operation in ("load_account", "stash_paths", "report_outgoing_backup", "unstash_paths", "surge"):
             self.assertNotIn(operation, self.operations())
@@ -513,7 +511,7 @@ main use tokyo --no-yolo
 
     def test_same_active_skips_backup_and_restore_but_selects_yolo(self):
         before = {p: p.read_bytes() for p in (self.credentials, self.home / ".claude.json",
-                  self.accounts / "sydney.json", self.accounts / "sydney.credentials.enc")}
+                  self.accounts / "sydney.json", self.accounts / "sydney.credentials")}
         result = self.run_body("main use sydney --yolo")
         self.assertNotIn("Confirm outgoing backup", result.stderr)
         self.assertNotIn("Backed up outgoing", result.stderr)

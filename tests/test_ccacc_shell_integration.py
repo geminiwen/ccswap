@@ -93,7 +93,7 @@ exec "$@"
         # Only credential/account movement and process/Surge work are replaced.
         mocks = r'''
 source "$FIXTURE_CORE" help >/dev/null
-ask_password() { printf 'password\n' >> "$HOME/operations"; }
+migrate_encrypted_backups() { printf 'password\n' >> "$HOME/operations"; }
 save_account() { printf '{}\n' > "$ACCOUNTS_DIR/$1.json"; }
 load_account() { printf 'load %s\n' "$1" >> "$HOME/operations"; }
 backup_active() { :; }
@@ -299,7 +299,7 @@ apply_surge() { :; }
                     path.chmod(0o444)
                 before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in paths}
                 # Already-active use must neither ask for a password nor write hook files.
-                self.harness('ask_password() { return 97; }; use_command sydney')
+                self.harness('migrate_encrypted_backups() { return 97; }; use_command sydney')
                 for command in ("save sydney --timezone Australia/Sydney", "use sydney", "use tokyo",
                                 "new"):
                     result = self.harness("main " + command)
@@ -348,7 +348,7 @@ apply_surge() { :; }
         traces = {
             "tokyo": None,  # an inactive account with profile JSON and timezone
             "jsononly": lambda: (self.accounts / "jsononly.json").write_text("{}"),
-            "loginonly": lambda: (self.accounts / "loginonly.credentials.enc").write_text("x"),
+            "loginonly": lambda: (self.accounts / "loginonly.credentials").write_text("x"),
             "zoneonly": lambda: (self.accounts / ".timezones/zoneonly").write_text("UTC\n"),
             "stashonly": lambda: ((self.accounts / "stashonly").mkdir(),
                                   (self.accounts / "stashonly/history.jsonl").write_text("x")),

@@ -35,7 +35,6 @@ keychain_write() {
     printf 'write\n' >> "$MUTATIONS"
     printf '%s' "$3" > "$STATE"
 }
-ask_password() { :; }
 require_shell_hook() { :; }
 load_shell_companion() { :; }
 ccacc_check_shell_hook() { return 1; }
@@ -46,7 +45,6 @@ stop_claude() { :; }
 note_device_keys() { :; }
 setup_surge() { :; }
 apply_surge() { :; }
-MASTER_PASSWORD=fixture-master
 '''
 
 
@@ -121,18 +119,18 @@ def main():
 
             fixture, _ = run(r'''
 write_backup example credentials "$(cat "$FIXTURE/target.json")"
-read_backup example credentials > "$FIXTURE/decrypted.json"
+read_backup example credentials > "$FIXTURE/restored.json"
 ''')
-            assert json.loads((fixture / 'decrypted.json').read_text()) == {'claudeAiOauth': TARGET['claudeAiOauth']}
+            assert json.loads((fixture / 'restored.json').read_text()) == {'claudeAiOauth': TARGET['claudeAiOauth']}
 
             fixture, _ = run(r'''
-printf 'fixture-sentinel' > "$ACCOUNTS_DIR/example.credentials.enc"
+printf 'fixture-sentinel' > "$ACCOUNTS_DIR/example.credentials"
 if write_backup example credentials '[]'; then exit 98; fi
 ''')
-            assert (fixture / 'home/.claude/accounts/example.credentials.enc').read_text() == 'fixture-sentinel'
+            assert (fixture / 'home/.claude/accounts/example.credentials').read_text() == 'fixture-sentinel'
 
             fixture, state = run(r'''
-printf '%s' "$(cat "$FIXTURE/target.json")" | encrypt_to "$ACCOUNTS_DIR/legacy.credentials.enc"
+printf '%s' "$(cat "$FIXTURE/target.json")" > "$ACCOUNTS_DIR/legacy.credentials"
 printf '{"userID":"fixture-target-id"}' > "$ACCOUNTS_DIR/legacy.json"
 load_account legacy
 ''')
@@ -145,12 +143,12 @@ printf 'original\n' > "$ACTIVE_FILE"
 new_command
 ''')
             assert json.loads(state.read_text()) == {k: v for k, v in BASE.items() if k != 'claudeAiOauth'}
-            assert not (fixture / 'home/.claude/accounts/fresh.credentials.enc').exists()
+            assert not (fixture / 'home/.claude/accounts/fresh.credentials').exists()
 
             fixture, state = run(r'''
 save_account original
 printf 'original\n' > "$ACTIVE_FILE"
-printf '%s' "$(cat "$FIXTURE/target.json")" | encrypt_to "$ACCOUNTS_DIR/other.credentials.enc"
+printf '%s' "$(cat "$FIXTURE/target.json")" > "$ACCOUNTS_DIR/other.credentials"
 printf '{"userID":"fixture-other-id"}' > "$ACCOUNTS_DIR/other.json"
 set_timezone other UTC
 set_timezone original UTC
@@ -179,7 +177,7 @@ use_command original
             expected['mcpOAuth']['extra'] = {'accessToken': 'fixture-new-shared'}
             assert json.loads(state.read_text()) == expected
     print(f'PASS: {count} isolated checks against the mocked macOS Keychain; '
-          'legacy backups, logout/new, roundtrip with new MCP auth, corruption guards, and login-only encrypted backups.')
+          'legacy backups, logout/new, roundtrip with new MCP auth, corruption guards, and login-only plain backups.')
 
 
 if __name__ == '__main__':

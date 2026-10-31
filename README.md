@@ -8,8 +8,8 @@ login, account-bound configuration, history and session files together.
 - macOS only. Claude logins are read from and written to the macOS keychain
   with `/usr/bin/security`; the installer and every command except `help` and
   `--version` refuse other platforms.
-- Bash (the system Bash 3.2 works), `curl` and `jq`; account backups also
-  require `openssl`.
+- Bash (the system Bash 3.2 works), `curl` and `jq`. `openssl` is needed only
+  once, to convert encrypted login backups made by older versions.
 - Bash or Zsh as the interactive shell for the launch hook.
 
 ## Installation
@@ -56,7 +56,7 @@ ccacc help
 ```
 
 `save <name>` creates a new profile or refreshes the **active** one under its own
-name. If `<name>` already exists (its profile JSON, encrypted login, saved timezone
+name. If `<name>` already exists (its profile JSON, login backup, saved timezone
 or history stash) and is not the active profile, save fails before any prompt or
 change:
 
@@ -64,7 +64,7 @@ change:
 Error: Account 'work' already exists and is not active; choose another name, or run 'ccacc use work' / 'ccacc rm work' first
 ```
 
-Save/use share one master password for encrypted login backups. Save leaves
+Save and use need no password: login backups are plain files (see below). Save leaves
 history and session directories in place while that account is active.
 Deleting an active profile leaves its current login/history in place but removes
 its saved identity, backup, timezone, policy choices and stored stash.
@@ -113,7 +113,7 @@ and `q`, Esc, Ctrl-C or EOF cancels. It requires terminal stdin and stderr.
 Switching between saved accounts automatically saves the latest outgoing login
 and account configuration, then archives its history/session/cache paths,
 including `~/.claude/sessions`. After saving and archival succeed, it reports the
-outgoing profile, encrypted login backup (or logged-out state), configuration
+outgoing profile, login backup (or logged-out state), configuration
 snapshot and actual archived paths on stderr, without printing their contents.
 Named noninteractive switches need no backup confirmation:
 
@@ -162,7 +162,7 @@ keys are ignored.
 
 YOLO means hooked Claude launches skip permission prompts, so enable this only if
 you accept that for every account you switch to. `use` reads the file before any
-picker, password prompt, process stop or account change. If the file exists but
+picker, backup migration, process stop or account change. If the file exists but
 cannot be read, is not valid JSON, is not an object, or `alwaysYOLO` is not a
 boolean, `use` fails with an error naming the file and changes nothing.
 
@@ -170,7 +170,7 @@ boolean, `use` fails with an error naming the file and changes nothing.
 
 | Operation | Saved or moved data |
 | --- | --- |
-| `save <name>` | Creates a new profile or refreshes the active one; other existing names are refused. Only `claudeAiOauth` goes into `<name>.credentials.enc`; account-bound `~/.claude.json` fields go into `<name>.json`. Save also records the independently chosen timezone and optional Surge policies. Live directories stay in place. |
+| `save <name>` | Creates a new profile or refreshes the active one; other existing names are refused. Only `claudeAiOauth` goes into `<name>.credentials`; account-bound `~/.claude.json` fields go into `<name>.json`. Save also records the independently chosen timezone and optional Surge policies. Live directories stay in place. |
 | `use <name>` | Updates the outgoing login/config backup, moves its account directories into `~/.claude/accounts/<outgoing>/`, and restores the target's saved login/config and directory stash. Saved timezone and Surge choices stay unchanged. |
 | `new` | Never auto-saves login/config or creates a named profile. After confirmation it logs out and resets account state. If the active saved identity matches the current identity, archive paths move into its stash; unmatched/unnamed paths are cleared. |
 
@@ -182,10 +182,20 @@ use your confidential information" prompts. Only a large item (roughly 1,900 byt
 or more, which no longer fits one `security -i` command line) is passed as an
 argument instead, as Claude Code also does, with a warning.
 
-Only the credentials backup is encrypted (AES-256-CBC with PBKDF2). Profile JSON
-and stashed files, including session JSON and `.key` bytes, are stored as files
-without an additional encryption layer. Session archival preserves those bytes;
-it does not restart stopped processes or recreate running sessions.
+Nothing ccacc saves is encrypted. The login backup `~/.claude/accounts/<name>.credentials`
+is plain JSON holding only `claudeAiOauth` (the Claude access and refresh tokens),
+written with mode 600 inside the private `accounts` folder. Anyone who can read
+your home folder, or a copy of it such as a Time Machine backup, can use that
+login. Profile JSON and stashed files, including session JSON and `.key` bytes,
+are stored the same way. Session archival preserves those bytes; it does not
+restart stopped processes or recreate running sessions.
+
+Older versions encrypted login backups as `<name>.credentials.enc` with a master
+password. The first `save` or `use` that finds such files asks for that password
+once, converts every backup to a plain file, and only then removes the encrypted
+files and `.check.enc`. A wrong or missing password, or any failure, leaves the
+encrypted backups untouched and changes nothing else. `rm` deletes either form
+without a password.
 
 The archive includes these `~/.claude` paths:
 
@@ -223,7 +233,7 @@ If recovery is incomplete, the error identifies either
 These guards block further account changes and hooked launches. Inspect its
 `manifest.json` and retained config/metadata copies; restore the recorded paths
 without overwriting existing data before removing the guard. A failed credential
-restore may require a saved encrypted profile or a fresh login. Keychain snapshots
+restore may require a saved profile or a fresh login. Keychain snapshots
 stay in memory; cleanup does not create plaintext Keychain recovery files.
 
 A late `use` failure can leave some target state applied. Read the error and inspect

@@ -39,9 +39,7 @@ read_credentials() {
 write_credentials() { printf 'write\n' >> "$SESSION_OPERATIONS"; printf '%s\n' "$1" > "$STRAY_CREDENTIALS_FILE"; }
 delete_credentials() { printf 'delete\n' >> "$SESSION_OPERATIONS"; rm -f "$STRAY_CREDENTIALS_FILE"; }
 # Deliberately plaintext fixture backups: never use real credentials or encryption.
-encrypt_to() { cat > "$1"; }
-decrypt_from() { cat "$1"; }
-ask_password() { printf 'password\n' >> "$SESSION_OPERATIONS"; MASTER_PASSWORD=fixture; }
+migrate_encrypted_backups() { printf 'password\n' >> "$SESSION_OPERATIONS"; }
 stop_claude() { printf 'stop\n' >> "$SESSION_OPERATIONS"; }
 note_device_keys() { :; }
 setup_surge() { printf 'setup-surge\n' >> "$SESSION_OPERATIONS"; }
@@ -108,7 +106,7 @@ main new
                                            "projects": {"old": {}}, "settings": {"keep": True}}))
         self.login()
         (self.accounts / "kept.json").write_bytes(self.config.read_bytes())
-        (self.accounts / "kept.credentials.enc").write_text('{"claudeAiOauth":{"accessToken":"prior-backup"}}')
+        (self.accounts / "kept.credentials").write_text('{"claudeAiOauth":{"accessToken":"prior-backup"}}')
         metadata = self.accounts / ".timezones"
         metadata.mkdir()
         (metadata / "kept").write_text("UTC\n")
@@ -167,7 +165,7 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
         self.assertEqual(self.fixture.cli("timezone", "personal").stdout, "Asia/Tokyo\n")
         self.assertFalse(self.pending.exists())
         self.assertEqual([p.name for p in self.accounts.glob("*.json")], ["personal.json"])
-        backup = json.loads((self.accounts / "personal.credentials.enc").read_text())
+        backup = json.loads((self.accounts / "personal.credentials").read_text())
         self.assertEqual(backup, {"claudeAiOauth": {"accessToken": "fixture-login"}})
         self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"],
                          {"fixture": {"accessToken": "shared"}})
@@ -185,7 +183,7 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
         self.assertFalse(self.active.exists())
         self.assertEqual([p.name for p in self.accounts.glob("*.json")], ["kept.json"])
         self.assertEqual(json.loads((self.accounts / "kept.json").read_text())["userID"], "old-id")
-        self.assertEqual(json.loads((self.accounts / "kept.credentials.enc").read_text()),
+        self.assertEqual(json.loads((self.accounts / "kept.credentials").read_text()),
                          {"claudeAiOauth": {"accessToken": "prior-backup"}})
         self.assertEqual((self.accounts / "kept/projects/history.json").read_text(), "fixture history")
         self.assertFalse((self.home / ".claude/projects").exists())
@@ -427,7 +425,7 @@ main new
         profiles = {p: p.read_bytes() for p in self.accounts.glob("kept.*")}
         self.run_body(r'''
 save_account() { printf 'unexpected-save' >> "$SESSION_OPERATIONS"; return 98; }
-ask_password() { printf 'unexpected-password' >> "$SESSION_OPERATIONS"; return 98; }
+migrate_encrypted_backups() { printf 'unexpected-password' >> "$SESSION_OPERATIONS"; return 98; }
 main new
 ''')
         self.assertEqual({p: p.read_bytes() for p in profiles}, profiles)
@@ -534,7 +532,7 @@ main new
         self.run_body('mkdir "$HOME/activation-directory"; ACTIVE_FILE="$HOME/activation-directory"; main save chosen --timezone UTC', success=False)
         self.assertTrue(self.pending.exists())
         self.assertFalse(self.active.exists())
-        self.assertFalse((self.accounts / "chosen.credentials.enc").exists())
+        self.assertFalse((self.accounts / "chosen.credentials").exists())
         self.assertFalse((self.accounts / "chosen.json").exists())
         self.assertFalse((self.accounts / ".timezones/chosen").exists())
         self.assertEqual(self.operations(), operations)
@@ -613,7 +611,7 @@ main new
         self.run_body("main new", stdin="yes\n3\n")
         self.login()
         before = self.selection.read_bytes()
-        for failure in ("ask_password() { return 1; }", "save_account() { return 1; }",
+        for failure in ("migrate_encrypted_backups() { return 1; }", "save_account() { return 1; }",
                         'setup_surge() { return 1; }'):
             with self.subTest(failure=failure):
                 self.run_body(failure + "; main save chosen --timezone UTC", success=False)
@@ -655,7 +653,7 @@ main new
         self.saved_active()
         self.run_body("main new", stdin="yes\n3\n")
         before = self.selection.read_bytes()
-        for failure in ("ask_password() { return 1; }", "load_account() { return 1; }",
+        for failure in ("migrate_encrypted_backups() { return 1; }", "load_account() { return 1; }",
                         "unstash_paths() { return 1; }", "apply_surge() { return 1; }"):
             self.run_body(failure + "; main use kept", success=False)
             self.assertEqual(self.selection.read_bytes(), before)
@@ -1022,7 +1020,7 @@ main new
         preserved = {}
         for name in ("settings.json", "settings.local.json", "skills/fixture/SKILL.md", "plugins/installed/fixture",
                      "knowledge/keep.md", ".device-keys.json", "commands/keep.md", "mcp-oauth-state.json",
-                     "accounts/saved.json", "accounts/saved.credentials.enc", "accounts/saved.surge",
+                     "accounts/saved.json", "accounts/saved.credentials", "accounts/saved.surge",
                      "accounts/.timezones/saved", "accounts/.aliases/saved.json", "accounts/.check.enc"):
             path = self.home / ".claude" / name
             path.parent.mkdir(parents=True, exist_ok=True)

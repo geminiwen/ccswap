@@ -64,8 +64,8 @@ class ProfilePickerTests(unittest.TestCase):
         (self.accounts / "tokyo.json").write_text(json.dumps({"userID": "target-id",
             "oauthAccount": {"emailAddress": "saved-tokyo@example.test"}}))
 
-    def run_pty(self, args=(), keys=b"q", backup=None, yolo=None, body=None,
-                before_select=None, before_prompt=None, size=(24, 110),
+    def run_pty(self, args=(), keys=b"q", yolo=None, body=None,
+                before_select=None, size=(24, 110),
                 ready_marker=b"Profiles ", menu_action=None, on_output=None, tty_setup=None):
         code = self.case.mocks + "\n" + (body or "main use " + shlex.join(args))
         stdout = self.fixture.fixture / "picker.stdout"
@@ -83,7 +83,7 @@ class ProfilePickerTests(unittest.TestCase):
         if tty_setup:
             original = tty_setup(original)
         data = b""
-        sent = backup_sent = yolo_sent = False
+        sent = yolo_sent = False
         status = None
         try:
             deadline = time.monotonic() + 12
@@ -107,15 +107,6 @@ class ProfilePickerTests(unittest.TestCase):
                     sent = True
                 if on_output:
                     on_output(pid, master, data)
-                if not backup_sent and b"Confirm outgoing backup? (y/N) " in data:
-                    self.assertIn(LEAVE.encode(), data)
-                    self.assertLess(data.index(LEAVE.encode()), data.index(b"Confirm outgoing backup"))
-                    self.assertIsNotNone(backup, data.decode(errors="replace"))
-                    self.assertEqual(self.case.operations(), [])
-                    if before_prompt:
-                        before_prompt()
-                    os.write(master, backup)
-                    backup_sent = True
                 if not yolo_sent and b"YOLO? (y/N) " in data:
                     self.assertIn(LEAVE.encode(), data)
                     self.assertLess(data.index(LEAVE.encode()), data.index(b"YOLO?"))
@@ -231,7 +222,7 @@ class ProfilePickerTests(unittest.TestCase):
             printf 'Fixture password? ' >&2
             printf 'password\n' >> "$OPS"
             MASTER_PASSWORD=fixture
-        }; main use --yes --no-yolo'''
+        }; main use --no-yolo'''
         status, menu, _ = self.run_pty(body=body, keys=b'j\r')
         self.assertEqual(status, 0, menu)
         self.assertLess(menu.index(LEAVE), menu.index('Fixture password?'))
@@ -292,13 +283,16 @@ class ProfilePickerTests(unittest.TestCase):
         self.assertNotIn("Choose saved profile", stdout)
         self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
 
-    def test_arrows_and_jk_reach_existing_backup_and_separate_yolo_flow(self):
+    def test_arrows_and_jk_reach_automatic_backup_and_separate_yolo_flow(self):
         for keys in (b"\x1b[B\x1b[A\x1b[B\r", b"jkj\r", b"\x1bOB\r"):
             with self.subTest(keys=keys):
-                status, menu, stdout = self.run_pty(keys=keys, backup=b"y\n", yolo=b"n\n")
+                status, menu, stdout = self.run_pty(keys=keys, yolo=b"n\n")
                 self.assertEqual(status, 0, menu + stdout)
                 self.assertIn("> tokyo | saved-tokyo@example.test", menu)
-                self.assertLess(menu.index("Confirm outgoing backup"), menu.index("YOLO?"))
+                self.assertNotIn("Confirm outgoing backup", menu)
+                self.assertLess(menu.index(LEAVE), menu.index("YOLO?"))
+                self.assertLess(menu.index("YOLO?"), menu.index("Backed up outgoing"))
+                self.case.assert_report(menu)
                 self.case.assert_switched()
                 self.case.run_body("main use sydney --yes --no-yolo")
                 self.case.ops.unlink()
@@ -313,14 +307,15 @@ class ProfilePickerTests(unittest.TestCase):
                 self.assertEqual(self.case.snapshot(), before)
                 self.assertEqual(self.case.operations(), [])
 
-    def test_cancel_at_backup_preserves_everything_after_picker(self):
+    def test_ctrl_c_at_yolo_preserves_everything_after_picker(self):
         before = self.case.snapshot()
-        status, menu, _ = self.run_pty(keys=b"j\r", backup=b"\n")
-        self.assertEqual(status, 1, menu)
+        status, menu, _ = self.run_pty(keys=b"j\r", yolo=b"\x03")
+        self.assertEqual(status, 130, menu)
+        self.assertNotIn("Backed up outgoing", menu)
         self.assertEqual(self.case.snapshot(), before)
         self.assertEqual(self.case.operations(), [])
 
-    def test_yes_requires_real_selection_and_only_skips_backup(self):
+    def test_yes_requires_real_selection_and_keeps_yolo_prompt(self):
         status, menu, _ = self.run_pty(["--yes"], b"j\r", yolo=b"n\n")
         self.assertEqual(status, 0, menu)
         self.assertNotIn("Confirm outgoing backup", menu)

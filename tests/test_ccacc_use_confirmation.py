@@ -1,4 +1,4 @@
-"""Outgoing-backup consent with real file transitions and fake system IO only."""
+"""Automatic outgoing backups with real file transitions and fake system IO only."""
 import json
 import os
 import pty
@@ -70,7 +70,7 @@ class UseConfirmationTests(unittest.TestCase):
         (self.home / ".claude/plans").symlink_to("absent-fixture-plan")
         # Preserve real implementations while observing ordering at their boundaries.
         self.mocks = MOCKS
-        for name in ("save_account", "load_account", "stash_paths", "unstash_paths"):
+        for name in ("save_account", "load_account", "stash_paths", "report_outgoing_backup", "unstash_paths"):
             self.mocks += '\neval "$(declare -f ' + name + " | sed '1s/" + name + "/original_" + name + "/')\"\n"
             self.mocks += name + '() { printf "' + name + '\\n" >> "$OPS"; original_' + name + ' "$@"; }\n'
 
@@ -89,7 +89,7 @@ class UseConfirmationTests(unittest.TestCase):
         return self.fixture.run_process(["/bin/bash", "-c", self.mocks + "\n" + body],
                                         success=success, stdin=stdin)
 
-    def run_pty(self, args, answer, yolo_answer=None):
+    def run_pty(self, args, yolo_answer=None):
         code = self.mocks + "\nmain use " + shlex.join(args)
         stdout = self.fixture.fixture / "pty.stdout"
         before = self.snapshot()
@@ -101,7 +101,6 @@ class UseConfirmationTests(unittest.TestCase):
             os.execve("/bin/bash", ["bash", "--noprofile", "--norc", "-c", code], self.fixture.env)
         data = b""
         status = None
-        sent = False
         yolo_sent = False
         try:
             deadline = time.monotonic() + 8
@@ -112,19 +111,23 @@ class UseConfirmationTests(unittest.TestCase):
                         data += os.read(master, 65536)
                     except OSError:
                         pass
-                if not sent and b"Confirm outgoing backup? (y/N) " in data:
-                    # No staged mode, passwords, credentials, backup or process work yet.
-                    self.assertEqual(self.snapshot(), before)
-                    self.assertEqual(self.operations(), [])
-                    os.write(master, answer)
-                    sent = True
                 if not yolo_sent and b"YOLO? (y/N) " in data:
                     self.assertIsNotNone(yolo_answer, data.decode(errors="replace"))
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertEqual(self.operations(), [])
                     os.write(master, yolo_answer)
                     yolo_sent = True
                 done, result = os.waitpid(pid, os.WNOHANG)
                 if done:
                     status = os.waitstatus_to_exitcode(result)
+                    while select.select([master], [], [], 0)[0]:
+                        try:
+                            chunk = os.read(master, 65536)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        data += chunk
                     break
             self.assertIsNotNone(status, data.decode(errors="replace"))
         finally:
@@ -146,35 +149,52 @@ class UseConfirmationTests(unittest.TestCase):
         self.assertEqual((self.accounts / "sydney/history.jsonl").read_text(), "latest-history-secret\n")
         self.assertFalse((self.home / ".claude/history.jsonl").exists())
         self.assertEqual((self.accounts / "sydney/feedback-drafts/draft").read_text(), "draft-secret")
+        self.assertEqual((self.accounts / "sydney/cli-nodejs-cache/cache").read_text(), "cache-secret")
         self.assertEqual({p.name: p.read_bytes() for p in (self.accounts / "sydney/sessions").iterdir()},
                          self.session_bytes)
         self.assertFalse(self.sessions.exists())
         self.assertTrue((self.accounts / "sydney/plans").is_symlink())
         self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"], {"shared": "shared-secret"})
+        self.assertEqual(json.loads((self.home / ".claude.json").read_text())["mcpServers"],
+                         {"shared": {"url": "shared-url-secret"}})
         self.assertEqual((self.accounts / ".timezones/sydney").read_text(), "Australia/Sydney\n")
         self.assertEqual((self.accounts / "sydney.surge").read_text(), '{"Claude":"saved-route"}')
         ops = self.operations()
-        for earlier, later in zip(("password", "stop", "save_account", "load_account", "stash_paths"),
-                                  ("stop", "save_account", "load_account", "stash_paths", "unstash_paths")):
+        for earlier, later in zip(("password", "stop", "save_account", "load_account", "stash_paths", "report_outgoing_backup"),
+                                  ("stop", "save_account", "load_account", "stash_paths", "report_outgoing_backup", "unstash_paths")):
             self.assertLess(ops.index(earlier), ops.index(later))
 
-    def test_yes_saves_latest_state_with_precise_secret_free_preview(self):
-        status, stderr, stdout = self.run_pty(["tokyo", "--no-yolo"], b"YeS\n")
+    def test_terminal_saves_latest_state_with_precise_secret_free_report(self):
+        # A stale outgoing path is cleared by stashing, and target-only archives
+        # are restored later; neither belongs in the completed outgoing report.
+        (self.accounts / "sydney/telemetry").mkdir(parents=True)
+        target = self.accounts / "tokyo/debug"
+        target.mkdir(parents=True)
+        (target / "target-only").write_text("target-history-secret")
+        status, stderr, stdout = self.run_pty(["tokyo", "--no-yolo"])
         self.assertEqual(status, 0, stderr + stdout)
-        self.assertIn("profile 'sydney', then switch to 'tokyo'", stderr)
-        self.assertIn("Encrypted Claude login credentials (claudeAiOauth only)", stderr)
-        self.assertNotIn("Account-bound ~/.claude.json keys present:", stderr)
-        for path in ("~/.claude/history.jsonl", "~/.claude/feedback/drafts", "~/.claude/plans", "~/.claude/sessions",
-                     "~/Library/Caches/claude-cli-nodejs"):
-            self.assertIn(path, stderr)
-        self.assertNotIn("~/.claude/telemetry", stderr)
-        self.assertIn("move into ~/.claude/accounts/sydney/ stash", stderr)
-        self.assertIn("timezone (TZ) and Surge choices remain unchanged", stderr)
-        for secret in ("latest-login-secret", "shared-secret", "latest-id-secret", "private-project-secret",
-                       "latest-history-secret", "draft-secret", "cache-secret", "shared-url-secret", "target-secret"):
-            self.assertNotIn(secret, stderr + stdout)
+        self.assert_report(stderr)
+        self.assertNotIn("telemetry:", stderr)
+        self.assertNotIn("debug:", stderr)
+        self.assertEqual((self.home / ".claude/debug/target-only").read_text(), "target-history-secret")
         self.assert_switched()
         self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
+
+    def assert_report(self, stderr):
+        self.assertEqual(stderr.count("Backed up outgoing account to profile 'sydney'."), 1)
+        self.assertIn("Encrypted Claude login backup: ~/.claude/accounts/sydney.credentials.enc", stderr)
+        self.assertIn("Account configuration snapshot: ~/.claude/accounts/sydney.json", stderr)
+        for label in ("history.jsonl", "feedback-drafts", "plans", "sessions", "cli-nodejs-cache"):
+            self.assertIn(label + ": ~/.claude/accounts/sydney/" + label, stderr)
+        for live_path in ("~/.claude/history.jsonl", "~/.claude/feedback/drafts", "~/.claude/sessions",
+                          "~/Library/Caches/claude-cli-nodejs"):
+            self.assertNotIn(live_path, stderr)
+        self.assertNotIn("Confirm outgoing backup", stderr)
+        self.assertIn("timezone (TZ) and Surge choices remain unchanged", stderr)
+        for secret in ("latest-login-secret", "shared-secret", "latest-id-secret", "private-project-secret",
+                       "latest-history-secret", "draft-secret", "cache-secret", "shared-url-secret", "target-secret",
+                       "target-history-secret", "userID", "numStartups", "mcpServers"):
+            self.assertNotIn(secret, stderr)
 
     def test_sessions_roundtrip_moves_exact_json_and_key_bytes(self):
         target = self.accounts / "tokyo/sessions"
@@ -185,14 +205,14 @@ class UseConfirmationTests(unittest.TestCase):
         }
         for name, content in target_bytes.items():
             (target / name).write_bytes(content)
-        self.run_body("main use tokyo --yes --no-yolo")
+        self.run_body("main use tokyo --no-yolo")
         self.assertFalse(target.exists())
         self.assertEqual({p.name: p.read_bytes() for p in self.sessions.iterdir()}, target_bytes)
         self.assertEqual({p.name: p.read_bytes() for p in (self.accounts / "sydney/sessions").iterdir()},
                          self.session_bytes)
         target_bytes["next.json"] = b'{"id":"synthetic-new-tokyo-session"}\n'
         (self.sessions / "next.json").write_bytes(target_bytes["next.json"])
-        self.run_body("main use sydney --yes --no-yolo")
+        self.run_body("main use sydney --no-yolo")
         self.assertEqual({p.name: p.read_bytes() for p in self.sessions.iterdir()}, self.session_bytes)
         self.assertEqual({p.name: p.read_bytes() for p in target.iterdir()}, target_bytes)
         self.assertFalse((self.accounts / "sydney/sessions").exists())
@@ -228,43 +248,174 @@ class UseConfirmationTests(unittest.TestCase):
                 for key, value in caches.items():
                     self.assertEqual(restored[key], value)
 
-    def test_no_empty_eof_and_ctrl_c_preserve_all_state(self):
-        for answer in (b"n\n", b"\n", b"\x04", b"\x03", b"unexpected\n"):
+    def test_yolo_no_blank_eof_mean_normal_mode_without_backup_consent(self):
+        for answer in (b"n\n", b"\n", b"\x04", b"unexpected\n"):
             with self.subTest(answer=answer):
-                before = self.snapshot()
-                status, stderr, _ = self.run_pty(["tokyo"], answer)
-                self.assertEqual(status, 130 if answer == b"\x03" else 1, stderr)
-                self.assertNotIn("YOLO?", stderr)
-                self.assertEqual(self.snapshot(), before)
-                self.assertEqual(self.operations(), [])
+                status, stderr, _ = self.run_pty(["tokyo"], yolo_answer=answer)
+                self.assertEqual(status, 0, stderr)
+                self.assert_report(stderr)
+                self.assert_switched()
+                self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
+                self.run_body("main use sydney --no-yolo")
+                self.ops.unlink()
 
-    def test_nonterminal_rejects_without_password_or_consuming_stdin(self):
+    def test_yolo_ctrl_c_cancels_before_mutations(self):
         before = self.snapshot()
-        result = self.run_body(r'''
-ask_password() { printf 'password\n' >> "$OPS"; read -r password; }
-if main use tokyo --yolo; then exit 99; fi
-IFS= read -r remaining
-printf '%s\n' "$remaining"
-''')
-        self.assertEqual(result.stdout, "password-stdin-sentinel\n")
-        self.assertIn("ccacc use tokyo --yes", result.stderr)
-        self.assertIn("does not enable YOLO", result.stderr)
+        status, stderr, _ = self.run_pty(["tokyo"], yolo_answer=b"\x03")
+        self.assertEqual(status, 130, stderr)
+        self.assertNotIn("Backed up outgoing", stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.operations(), [])
 
-    def test_explicit_yes_bypasses_only_backup_confirmation(self):
+    def test_nonterminal_without_yes_password_reads_stdin_once(self):
+        result = self.run_body(r'''
+ask_password() {
+    printf 'password\n' >> "$OPS"
+    IFS= read -r password
+    [ "$password" = password-stdin-sentinel ] || return 98
+}
+main use tokyo
+IFS= read -r remaining
+printf '%s\n' "$remaining"
+''', stdin="password-stdin-sentinel\nremaining-sentinel\n")
+        self.assertTrue(result.stdout.endswith("remaining-sentinel\n"), result.stdout)
+        self.assert_report(result.stderr)
+        self.assert_switched()
+        self.assertEqual(self.operations().count("password"), 1)
+        self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
+
+    def test_explicit_yes_is_compatibility_noop(self):
         result = self.run_body("main use tokyo --yes")
         self.assertNotIn("Confirm outgoing backup", result.stderr)
+        self.assert_report(result.stderr)
         self.assert_switched()
         self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
 
     def test_yes_still_prompts_for_yolo_on_terminal(self):
-        status, stderr, _ = self.run_pty(["tokyo", "--yes"], b"unused\n", yolo_answer=b"n\n")
+        status, stderr, _ = self.run_pty(["tokyo", "--yes"], yolo_answer=b"n\n")
         self.assertEqual(status, 0, stderr)
         self.assertNotIn("Confirm outgoing backup", stderr)
         self.assertIn("YOLO? (y/N)", stderr)
         self.assert_switched()
         self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
+
+    def test_logged_out_named_profile_reports_no_encrypted_login_backup(self):
+        self.credentials.write_text('{"mcpOAuth":{"shared":"shared-secret"}}')
+        result = self.run_body("main use tokyo --no-yolo")
+        self.assertIn("No Claude login to back up (logged out); no encrypted login backup", result.stderr)
+        self.assertNotIn("Encrypted Claude login backup:", result.stderr)
+        self.assertFalse((self.accounts / "sydney.credentials.enc").exists())
+        self.assertIn("Account configuration snapshot:", result.stderr)
+        self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"], {"shared": "shared-secret"})
+
+    def test_logged_out_backup_delete_failure_blocks_switch_and_report(self):
+        self.credentials.write_text('{"mcpOAuth":{"shared":"shared-secret"}}')
+        stale_login = (self.accounts / "sydney.credentials.enc").read_bytes()
+        before = {path: metadata for path, metadata in self.snapshot().items() if metadata[0] is not None}
+        result = self.run_body(r'''
+rm() {
+    if [ "$#" = 2 ] && [ "$1" = -f ] && [ "$2" = "$ACCOUNTS_DIR/sydney.credentials.enc" ]; then
+        printf 'delete_backup_failed\n' >> "$OPS"
+        return 91
+    fi
+    command rm "$@"
+}
+main use tokyo --no-yolo
+''', success=False)
+        self.assertIn("delete_backup_failed", self.operations())
+        for operation in ("load_account", "stash_paths", "report_outgoing_backup", "unstash_paths", "surge"):
+            self.assertNotIn(operation, self.operations())
+        self.assertNotIn("Backed up outgoing", result.stderr)
+        self.assertNotIn("Switched to", result.stdout)
+        self.assertEqual((self.accounts / "sydney.credentials.enc").read_bytes(), stale_login)
+        self.assertEqual({path: metadata for path, metadata in self.snapshot().items() if metadata[0] is not None}, before)
+
+    def test_report_reads_only_metadata_and_leaves_files_unchanged(self):
+        result = self.run_body(r'''
+stash_paths sydney
+read_credentials() { return 98; }
+decrypt_from() { return 99; }
+report_outgoing_backup sydney
+''')
+        self.assert_report(result.stderr)
+        self.assertEqual(self.operations(), ["stash_paths", "report_outgoing_backup"])
+        before = self.snapshot()
+        self.run_body("report_outgoing_backup sydney")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_no_archive_paths_reports_none(self):
+        self.run_body(r'''
+for entry in "${ACCOUNT_PATHS[@]}"; do rm -rf "${entry#*|}"; done
+''')
+        result = self.run_body("main use tokyo --no-yolo")
+        self.assertIn("(none archived)", result.stderr)
+        self.assertIn("Backed up outgoing account to profile 'sydney'", result.stderr)
+
+    def test_clean_unnamed_profile_has_no_outgoing_backup_or_report(self):
+        result = self.run_body(r'''
+rm -f "$ACTIVE_FILE"
+printf '{"mcpServers":{"shared":{}}}' > "$CLAUDE_JSON"
+printf '{"mcpOAuth":{"shared":"shared-secret"}}' > "$CREDENTIALS_FILE"
+for entry in "${ACCOUNT_PATHS[@]}"; do rm -rf "${entry#*|}"; done
+main use tokyo --no-yolo
+''')
+        self.assertNotIn("Backed up outgoing", result.stderr)
+        for operation in ("save_account", "stash_paths", "report_outgoing_backup"):
+            self.assertNotIn(operation, self.operations())
+        for operation in ("password", "stop", "load_account", "unstash_paths", "surge"):
+            self.assertEqual(self.operations().count(operation), 1)
+        self.assertEqual((self.accounts / ".active").read_text(), "tokyo\n")
+
+    def test_backup_failure_blocks_load_stash_report_and_switch_success(self):
+        result = self.run_body('backup_active() { printf "backup_failed\\n" >> "$OPS"; return 91; }; '
+                               'main use tokyo --no-yolo', success=False)
+        self.assertEqual(self.operations(), ["stage", "password", "stop", "backup_failed"])
+        self.assertNotIn("Backed up outgoing", result.stderr)
+        self.assertNotIn("Switched to", result.stdout)
+        self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
+
+    def test_login_save_failure_blocks_load_stash_report(self):
+        result = self.run_body("encrypt_to() { return 91; }; main use tokyo --no-yolo", success=False)
+        self.assertIn("save_account", self.operations())
+        for operation in ("load_account", "stash_paths", "report_outgoing_backup", "unstash_paths", "surge"):
+            self.assertNotIn(operation, self.operations())
+        self.assertNotIn("Backed up outgoing", result.stderr)
+        self.assertNotIn("Switched to", result.stdout)
+
+    def test_stash_failure_blocks_report_and_target_path_restore(self):
+        result = self.run_body('stash_paths() { printf "stash_failed\\n" >> "$OPS"; return 91; }; '
+                               'main use tokyo --no-yolo', success=False)
+        self.assertIn("load_account", self.operations())
+        self.assertEqual(self.operations()[-1], "stash_failed")
+        self.assertNotIn("report_outgoing_backup", self.operations())
+        self.assertNotIn("unstash_paths", self.operations())
+        self.assertNotIn("Backed up outgoing", result.stderr)
+        self.assertNotIn("Switched to", result.stdout)
+        self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
+
+    def test_later_restore_failure_keeps_truthful_backup_report_without_switch_success(self):
+        target = self.accounts / "tokyo/debug"
+        target.mkdir(parents=True)
+        (target / "target-only").write_text("target-history-secret")
+        mode = (self.accounts / ".launch-mode").read_bytes()
+        result = self.run_body(r'''
+unstash_paths() {
+    printf 'unstash_paths\n' >> "$OPS"
+    original_unstash_paths "$@" || return 1
+    return 91
+}
+main use tokyo --no-yolo
+''', success=False)
+        self.assert_report(result.stderr)
+        self.assertNotIn("debug:", result.stderr)
+        self.assertNotIn("Switched to", result.stdout)
+        self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
+        self.assertEqual((self.accounts / ".launch-mode").read_bytes(), mode)
+        self.assertEqual((self.home / ".claude/debug/target-only").read_text(), "target-history-secret")
+        self.assertEqual((self.accounts / "sydney/history.jsonl").read_text(), "latest-history-secret\n")
+        for operation in ("save_account", "load_account", "stash_paths", "report_outgoing_backup", "unstash_paths"):
+            self.assertEqual(self.operations().count(operation), 1)
+        self.assertNotIn("surge", self.operations())
 
     def test_options_in_either_order_and_explicit_yolo(self):
         for args, expected in (("--yes --no-yolo", False), ("--no-yolo --yes", False),
@@ -289,6 +440,7 @@ printf '%s\n' "$remaining"
                   self.accounts / "sydney.json", self.accounts / "sydney.credentials.enc")}
         result = self.run_body("main use sydney --yolo")
         self.assertNotIn("Confirm outgoing backup", result.stderr)
+        self.assertNotIn("Backed up outgoing", result.stderr)
         self.assertEqual({p: p.read_bytes() for p in before}, before)
         self.assertEqual(self.operations(), ["stage"])
         self.assertTrue(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])

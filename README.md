@@ -37,7 +37,7 @@ ccacc save personal --timezone Asia/Shanghai # Save the current login and name i
 ccacc new                                   # Confirm backup, choose optional TZ, log out
 claude /login                               # Login in the unnamed session
 ccacc save work                              # Choose work's saved timezone independently
-ccacc use personal                          # Confirm outgoing backup, choose YOLO, switch
+ccacc use personal                          # Auto-back up outgoing account, choose YOLO, switch
 ccacc use                                   # Pick a saved profile in the terminal
 ccacc list                                  # List profiles; ls is an alias
 ccacc current                               # Show current email and saved name
@@ -93,18 +93,22 @@ inspect modified/orphaned hook files before following repair instructions.
 No-name `use` opens a terminal picker: Up/Down or `j`/`k` moves, Return selects,
 and `q`, Esc, Ctrl-C or EOF cancels. It requires terminal stdin and stderr.
 
-Switching between saved accounts previews the outgoing profile, login backup and
-existing archive paths, including `~/.claude/sessions`, then asks
-`Confirm outgoing backup? (y/N)`. No/blank/EOF cancels before passwords, process
-shutdown or account changes. Noninteractive switches require `--yes`:
+Switching between saved accounts automatically saves the latest outgoing login
+and account configuration, then archives its history/session/cache paths,
+including `~/.claude/sessions`. After saving and archival succeed, it reports the
+outgoing profile, encrypted login backup (or logged-out state), configuration
+snapshot and actual archived paths on stderr, without printing their contents.
+Named noninteractive switches need no backup confirmation:
 
 ```bash
-ccacc use work --yes --no-yolo
-ccacc use work --yes --yolo
+ccacc use work --no-yolo
+ccacc use work --yolo
 ```
 
-`--yes` confirms only the outgoing backup. On a terminal, use separately asks
-`YOLO? (y/N)` unless `--yolo` or `--no-yolo` is explicit. Noninteractive use defaults
+`--yes` is still accepted as a compatibility no-op; it is no longer required,
+never selects a profile and never enables YOLO. On a terminal, use separately asks
+`YOLO? (y/N)` unless `--yolo` or `--no-yolo` is explicit. No/blank/EOF chooses normal
+permissions; Ctrl-C cancels before account changes. Noninteractive use defaults
 to normal permissions. YOLO adds `--dangerously-skip-permissions` to hooked Claude
 launches while that profile is active; caller-supplied flags are still forwarded.
 The choice belongs to the current selection, not the profile backup. Successful
@@ -174,6 +178,8 @@ stay in memory; cleanup does not create plaintext Keychain recovery files.
 
 A late `use` failure can leave some target state applied. Read the error and inspect
 the current account before retrying; the command does not claim a completed switch.
+An earlier outgoing-backup report describes the saved backup only; it does not
+mean that the target restore or switch completed.
 
 ## Development checks
 

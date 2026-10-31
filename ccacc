@@ -111,7 +111,7 @@ Commands:
                         Back up the current account and its timezone
   timezone [name]       Print the current session TZ or a named account's saved TZ
   use [name] [--yes] [--yolo|--no-yolo]
-                        Pick a saved account, confirm backup, and choose launch mode
+                        Pick a saved account, back up outgoing data, choose launch mode
   new
                         Confirm prior backup, optionally choose TZ, then clean/logout
                         (logged out; run 'claude /login', then 'ccacc save <name>')
@@ -130,8 +130,8 @@ With Surge installed, save asks which policies the account uses and use applies 
 without Surge no policy selection is asked.
 Install/reinstall with: $INSTALL_COMMAND
 Only use requires the installed shell hook; save/new never install or repair it.
-Switching away from a saved account previews its backup and asks to proceed (y/N).
-Noninteractive switches between saved accounts require --yes to confirm that backup.
+Switching away from a saved account automatically backs it up and reports saved contents.
+Named noninteractive use needs no --yes; --yes remains a compatibility no-op.
 --yes never enables YOLO. Saved timezone and Surge choices stay unchanged.
 Without a name, use requires a terminal: arrows or j/k move, Return selects,
 q, Esc, Ctrl-C or EOF cancel. --yes never automatically selects a profile.
@@ -673,7 +673,7 @@ write_backup() {
     fi
 
     if [ -z "$content" ]; then
-        delete_backup "$name" "$kind"
+        delete_backup "$name" "$kind" || return 1
         return 0
     fi
 
@@ -1171,34 +1171,29 @@ save_command() (
     echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
 )
 
-# Preview metadata only: never fetch credentials or print account/config values.
-confirm_outgoing_backup() {
-    local outgoing="$1" incoming="$2" entry path found=false answer=''
-    if [ ! -t 0 ] || [ ! -t 2 ]; then
-        printf "Error: Switching from '%s' to '%s' saves the current account to profile '%s'.\n" \
-            "$outgoing" "$incoming" "$outgoing" >&2
-        printf "Run '%s use %s --yes' to confirm the outgoing backup (--yes does not enable YOLO).\n" \
-            "$SCRIPT_NAME" "$incoming" >&2
-        return 1
+# Completed backup metadata only: inspect the outgoing stash, never live target
+# paths or credential/config values. Call only after save_account and stash_paths succeed.
+report_outgoing_backup() {
+    local outgoing="$1" stash="$ACCOUNTS_DIR/$1" entry label path found=false
+    printf "Backed up outgoing account to profile '%s'.\n" "$outgoing" >&2
+    printf 'Saved contents:\n' >&2
+    if [ -f "$ACCOUNTS_DIR/$outgoing.credentials.enc" ]; then
+        printf '  - Encrypted Claude login backup: ~/.claude/accounts/%s.credentials.enc\n' "$outgoing" >&2
+    else
+        printf '  - No Claude login to back up (logged out); no encrypted login backup.\n' >&2
     fi
-    printf "Will save the current account to profile '%s', then switch to '%s'.\n" "$outgoing" "$incoming" >&2
-    printf 'Saved contents:\n  - Encrypted Claude login credentials (claudeAiOauth only).\n' >&2
-    printf '  - Existing account history/session/cache paths:\n' >&2
+    printf '  - Account configuration snapshot: ~/.claude/accounts/%s.json\n' "$outgoing" >&2
+    printf '  - Archived account history/session/cache paths:\n' >&2
     for entry in "${ACCOUNT_PATHS[@]}"; do
-        path="${entry#*|}"
+        label="${entry%%|*}"
+        path="$stash/$label"
         if [ -e "$path" ] || [ -L "$path" ]; then
-            printf '      %s\n' "~${path#"$HOME"}" >&2
+            printf '      %s: %s\n' "$label" "~${path#"$HOME"}" >&2
             found=true
         fi
     done
-    if [ "$found" = false ]; then printf '      (none present)\n' >&2; fi
-    printf 'Active files/directories move into ~/.claude/accounts/%s/ stash; they are not copied.\n' "$outgoing" >&2
-    printf 'Saved timezone (TZ) and Surge choices remain unchanged.\nConfirm outgoing backup? (y/N) ' >&2
-    if { IFS= read -r answer < /dev/tty; } 2>/dev/null; then
-        case "$answer" in y|Y|[yY][eE][sS]) return 0 ;; esac
-    fi
-    printf "Switch cancelled; profile '%s' remains active.\n" "$outgoing" >&2
-    return 1
+    if [ "$found" = false ]; then printf '      (none archived)\n' >&2; fi
+    printf 'Saved timezone (TZ) and Surge choices remain unchanged.\n' >&2
 }
 
 # Shared by discovery and the final selected-target check; never reads credentials.
@@ -1222,7 +1217,7 @@ pick_saved_account() (
     # confined to the picker subshell and keeps Bash's elapsed-time variable.
     SECONDS=0
     if [ ! -t 0 ] || [ ! -t 2 ]; then
-        echo "Error: ccacc use without a name requires a terminal; use 'ccacc use <name> [--yes] [--yolo|--no-yolo]'" >&2
+        echo "Error: ccacc use without a name requires a terminal; use 'ccacc use <name> [--yolo|--no-yolo]'" >&2
         return 1
     fi
     command -v jq >/dev/null 2>&1 || { echo "Error: jq is required" >&2; return 1; }
@@ -1366,12 +1361,12 @@ pick_saved_account() (
 
 # Function to switch to a saved account
 use_command() (
-    local name='' name_seen=false zone active mode=false answer='' staged_mode='' mode_option='' backup_confirmed=false status
+    local name='' name_seen=false zone active mode=false answer='' staged_mode='' mode_option='' yes_seen=false status
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --yes)
-                [ "$backup_confirmed" = false ] || { echo "Error: Duplicate --yes" >&2; return 1; }
-                backup_confirmed=true ;;
+                [ "$yes_seen" = false ] || { echo "Error: Duplicate --yes" >&2; return 1; }
+                yes_seen=true ;;
             --yolo|--no-yolo)
                 [ -z "$mode_option" ] || { echo "Error: Duplicate or conflicting launch mode options" >&2; return 1; }
                 mode_option="$1"
@@ -1412,9 +1407,6 @@ use_command() (
         echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
         return 1
     fi
-    if [ -n "$active" ] && [ "$active" != "$name" ] && [ "$backup_confirmed" = false ]; then
-        confirm_outgoing_backup "$active" "$name" || return 1
-    fi
     # Validate and stage this session record before passwords or process/account
     # mutations. A failed selection leaves the previous launch mode untouched.
     _ccacc_shell_path "$LAUNCH_MODE_FILE" file && cleanup_file_is_writable "$LAUNCH_MODE_FILE" || {
@@ -1442,7 +1434,10 @@ use_command() (
     note_device_keys
     if [ -n "$active" ]; then backup_active || return 1; fi
     load_account "$name" || return 1
-    if [ -n "$active" ]; then stash_paths "$active" || return 1; fi
+    if [ -n "$active" ]; then
+        stash_paths "$active" || return 1
+        report_outgoing_backup "$active"
+    fi
     unstash_paths "$name" || return 1
     echo "$name" > "$ACTIVE_FILE" || return 1
     rm -f "$LEGACY_PENDING_TIMEZONE_FILE" || return 1

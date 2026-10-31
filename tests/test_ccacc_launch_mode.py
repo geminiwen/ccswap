@@ -47,7 +47,7 @@ stash_paths() { :; }
 unstash_paths() { :; }
 apply_surge() { :; }
 '''
-        code += extra + "\nmain use " + shlex.quote(target) + " --yes"
+        code += extra + "\nmain use " + shlex.quote(target)
         stdout_path = self.fixture.fixture / "selection.stdout"
         pid, master = pty.fork()
         if pid == 0:

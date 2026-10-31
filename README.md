@@ -142,9 +142,8 @@ creating an empty profile. An unsaved Claude OAuth login or unowned history must
 first be preserved with `save <name>`; `use` refuses to discard it.
 
 When switching between saved accounts, `use` previews the outgoing profile name,
-incoming target, encrypted Claude login backup (`claudeAiOauth` only), names of
-the account-bound `~/.claude.json` keys present, and existing account history,
-session and cache paths. The preview displays no values and never fetches login
+incoming target, encrypted Claude login backup (`claudeAiOauth` only), and existing
+account history, session and cache paths. The preview displays no values and never fetches login
 credentials.
 It asks `Confirm outgoing backup? (y/N)` through the terminal before asking for a
 password, staging launch mode, stopping processes or changing accounts. Only `y`

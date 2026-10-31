@@ -152,7 +152,7 @@ class UseConfirmationTests(unittest.TestCase):
         self.assertEqual(status, 0, stderr + stdout)
         self.assertIn("profile 'sydney', then switch to 'tokyo'", stderr)
         self.assertIn("Encrypted Claude login credentials (claudeAiOauth only)", stderr)
-        self.assertIn("userID, numStartups, projects (names only; no values)", stderr)
+        self.assertNotIn("Account-bound ~/.claude.json keys present:", stderr)
         for path in ("~/.claude/history.jsonl", "~/.claude/feedback/drafts", "~/.claude/plans",
                      "~/Library/Caches/claude-cli-nodejs"):
             self.assertIn(path, stderr)

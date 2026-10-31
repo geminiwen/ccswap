@@ -1107,7 +1107,7 @@ save_command() (
 
 # Preview metadata only: never fetch credentials or print account/config values.
 confirm_outgoing_backup() {
-    local outgoing="$1" incoming="$2" keys entry path found=false answer=''
+    local outgoing="$1" incoming="$2" entry path found=false answer=''
     if [ ! -t 0 ] || [ ! -t 2 ]; then
         printf "Error: Switching from '%s' to '%s' saves the current account to profile '%s'.\n" \
             "$outgoing" "$incoming" "$outgoing" >&2
@@ -1115,12 +1115,8 @@ confirm_outgoing_backup() {
             "$SCRIPT_NAME" "$incoming" >&2
         return 1
     fi
-    keys=$(jq -r --argjson keys "$ACCOUNT_KEYS" \
-        '[keys_unsorted[] | select(. as $key | $keys | index($key))] | join(", ")' \
-        "$CLAUDE_JSON") || return 1
     printf "Will save the current account to profile '%s', then switch to '%s'.\n" "$outgoing" "$incoming" >&2
     printf 'Saved contents:\n  - Encrypted Claude login credentials (claudeAiOauth only).\n' >&2
-    printf '  - Account-bound ~/.claude.json keys present: %s (names only; no values).\n' "${keys:-none}" >&2
     printf '  - Existing account history/session/cache paths:\n' >&2
     for entry in "${ACCOUNT_PATHS[@]}"; do
         path="${entry#*|}"

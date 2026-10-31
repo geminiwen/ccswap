@@ -1,0 +1,17 @@
+# Managed by ccacc. Account timezone is resolved on every launch.
+unalias claude 2>/dev/null || :
+function __ccacc_launch { (
+    __ccacc_tz=$(command bash @SCRIPT@ timezone) || {
+        printf '%s\n' 'ccacc: cannot read the active account timezone; configure it before launching Claude' >&2
+        return 1
+    }
+    case "$__ccacc_tz" in
+        ''|/*|*..*|*[!A-Za-z0-9_+/-]*)
+            printf '%s\n' 'ccacc: invalid or missing active account timezone' >&2; return 1 ;;
+    esac
+    if [ ! -f "/usr/share/zoneinfo/$__ccacc_tz" ] && [ ! -f "/var/db/timezone/zoneinfo/$__ccacc_tz" ]; then
+        printf '%s\n' 'ccacc: unknown active account timezone' >&2; return 1
+    fi
+    @COMMAND@
+) }
+alias claude='__ccacc_launch'

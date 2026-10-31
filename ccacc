@@ -14,6 +14,7 @@ set -e
 
 SCRIPT_NAME="ccacc"
 VERSION="0.1.0"
+INSTALL_COMMAND="curl -fsSL https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash"
 
 # Always the default config dir, whatever CLAUDE_CONFIG_DIR says
 CONFIG_DIR="$HOME/.claude"
@@ -26,7 +27,7 @@ ACCOUNTS_DIR="$CONFIG_DIR/accounts"
 # Hidden names cannot pass check_name, keeping metadata separate from account stashes.
 ALIASES_DIR="$ACCOUNTS_DIR/.aliases"
 TIMEZONES_DIR="$ACCOUNTS_DIR/.timezones"
-PENDING_TIMEZONE_FILE="$ACCOUNTS_DIR/.pending-timezone"
+LEGACY_PENDING_TIMEZONE_FILE="$ACCOUNTS_DIR/.pending-timezone"
 ACTIVE_FILE="$ACCOUNTS_DIR/.active"
 CLEANUP_RECOVERY_DIR="$ACCOUNTS_DIR/.cleanup-recovery"
 CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
@@ -98,16 +99,10 @@ Commands:
   alias <name> [alias-name]
                         Back up an existing shell alias (optional, never executed)
   timezone [name]       Print the saved TZ only (defaults to the active account)
-  timezone <name> <ZONE>
-                        Set the account timezone without accessing credentials
-  install               Install/repair the dynamic Claude shell hook (no account needed)
-  configure-shell [name]
-                        Deprecated explicit alias for install; account is ignored
   use <name>            Back up the active account, then switch to <name>
-  new [--timezone <ZONE>]
+  new
                         Confirm prior backup, then clean to an unnamed logged-out session
                         (logged out; run 'claude /login', then 'ccacc save <name>')
-  surge <name>          Choose the Surge policies <name> uses (e.g. its own exit for the Claude group)
   rm <name>             Delete a saved account and its saved history
   help                  Show this help message
   -v, --version         Show version information
@@ -121,10 +116,11 @@ Login backups use one master password for save/use. New never saves credentials.
 Folders are moved, not copied, so switching is instant.
 With Surge installed, save asks which policies the account uses and use applies them;
 without Surge no policy selection is asked.
-Run '$SCRIPT_NAME install' once before save/new/use; these commands only check setup.
-Save reuses a named or pending timezone; new requires an explicit fresh-session choice.
-An already-clean pending session can reuse its selected timezone. Both accept --timezone <ZONE>.
-First setup requires a numbered timezone choice or custom IANA entry, with no default.
+Install/reinstall with: $INSTALL_COMMAND
+Only use requires the installed shell hook; save/new never install or repair it.
+Only save records a timezone; use 'save <name> --timezone <ZONE>' to change it.
+New clears the active timezone. Unnamed sessions launch Claude with TZ unset.
+First save requires a numbered timezone choice or custom IANA entry, with no default.
 Invalid or unanswered choices fail before account changes. Aliases never choose TZ.
 
 Left alone: CLAUDE_CONFIG_DIR, suffixed keychain items, the shared Cowork device keys,
@@ -133,9 +129,9 @@ Switching stops all Claude Code
 processes owned by the current user, including those using another config dir.
 
 Examples:
-  $SCRIPT_NAME install
+  $INSTALL_COMMAND
   $SCRIPT_NAME save personal
-  $SCRIPT_NAME new --timezone UTC
+  $SCRIPT_NAME new
   claude /login
   $SCRIPT_NAME save work
   $SCRIPT_NAME use personal
@@ -275,29 +271,17 @@ read_timezone_file() {
 timezone_command() {
     local name="${1:-}"
     if [ -z "$name" ]; then
-        [ ! -e "$CLEANUP_RECOVERY_DIR" ] || return 1
-        name=$(active_account)
-        if [ -z "$name" ]; then
-            read_timezone_file "$PENDING_TIMEZONE_FILE"
-            return $?
-        fi
+        [ ! -e "$CLEANUP_RECOVERY_DIR" ] && [ ! -L "$CLEANUP_RECOVERY_DIR" ] || return 1
+        # Exit 3 means a legitimate unnamed session, never corrupt metadata.
+        # The generated hook uses it to unset TZ without prompting or writing.
+        [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] && return 3
+        [ -f "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] || return 1
+        name=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z")) | rtrimstr("\n")' "$ACTIVE_FILE" 2>/dev/null) || return 1
+        [ -f "$ACCOUNTS_DIR/$name.json" ] && [ ! -L "$ACCOUNTS_DIR/$name.json" ] || return 1
+        jq -se 'length == 1 and (.[0] | type) == "object"' "$ACCOUNTS_DIR/$name.json" >/dev/null 2>&1 || return 1
     fi
     check_name "$name" >/dev/null 2>&1 || return 1
     read_timezone_file "$TIMEZONES_DIR/$name"
-}
-
-# A pending zone belongs to an explicitly selected unnamed login session.
-set_pending_timezone() {
-    local zone="$1" temporary
-    valid_timezone "$zone" || return 1
-    _ccacc_shell_path "$PENDING_TIMEZONE_FILE" file || return 1
-    mkdir -p -m 700 "$ACCOUNTS_DIR" || return 1
-    temporary=$(mktemp "$ACCOUNTS_DIR/.pending.XXXXXXXX") || return 1
-    if ! printf '%s\n' "$zone" > "$temporary" || ! chmod 600 "$temporary" \
-        || ! mv -f "$temporary" "$PENDING_TIMEZONE_FILE"; then
-        rm -f "$temporary"
-        return 1
-    fi
 }
 
 # An explicit first-setup choice only; never infer a zone from the environment,
@@ -345,14 +329,7 @@ set_timezone() {
 
 # Locate the companion beside the deployed core, independently of credentials.
 load_shell_companion() {
-    local source_path="${BASH_SOURCE[0]}" directory library shell="${SHELL:-/bin/bash}"
-    case "$shell" in
-        */bash|*/zsh|bash|zsh) ;;
-        *) echo "Error: Shell configuration supports only Bash and Zsh" >&2; return 1 ;;
-    esac
-    command -v "$shell" >/dev/null 2>&1 || {
-        echo "Error: Shell executable is unavailable: $shell" >&2; return 1;
-    }
+    local source_path="${BASH_SOURCE[0]}" directory library
     command -v jq >/dev/null 2>&1 || { echo "Error: jq is required for shell configuration" >&2; return 1; }
     directory=$(cd -- "$(dirname -- "$source_path")" && pwd -P) || return 1
     CCACC_ABSOLUTE_SCRIPT="$directory/$(basename -- "$source_path")"
@@ -371,9 +348,8 @@ load_shell_companion() {
 # Read-only installation check before prompts, passwords or account changes.
 require_shell_hook() {
     local SHELL="${SHELL:-/bin/bash}"
-    load_shell_companion || return 1
-    if ! ccacc_check_shell_hook "$CCACC_ABSOLUTE_SCRIPT"; then
-        echo "Error: Shell hook is not installed correctly; run '$SCRIPT_NAME install' first; account unchanged" >&2
+    if ! load_shell_companion || ! ccacc_check_shell_hook "$CCACC_ABSOLUTE_SCRIPT"; then
+        echo "Error: Shell hook is not installed correctly; reinstall with: $INSTALL_COMMAND; account unchanged" >&2
         return 1
     fi
 }
@@ -419,11 +395,14 @@ prepare_account_metadata() {
     command -v jq >/dev/null || return 1
     zone="$requested_zone"
     if [ -z "$zone" ]; then zone=$(timezone_command "$name") || zone=""; fi
-    if [ -z "$zone" ] && [ ! -e "$TIMEZONES_DIR/$name" ] && [ -z "$(active_account)" ]; then
-        zone=$(read_timezone_file "$PENDING_TIMEZONE_FILE") || zone=""
-    fi
     if [ -z "$zone" ]; then zone=$(choose_timezone "$name") || return 1; fi
     PREPARED_TIMEZONE="$zone"
+    # A save is allowed before installation or while the hook needs repair.
+    # Never let its optional login-shell alias probe source an unverified hook.
+    if [ -e "$HOME/.ccacc-shell" ] && ! ccacc_check_shell_hook "$CCACC_ABSOLUTE_SCRIPT" >/dev/null 2>&1; then
+        echo "Warning: Skipping alias backup until the shell hook is reinstalled" >&2
+        return 0
+    fi
     if ! PREPARED_ALIAS=$(probe_alias "$PREPARED_ALIAS_NAME"); then
         echo "Warning: Could not query shell alias; backup unchanged" >&2
         PREPARED_ALIAS=""
@@ -1011,9 +990,10 @@ apply_surge() {
 
 # Function to print the active account name (empty if none)
 active_account() {
-    [ ! -e "$CLEANUP_RECOVERY_DIR" ] || return 0
+    [ ! -e "$CLEANUP_RECOVERY_DIR" ] && [ ! -L "$CLEANUP_RECOVERY_DIR" ] || return 0
     if [ -f "$ACTIVE_FILE" ]; then
-        local name=$(cat "$ACTIVE_FILE")
+        local name
+        name=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z")) | rtrimstr("\n")' "$ACTIVE_FILE" 2>/dev/null) || return 0
         if check_name "$name" >/dev/null 2>&1 && [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
             echo "$name"
         fi
@@ -1081,7 +1061,7 @@ show_current() {
 # Function to save the current account as <name>
 save_command() {
     local name="${1:-}"
-    require_shell_hook || return 1
+    load_shell_companion || return 1
     cleanup_is_complete || return 1
     prepare_account_metadata "$@" || return 1
     check_ready || return 1
@@ -1090,7 +1070,7 @@ save_command() {
 
     save_account "$name" || return 1
     printf '%s\n' "$name" > "$ACTIVE_FILE" || return 1
-    rm -f "$PENDING_TIMEZONE_FILE" || return 1
+    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" || return 1
     echo -e "${GREEN}Saved Claude account ($(current_email)) as: ${name}${NC}"
 
     if [ ! -f "$ACCOUNTS_DIR/${name}.surge" ]; then
@@ -1112,7 +1092,7 @@ use_command() {
     fi
 
     zone=$(timezone_command "$name") || {
-        echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME timezone $name <ZONE>' first" >&2
+        echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME save $name --timezone <ZONE>' first" >&2
         return 1
     }
     check_ready || return 1
@@ -1123,9 +1103,9 @@ use_command() {
         return 0
     fi
 
-    # A clean pending session has nothing to back up. An unsaved login or
+    # A clean unnamed session has nothing to back up. An unsaved login or
     # history must be named first, before passwords/processes or any writes.
-    if [ -z "$active" ] && ! clean_pending_session; then
+    if [ -z "$active" ] && ! clean_unnamed_session; then
         echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
         return 1
     fi
@@ -1137,7 +1117,7 @@ use_command() {
     if [ -n "$active" ]; then stash_paths "$active" || return 1; fi
     unstash_paths "$name" || return 1
     echo "$name" > "$ACTIVE_FILE" || return 1
-    rm -f "$PENDING_TIMEZONE_FILE" || return 1
+    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" || return 1
     echo -e "${GREEN}Switched to Claude account: ${name} ($(current_email))${NC}"
     apply_surge "$name"
 }
@@ -1241,9 +1221,9 @@ cleanup_is_complete() {
     fi
 }
 
-clean_pending_session() {
+clean_unnamed_session() {
     local credentials path entry
-    read_timezone_file "$PENDING_TIMEZONE_FILE" >/dev/null || return 1
+    [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] || return 1
     credentials=$(read_credentials) && credentials=$(claude_login_only "$credentials") || return 1
     [ "$credentials" = '{}' ] || return 1
     if [ -f "$CREDENTIALS_FILE" ]; then
@@ -1303,7 +1283,7 @@ cleanup_stage_and_reset() {
         done
     fi
     metadata_attempted=yes
-    set_pending_timezone "$zone" && rm -f "$ACTIVE_FILE"
+    rm -f "$LEGACY_PENDING_TIMEZONE_FILE" && rm -f "$ACTIVE_FILE"
 }
 
 cleanup_restore_snapshot() {
@@ -1334,7 +1314,7 @@ cleanup_rollback() {
     if [ -n "$config_attempted" ]; then cleanup_restore_snapshot config.json "$CLAUDE_JSON" || failed=yes; fi
     if [ -n "$metadata_attempted" ]; then
         cleanup_restore_snapshot active "$ACTIVE_FILE" || failed=yes
-        cleanup_restore_snapshot pending-timezone "$PENDING_TIMEZONE_FILE" || failed=yes
+        cleanup_restore_snapshot pending-timezone "$LEGACY_PENDING_TIMEZONE_FILE" || failed=yes
     fi
     if [ -z "$failed" ] && rm -rf -- "$CLEANUP_RECOVERY_DIR"; then
         echo "Error: Account cleanup failed; previous account, credentials and history restored" >&2
@@ -1346,30 +1326,19 @@ cleanup_rollback() {
 
 # Full current-account cleanup after explicit backup confirmation; never auto-save.
 new_command() {
-    local active confirmation zone='' pending='' zone_seen='' credentials entry path label
+    local active confirmation credentials entry path label
     local optional_credentials='' optional_existed='' credentials_attempted='' config_attempted='' metadata_attempted=''
     local index destination
     local -a cleanup_paths staged_locations
-    require_shell_hook || return 1
+    load_shell_companion || return 1
     cleanup_is_complete || return 1
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --timezone)
-                [ "$#" -ge 2 ] && [ -z "$zone_seen" ] || {
-                    echo "Error: --timezone requires one value and may appear only once" >&2; return 1;
-                }
-                zone="$2"
-                valid_timezone "$zone" || { echo "Error: Invalid timezone" >&2; return 1; }
-                zone_seen=yes; shift 2 ;;
-            *) echo "Error: new accepts only [--timezone <ZONE>]; name a profile with 'ccacc save <name>'" >&2; return 1 ;;
-        esac
-    done
+    [ "$#" -eq 0 ] || { echo "Error: new accepts no arguments; choose timezone with 'ccacc save <name> --timezone <ZONE>'" >&2; return 1; }
     printf "Have you already run '$SCRIPT_NAME save <name>' to back up this account? (y/N): " >&2
     if ! IFS= read -r confirmation; then confirmation=''; fi
     case "$confirmation" in y|Y|yes) ;; *) echo "Cleanup cancelled; run '$SCRIPT_NAME save <name>' first." >&2; return 1 ;; esac
     # Validate the entire bounded cleanup set, including optional credentials,
     # before stopping processes or modifying any account/session metadata.
-    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$PENDING_TIMEZONE_FILE"; do
+    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE"; do
         _ccacc_shell_path "$path" file || { echo "Error: Unsafe cleanup path; cleanup incomplete: $path" >&2; return 1; }
     done
     if [ -f "$CLAUDE_JSON" ]; then
@@ -1419,7 +1388,7 @@ new_command() {
     # No probe writes: permission and ancestor checks are read-only. Check all
     # metadata/config/stash destinations before any irreversible work begins.
     _ccacc_shell_path "$CLEANUP_RECOVERY_DIR" dir || return 1
-    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$PENDING_TIMEZONE_FILE"; do
+    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE"; do
         cleanup_file_is_writable "$path" || { echo "Error: Cleanup destination is not writable: $path" >&2; return 1; }
     done
     cleanup_parent_is_writable "$CLEANUP_RECOVERY_DIR/data" || return 1
@@ -1435,9 +1404,6 @@ new_command() {
             }
         done
     fi
-    if [ -z "$(active_account)" ]; then pending=$(read_timezone_file "$PENDING_TIMEZONE_FILE") || pending=''; fi
-    [ -n "$zone" ] || zone=$pending
-    if [ -z "$zone" ]; then zone=$(choose_timezone 'unnamed session') || return 1; fi
     cleanup_stop_processes && cleanup_runtime_is_safe || {
         echo "Error: Live or unverifiable processes/runtime owners; cleanup incomplete" >&2; return 1;
     }
@@ -1447,7 +1413,7 @@ new_command() {
     # process exits or rollback fails. Its manifest contains paths, never secrets.
     mkdir -m 700 "$CLEANUP_RECOVERY_DIR" || return 1
     if ! mkdir -m 700 "$CLEANUP_RECOVERY_DIR/data"; then return 1; fi
-    for entry in "config.json|$CLAUDE_JSON" "active|$ACTIVE_FILE" "pending-timezone|$PENDING_TIMEZONE_FILE"; do
+    for entry in "config.json|$CLAUDE_JSON" "active|$ACTIVE_FILE" "pending-timezone|$LEGACY_PENDING_TIMEZONE_FILE"; do
         label=${entry%%|*}; path=${entry#*|}
         if [ -f "$path" ] && ! cp -p "$path" "$CLEANUP_RECOVERY_DIR/$label"; then
             rm -rf -- "$CLEANUP_RECOVERY_DIR"
@@ -1478,25 +1444,10 @@ new_command() {
     echo "Run 'claude /login', then '$SCRIPT_NAME save <name>' to name and save it."
 }
 
-# Function to (re)choose the Surge policies of an account; applied right away when it is active
+# Compatibility redirect: only save records per-profile metadata.
 surge_command() {
-    local name="$1"
-    check_name "$name"
-    check_ready
-
-    if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
-        echo -e "${RED}Error: Account '${name}' not found${NC}"
-        return 1
-    fi
-    if ! find_surge; then
-        echo -e "${RED}Error: Surge is not installed${NC}"
-        return 1
-    fi
-
-    setup_surge "$name"
-    if [ "$(active_account)" = "$name" ]; then
-        apply_surge "$name"
-    fi
+    echo "Error: Surge policies are recorded by '$SCRIPT_NAME save ${1:-<name>}'" >&2
+    return 1
 }
 
 # Function to delete a saved account
@@ -1553,18 +1504,18 @@ main() {
         timezone)
             [ "$#" -le 3 ] || return 1
             if [ "$#" -eq 3 ]; then
-                set_timezone "$2" "$3"
+                echo "Error: timezone is read-only; use '$SCRIPT_NAME save $2 --timezone <ZONE>'" >&2
+                return 1
             else
                 timezone_command "${2:-}"
             fi
             ;;
         install)
-            [ "$#" -eq 1 ] || { echo "Error: install accepts no arguments" >&2; return 1; }
-            configure_shell_command
+            echo "Error: Install/reinstall ccacc with: $INSTALL_COMMAND" >&2
+            return 1
             ;;
         configure-shell)
             [ "$#" -le 2 ] || { echo "Error: configure-shell accepts at most one account" >&2; return 1; }
-            echo "Warning: configure-shell is deprecated; use '$SCRIPT_NAME install' (account argument ignored)" >&2
             configure_shell_command
             ;;
         use)

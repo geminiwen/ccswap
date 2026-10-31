@@ -72,6 +72,8 @@ exec /bin/{shell} {'--noprofile --norc' if shell == 'bash' else '-f'} -c '. "$AL
         mocks = '''
 ask_password() { MASTER_PASSWORD=fixture-only; }
 require_shell_hook() { :; }
+load_shell_companion() { :; }
+ccacc_check_shell_hook() { return 1; }
 cleanup_stop_processes() { stop_claude; }
 cleanup_runtime_is_safe() { :; }
 _ccacc_shell_path() { :; }
@@ -92,6 +94,10 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
 
     def metadata(self, name="example"):
         return json.loads(self.metadata_path(name).read_text())
+
+    def seed_timezone(self, name, zone):
+        self.timezones.mkdir(exist_ok=True)
+        (self.timezones / name).write_text(zone + "\n")
 
     def test_bash_and_zsh_capture_exact_definition_without_execution(self):
         self.alias_metadata.rmdir()
@@ -136,7 +142,7 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         self.define("example", "TZ=UTC claude")
         self.run_cli("alias", "example")
         self.run_cli("timezone", success=False)
-        self.run_cli("timezone", "example", "UTC")
+        self.seed_timezone("example", "UTC")
         (self.accounts / "example.json").write_text("{}")
         (self.accounts / ".active").write_text("example\n")
         self.assertEqual(self.run_cli("timezone").stdout, "UTC\n")
@@ -150,7 +156,7 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
         (self.home / ".claude.json").write_text("{}")
         self.define("emocode", "TZ=Australia/Sydney claude")
         self.run_cli("alias", "emocode")
-        self.run_cli("timezone", "emocode", "Australia/Sydney")
+        self.seed_timezone("emocode", "Australia/Sydney")
         dynamic = 'TZ="$(_claude_timezone)" claude "$HOME/fixture"'
         with self.aliases.open("a") as handle:
             handle.write('_claude_timezone() { touch "$HOME/executed"; printf UTC; }\n')
@@ -171,7 +177,7 @@ kill() { printf 'kill\\n' >> "$FORBIDDEN"; return 98; }
             (self.accounts / (name + ".json")).write_text("{}")
             self.define(name, "TZ=" + zone + " claude")
             self.run_cli("alias", name)
-            self.run_cli("timezone", name, zone)
+            self.seed_timezone(name, zone)
         history = self.home / ".claude/history.jsonl"
         history.write_text("foo history\n")
         (self.accounts / ".active").write_text("foo\n")
@@ -251,7 +257,7 @@ main use foo
         self.assertTrue((self.alias_metadata / "example.json").exists())
         (self.accounts / "example.alias.json").write_text("{}")
         self.run_cli("alias", "example.alias", "example")
-        self.run_cli("timezone", "example.alias", "UTC")
+        self.seed_timezone("example.alias", "UTC")
         (self.accounts / ".active").write_text("example.alias\n")
         self.assertEqual(self.run_cli("timezone").stdout, "UTC\n")
         self.assertIn("example.alias", self.run_cli("ls").stdout)
@@ -260,7 +266,7 @@ main use foo
     def test_removal_cleans_only_target_metadata(self):
         (self.home / ".claude.json").write_text("{}")
         for name in ("example", "other"):
-            self.run_cli("timezone", name, "UTC")
+            self.seed_timezone(name, "UTC")
             (self.accounts / (name + ".json")).write_text("{}")
             (self.alias_metadata / (name + ".json")).write_text("fixture-metadata")
             (self.accounts / (name + ".surge")).write_text("{}")
@@ -355,14 +361,15 @@ save_account() { printf 'save\\n' >> "$FORBIDDEN"; return 98; }
         self.run_harness(forbidden + 'main save target --timezone UTC --alias', success=False)
         self.assertFalse(self.probes.exists())
 
-    def test_timezone_setter_is_independent_and_query_prefers_valid_selection(self):
-        self.run_cli("timezone", "example", "Australia/Sydney")
+    def test_timezone_setter_is_rejected_and_query_remains_readonly(self):
+        self.seed_timezone("example", "Australia/Sydney")
         self.assertFalse(self.probes.exists())
         self.assertFalse(self.metadata_path().exists())
         self.assertEqual(self.run_cli("timezone", "example").stdout, "Australia/Sydney\n")
         before = (self.timezones / "example").read_bytes()
-        for zone in ("", "Invalid/Zone", "../UTC", "UTC\n", "$(touch nope)"):
-            self.run_cli("timezone", "example", zone, success=False)
+        for zone in ("UTC", "", "Invalid/Zone", "../UTC", "UTC\n", "$(touch nope)"):
+            result = self.run_cli("timezone", "example", zone, success=False)
+            self.assertIn("save example --timezone", result.stderr)
             self.assertEqual((self.timezones / "example").read_bytes(), before)
         self.run_cli("timezone", ".timezones", "UTC", success=False)
         self.define("example", "TZ=Asia/Tokyo claude")
@@ -374,10 +381,12 @@ save_account() { printf 'save\\n' >> "$FORBIDDEN"; return 98; }
         self.metadata_path().unlink()
         self.assertEqual(self.run_cli("timezone", "example", success=False).stdout, "")
 
-    def test_new_saves_explicit_pending_timezone_after_confirmed_clean(self):
+    def test_new_never_selects_timezone_and_clears_legacy_pending_selection(self):
         (self.home / ".claude.json").write_text("{}")
         (self.accounts / "original.json").write_text("{}")
         (self.accounts / ".active").write_text("original\n")
+        legacy = self.accounts / ".pending-timezone"
+        legacy.write_text("Australia/Sydney\n")
         self.run_harness('''
 stop_claude() { :; }
 stash_paths() { :; }
@@ -385,15 +394,18 @@ reset_account_state() { :; }
 replace_credentials() {
     printf 'cleared' > "$HOME/credential-change"
 }
-main new --timezone Australia/Sydney
+main new
 ''', stdin="yes\n")
         self.assertEqual((self.home / "credential-change").read_text(), "cleared")
         self.assertFalse((self.accounts / ".active").exists())
-        self.assertEqual(self.run_cli("timezone").stdout, "Australia/Sydney\n")
+        result = self.run_cli("timezone", success=False)
+        self.assertEqual((result.returncode, result.stdout), (3, ""))
+        self.assertFalse(legacy.exists())
         self.assertFalse((self.accounts / "fresh.json").exists())
-        # Repeating an already-clean session reuses the explicit pending choice.
+        # Repeating cleanup never asks for or writes any timezone selection.
         self.run_harness("stop_claude() { :; }; replace_credentials() { :; }; reset_account_state() { :; }; main new", stdin="yes\n")
-        self.assertEqual(self.run_cli("timezone").stdout, "Australia/Sydney\n")
+        self.assertEqual(self.run_cli("timezone", success=False).returncode, 3)
+        self.assertFalse(self.timezones.exists())
 
     def test_probe_failure_preserves_backup(self):
         (self.alias_metadata / "example.json").write_text("fixture-unchanged")

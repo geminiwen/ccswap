@@ -30,14 +30,15 @@ class ShellHookTests(unittest.TestCase):
         self.ccacc.write_text(
             '#!/bin/bash\n[ "$1" = timezone ] || exit 3\n'
             'printf "called\\n" >> "$HOME/timezone.calls"\n'
+            '[ ! -f "$HOME/unnamed" ] || exit 3\n'
             '[ -s "$HOME/active-zone" ] || exit 4\ncat "$HOME/active-zone"\n'
         )
         # Intentionally non-executable, matching the repository's ccacc mode.
         self.ccacc.chmod(0o600)
         self.claude = self.bin / "claude"
         self.claude.write_text(
-            '#!/bin/bash\n{ printf "BROWSER=%s\\nTZ=%s\\nKEEP=%s\\nWRAPPED=%s\\n" '
-            '"$BROWSER" "$TZ" "$KEEP" "$WRAPPED"; '
+            '#!/bin/bash\n{ printf "BROWSER=%s\\nTZ=%s\\nTZ_SET=%s\\nKEEP=%s\\nWRAPPED=%s\\n" '
+            '"$BROWSER" "$TZ" "${TZ+x}" "$KEEP" "$WRAPPED"; '
             'printf "ARG=%s\\n" "$@"; } >> "$HOME/claude.calls"\n'
         )
         self.claude.chmod(0o700)
@@ -166,6 +167,20 @@ class ShellHookTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("timezone", result.stderr)
         self.assertFalse(self.log.exists())
+
+    def test_unnamed_launch_unsets_inherited_and_wrapper_timezone(self):
+        self.install("TZ=Old KEEP=keep _op_agent env TZ=Bad WRAPPED=yes claude --model fixture")
+        (self.home / "unnamed").touch()
+        self.env["TZ"] = "America/New_York"
+        for shell in ("bash", "zsh"):
+            self.launch(shell, prefix='_op_agent() { export TZ=Asia/Tokyo; "$@"; }')
+        calls = self.log.read_text()
+        self.assertEqual(calls.count("TZ_SET=\n"), 2)
+        self.assertEqual(calls.count("BROWSER=false"), 2)
+        self.assertEqual(calls.count("KEEP=keep"), 2)
+        self.assertEqual(calls.count("WRAPPED=yes"), 2)
+        self.assertEqual(calls.count("ARG=--model"), 2)
+        self.assertNotIn("TZ=Asia/Tokyo", calls)
 
     def test_overwrite_once_keeps_original_and_exact_rc_bytes_modes(self):
         rc = self.home / ".bashrc"

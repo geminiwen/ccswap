@@ -41,6 +41,8 @@ keychain_write() {
 }
 ask_password() { :; }
 require_shell_hook() { :; }
+load_shell_companion() { :; }
+ccacc_check_shell_hook() { return 1; }
 cleanup_stop_processes() { stop_claude; }
 cleanup_runtime_is_safe() { :; }
 _ccacc_shell_path() { :; }
@@ -146,7 +148,7 @@ load_account legacy
             fixture, state = run(r'''
 save_account original
 printf 'original\n' > "$ACTIVE_FILE"
-new_command --timezone UTC
+new_command
 ''')
             assert json.loads(state.read_text()) == {k: v for k, v in BASE.items() if k != 'claudeAiOauth'}
             assert not (fixture / 'home/.claude/accounts/fresh.credentials.enc').exists()

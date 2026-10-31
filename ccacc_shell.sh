@@ -93,7 +93,10 @@ _ccacc_shell_words() {
 # prefix. Only BROWSER and TZ assignments are removed. Unknown wrappers fail
 # before any files change, rather than losing wrapper options or arguments.
 _ccacc_shell_command() {
-    local definition=$1 i=0 token name base prefix='' assignments=''
+    local definition=$1 i=0 token name base prefix='' assignments='' timezone_assignment=''
+    # Only used to recognize the exact previous generated hook during an
+    # explicit install. Runtime checks accept the current renderer only.
+    if [ "${2:-}" = legacy ]; then timezone_assignment=' TZ="$__ccacc_tz"'; fi
     _ccacc_shell_words "$definition" || return 1
     while [ "$i" -lt "${#_ccacc_raw[@]}" ]; do
         token=${_ccacc_value[$i]}
@@ -116,7 +119,7 @@ _ccacc_shell_command() {
     if [ -n "$prefix" ]; then
         # Keep the first assignment group before the wrapper, and the second
         # after env; their order can matter to credential wrappers.
-        _ccacc_command="$assignments BROWSER=false TZ=\"\$__ccacc_tz\" $prefix"
+        _ccacc_command="$assignments BROWSER=false$timezone_assignment $prefix"
         assignments=''
         while [ "$i" -lt "${#_ccacc_raw[@]}" ]; do
             token=${_ccacc_value[$i]}
@@ -131,7 +134,12 @@ _ccacc_shell_command() {
     [ "$i" -lt "${#_ccacc_raw[@]}" ] || return 1
     token=${_ccacc_value[$i]}; base=${token##*/}
     [ "$base" = claude ] || return 1
-    _ccacc_command="$_ccacc_command$assignments BROWSER=false TZ=\"\$__ccacc_tz\""
+    _ccacc_command="$_ccacc_command$assignments BROWSER=false$timezone_assignment"
+    if [ "${2:-}" != legacy ]; then
+        # Run env after the wrapper too: even a wrapper that reintroduces its
+        # own TZ cannot leak the old account zone into an unnamed Claude child.
+        _ccacc_command="$_ccacc_command 'env' \"\${__ccacc_tz_env[@]}\" BROWSER=false"
+    fi
     # Quote decoded arguments to prevent source-time alias expansion, globbing,
     # and assignment interpretation in a different shell.
     while [ "$i" -lt "${#_ccacc_raw[@]}" ]; do
@@ -188,7 +196,7 @@ _ccacc_shell_replace() {
     mv -f "$1" "$2"
 }
 
-_ccacc_shell_hook_text() {
+_ccacc_shell_hook_text_legacy() {
     quoted_script=$(_ccacc_shell_quote "$script")
     cat <<HOOK
 # Managed by ccacc. Account timezone is resolved on every launch.
@@ -211,6 +219,47 @@ alias claude='__ccacc_launch'
 HOOK
 }
 
+_ccacc_shell_hook_text() {
+    quoted_script=$(_ccacc_shell_quote "$script")
+    cat <<HOOK
+# Managed by ccacc. Account timezone is resolved on every launch.
+__ccacc_bin=$(_ccacc_shell_quote "${script%/*}")
+case ":\${PATH-}:" in
+    *:"\$__ccacc_bin":*) ;;
+    *) export PATH="\$__ccacc_bin\${PATH:+:\$PATH}" ;;
+esac
+unset __ccacc_bin
+unalias claude 2>/dev/null || :
+function __ccacc_launch { (
+    __ccacc_status=0
+    __ccacc_tz=\$(command bash $quoted_script timezone) || __ccacc_status=\$?
+    case "\$__ccacc_status" in
+        0)
+            case "\$__ccacc_tz" in
+                ''|/*|*..*|*[!A-Za-z0-9_+/-]*)
+                    printf '%s\\n' 'ccacc: invalid or missing active account timezone' >&2; return 1 ;;
+            esac
+            if [ ! -f "/usr/share/zoneinfo/\$__ccacc_tz" ] && [ ! -f "/var/db/timezone/zoneinfo/\$__ccacc_tz" ]; then
+                printf '%s\\n' 'ccacc: unknown active account timezone' >&2; return 1
+            fi
+            export TZ="\$__ccacc_tz"
+            __ccacc_tz_env=("TZ=\$__ccacc_tz")
+            ;;
+        3)
+            [ -z "\$__ccacc_tz" ] || return 1
+            unset TZ
+            __ccacc_tz_env=(-u TZ)
+            ;;
+        *)
+            printf '%s\\n' 'ccacc: cannot read the active account timezone; save its timezone before launching Claude' >&2
+            return 1 ;;
+    esac
+    $_ccacc_command
+) }
+alias claude='__ccacc_launch'
+HOOK
+}
+
 _ccacc_shell_probe_context() {
     if [ "$check_only" = --installed ] && [ "${SHELL##*/}" = bash ]; then
         probe='{"missing":true}'
@@ -225,12 +274,57 @@ _ccacc_shell_probe_context() {
     }
 }
 
+# Decode one literal script word from the known v1 renderer, without evaluating
+# shell text. The entire hook must still match a reconstructed template below.
+_ccacc_shell_prior_script() {
+    local line word prior='' count=0 prefix='    __ccacc_tz=$(command bash '
+    local suffix_old=' timezone) || {' suffix_new=' timezone) || __ccacc_status=$?'
+    if jq -e '.version == 2' "$private/managed.json" >/dev/null; then
+        jq -er '.script | select(type == "string" and startswith("/") and
+            (contains("\u0000") or contains("\n") or contains("\r") | not))' "$private/managed.json"
+        return $?
+    fi
+    while IFS= read -r line; do
+        case "$line" in
+            "$prefix"*)
+                word=${line#"$prefix"}
+                case "$word" in
+                    *"$suffix_old") word=${word%"$suffix_old"} ;;
+                    *"$suffix_new") word=${word%"$suffix_new"} ;;
+                    *) return 1 ;;
+                esac
+                _ccacc_shell_words "$word" && [ "${#_ccacc_value[@]}" -eq 1 ] || return 1
+                prior=${_ccacc_value[0]}; count=$((count+1))
+                ;;
+        esac
+    done <<< "$_ccacc_content"
+    [ "$count" -eq 1 ] || return 1
+    printf '%s' "$prior"
+}
+
 _ccacc_shell_check_text() {
+    local current_command current_script prior_script
     [ -f "$private/hook.sh" ] && _ccacc_shell_read "$private/hook.sh" || {
         _ccacc_shell_error 'installed hook is missing or unreadable'; return 1;
     }
     expected=$(_ccacc_shell_hook_text; printf '.')
-    [ "$_ccacc_content." = "$expected" ] || { _ccacc_shell_error 'installed hook does not match its records'; return 1; }
+    [ "$_ccacc_content." != "$expected" ] || return 0
+    if [ "$check_only" != --installed ]; then
+        current_command=$_ccacc_command
+        current_script=$script
+        prior_script=$(_ccacc_shell_prior_script) && _ccacc_shell_path "$prior_script" file || {
+            _ccacc_shell_error 'cannot verify the prior hook deployment'; return 1;
+        }
+        script=$prior_script
+        expected=$(_ccacc_shell_hook_text; printf '.')
+        if [ "$_ccacc_content." = "$expected" ]; then script=$current_script; return 0; fi
+        if ! _ccacc_shell_command "${definition:-claude}" legacy; then script=$current_script; return 1; fi
+        expected=$(_ccacc_shell_hook_text_legacy; printf '.')
+        script=$current_script; _ccacc_command=$current_command
+        [ "$_ccacc_content." != "$expected" ] || return 0
+    fi
+    _ccacc_shell_error 'installed hook does not match its records; rerun the curl installer for a known prior hook'
+    return 1
 }
 
 _ccacc_shell_hook() (
@@ -241,6 +335,8 @@ _ccacc_shell_hook() (
     local -a rcs stages _ccacc_raw _ccacc_value
     umask 077
     [ "$#" -le 2 ] && { [ -z "$check_only" ] || [ "$check_only" = --validate-only ] || [ "$check_only" = --installed ]; } || return 1
+    case "${SHELL##*/}" in bash|zsh) ;; *) _ccacc_shell_error 'only Bash and Zsh are supported'; return 1 ;; esac
+    command -v "$SHELL" >/dev/null 2>&1 || { _ccacc_shell_error 'shell executable is unavailable'; return 1; }
     command -v jq >/dev/null 2>&1 || { _ccacc_shell_error 'jq is required'; return 1; }
     _ccacc_shell_path "$script" file && [ -f "$script" ] || {
         _ccacc_shell_error 'ccacc must be an absolute regular file with no symlink components'; return 1;
@@ -298,7 +394,7 @@ _ccacc_shell_hook() (
     fi
     if [ "$check_only" = --installed ] || [ -f "$private/hook.sh" ]; then
         if ! _ccacc_shell_check_text; then
-            _ccacc_shell_error "inspect and move aside the unverified $private/hook.sh manually, then run ccacc install"
+            _ccacc_shell_error "inspect and move aside the unverified $private/hook.sh manually, then rerun the curl installer"
             return 1
         fi
     fi

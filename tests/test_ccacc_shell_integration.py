@@ -251,7 +251,7 @@ apply_surge() { :; }
                 if shell == "zsh":
                     self.reset_fixture()
                 _, rcs = self.startup(shell, "TZ=UTC claude --model fixture", zdotdir=shell == "zsh")
-                self.cli("install")
+                self.cli("configure-shell")
                 paths = list(rcs) + list((self.home / ".ccacc-shell").iterdir())
                 for path in rcs:
                     path.chmod(0o444)
@@ -259,12 +259,12 @@ apply_surge() { :; }
                 # Already-active use must neither ask for a password nor write hook files.
                 self.harness('ask_password() { return 97; }; use_command sydney')
                 for command in ("save sydney --timezone Australia/Sydney", "use sydney", "use tokyo",
-                                "new --timezone Australia/Sydney"):
+                                "new"):
                     result = self.harness("main " + command)
                     self.assertNotIn("hook installed", result.stdout)
                     self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
                                       for p in paths}, before)
-                self.assertEqual(self.cli("timezone").stdout, "Australia/Sydney\n")
+                self.assertEqual(self.cli("timezone", success=False).returncode, 3)
                 self.assertFalse(self.launches.exists())
 
     def test_missing_library_and_unsupported_shell_fail_before_account_operations(self):
@@ -276,8 +276,11 @@ apply_surge() { :; }
         for command in ("save next --timezone UTC", "new next --timezone UTC", "use tokyo"):
             result = self.harness("main " + command, success=False)
             self.assertIn("ccacc_shell.sh companion", result.stderr)
+            if command.startswith("use "):
+                self.assertIn("curl -fsSL", result.stderr)
             self.assertNotIn("shell hook installed", result.stdout)
             self.assertFalse((self.home / "operations").exists())
+        library.with_suffix(".saved").rename(library)
         self.env["SHELL"] = "/bin/fish"
         result = self.harness("main use tokyo", success=False)
         self.assertIn("only Bash and Zsh", result.stderr)
@@ -307,12 +310,12 @@ apply_surge() { :; }
         self.cli("help")
         self.cli("--version")
         self.cli("timezone", success=False)
-        self.cli("install")
+        self.cli("configure-shell")
         self.assertFalse((self.home / ".claude").exists())
         self.assertFalse((self.home / ".claude.json").exists())
         before = self.home_snapshot()
         inodes = {p: p.stat().st_ino for p in self.home.rglob("*") if p.is_file()}
-        self.cli("install")
+        self.cli("configure-shell")
         self.assertEqual(self.home_snapshot(), before)
         self.assertEqual({p: p.stat().st_ino for p in inodes}, inodes)
         self.harness("require_shell_hook")
@@ -320,25 +323,24 @@ apply_surge() { :; }
         self.cli("timezone", success=False)
         self.assertFalse(self.launches.exists())
 
-    def test_missing_or_corrupt_install_blocks_direct_and_cli_operations(self):
+    def test_missing_or_corrupt_install_blocks_only_use_before_mutation(self):
         self.startup("bash", "TZ=UTC claude --model fixture")
         # Inputs deliberately omit TZ: rejection must precede the setup menu.
-        commands = ("save_command next", "new_command next", "use_command sydney",
-                    "use_command tokyo", "main save next", "main new next", "main use sydney",
+        commands = ("use_command sydney", "use_command tokyo", "main use sydney",
                     "main use tokyo")
         def blocked():
             before = self.home_snapshot()
             for command in commands:
                 result = self.harness(command, success=False)
-                self.assertIn("ccacc install", result.stderr)
+                self.assertIn("curl -fsSL", result.stderr)
                 self.assertNotIn("Choose timezone", result.stderr)
                 self.assertEqual(self.home_snapshot(), before)
                 self.assertFalse((self.home / "operations").exists())
-            for args in (("save", "next"), ("new", "next"), ("use", "sydney"), ("use", "tokyo")):
+            for args in (("use", "sydney"), ("use", "tokyo")):
                 self.cli(*args, success=False)
                 self.assertEqual(self.home_snapshot(), before)
         blocked()
-        self.cli("install")
+        self.cli("configure-shell")
         private = self.home / ".ccacc-shell"
         corruptions = (
             (private / "hook.sh", None),
@@ -382,9 +384,50 @@ apply_surge() { :; }
         (self.home / ".bash_profile").write_text("# shadows .profile\n")
         blocked()
 
+    def test_save_and_new_do_not_require_or_repair_an_installed_hook(self):
+        self.startup("bash", "TZ=UTC claude")
+        self.harness("main save next --timezone UTC")
+        self.assertFalse((self.home / ".ccacc-shell").exists())
+        self.harness("main new")
+        self.assertFalse((self.home / ".ccacc-shell").exists())
+        self.cli("configure-shell")
+        hook = self.home / ".ccacc-shell/hook.sh"
+        hook.write_text('printf executed > "$HOME/hook-executed"\n')
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
+                  for p in (self.home / ".bashrc", self.home / ".bash_profile", *hook.parent.iterdir())}
+        self.harness("main save next --timezone UTC")
+        self.harness("main new")
+        self.env["SHELL"] = "/bin/unsupported-fixture-shell"
+        self.harness("main save next --timezone UTC")
+        self.harness("main new")
+        self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in before}, before)
+        self.assertFalse((self.home / "hook-executed").exists())
+
+    def test_public_install_redirects_to_curl_without_writing(self):
+        before = self.home_snapshot()
+        result = self.cli("install", success=False)
+        self.assertIn("curl -fsSL https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash", result.stderr)
+        self.assertEqual(self.home_snapshot(), before)
+
+    def test_source_adds_deployed_prefix_to_path_once_without_account_operations(self):
+        shutil.rmtree(self.home / ".claude")
+        (self.home / ".claude.json").unlink()
+        self.startup("bash")
+        self.core.chmod(0o700)
+        self.cli("configure-shell")
+        hook = shlex.quote(str(self.home / ".ccacc-shell/hook.sh"))
+        result = self.run_process(["/bin/bash", "--noprofile", "--norc", "-c",
+                                   f'. {hook}\n. {hook}\ncommand -v ccacc\nprintf "%s\\n" "$PATH"\n'])
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], str(self.core))
+        self.assertEqual(lines[1].split(":").count(str(self.core.parent)), 1)
+        self.assertFalse(self.launches.exists())
+        self.assertFalse((self.home / ".claude").exists())
+        self.assertFalse((self.home / ".claude.json").exists())
+
     def test_legacy_valid_install_is_recognized_and_explicitly_migrated(self):
         self.startup("bash", "TZ=UTC claude --model fixture")
-        self.cli("install")
+        self.cli("configure-shell")
         private = self.home / ".ccacc-shell"
         (private / "managed.json").write_text('{"version":1,"originalMissing":false}\n')
         before = self.home_snapshot()
@@ -392,10 +435,122 @@ apply_surge() { :; }
         self.assertEqual(self.home_snapshot(), before)
         preserved = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
                      for p in (self.home / ".bashrc", self.home / ".bash_profile", private / "hook.sh")}
-        self.cli("install")
+        self.cli("configure-shell")
         self.assertEqual(json.loads((private / "managed.json").read_text())["version"], 2)
         self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
                           for p in preserved}, preserved)
+
+    def test_known_prior_hook_requires_explicit_upgrade_and_rejects_modified_bytes(self):
+        template = (ROOT / "tests/fixtures/ccacc_hook_v1.sh.in").read_text()
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                if shell == "zsh":
+                    self.reset_fixture()
+                self.startup(shell, "KEEP=keep TZ=UTC _op_agent env INNER=inner TZ=UTC claude --model fixture",
+                             zdotdir=shell == "zsh")
+                self.cli("configure-shell")
+                private = self.home / ".ccacc-shell"
+                hook = private / "hook.sh"
+                current = hook.read_bytes()
+                original = (private / "original-alias.json").read_bytes()
+                quoted = "'" + str(self.core).replace("'", "'\\''") + "'"
+                command = (' KEEP=keep BROWSER=false TZ="$__ccacc_tz" \'_op_agent\' \'env\' '
+                           'INNER=inner BROWSER=false TZ="$__ccacc_tz" \'claude\' \'--model\' \'fixture\' "$@"')
+                legacy = template.replace("@SCRIPT@", quoted).replace("@COMMAND@", command)
+                hook.write_text(legacy)
+                before = self.home_snapshot()
+                self.harness("require_shell_hook", success=False)
+                self.assertEqual(self.home_snapshot(), before)
+                hook.write_text(legacy + 'printf executed > "$HOME/hook-executed"\n')
+                before = self.home_snapshot()
+                self.cli("configure-shell", success=False)
+                self.assertEqual(self.home_snapshot(), before)
+                self.assertFalse((self.home / "hook-executed").exists())
+                hook.write_text(legacy)
+                self.cli("configure-shell")
+                self.assertEqual(hook.read_bytes(), current)
+                self.assertEqual((private / "original-alias.json").read_bytes(), original)
+                self.harness("require_shell_hook")
+
+    def test_explicit_setup_migrates_known_old_deployment_for_v1_and_v2_records(self):
+        template = (ROOT / "tests/fixtures/ccacc_hook_v1.sh.in").read_text()
+        for version, shell in ((1, "bash"), (1, "zsh"), (2, "bash"), (2, "zsh")):
+            with self.subTest(version=version, shell=shell):
+                self.reset_fixture()
+                old = self.fixture / "old tools's"
+                old.mkdir()
+                self.core = old / "ccacc"
+                shutil.copyfile(ROOT / "ccacc", self.core)
+                shutil.copyfile(ROOT / "ccacc_shell.sh", old / "ccacc_shell.sh")
+                self.env["FIXTURE_CORE"] = str(self.core)
+                self.startup(shell, "TZ=UTC claude --model fixture", zdotdir=shell == "zsh")
+                self.cli("configure-shell")
+                private = self.home / ".ccacc-shell"
+                hook = private / "hook.sh"
+                quoted = "'" + str(self.core).replace("'", "'\\''") + "'"
+                command = ' BROWSER=false TZ="$__ccacc_tz" \'claude\' \'--model\' \'fixture\' "$@"'
+                hook.write_text(template.replace("@SCRIPT@", quoted).replace("@COMMAND@", command))
+                if version == 1:
+                    (private / "managed.json").write_text('{"version":1,"originalMissing":false}\n')
+                before = {p: p.read_bytes() for p in (self.home / ".claude").rglob("*") if p.is_file()}
+                original = (private / "original-alias.json").read_bytes()
+                final = self.fixture / "new tools's"
+                final.mkdir()
+                self.core = final / "ccacc"
+                shutil.copyfile(ROOT / "ccacc", self.core)
+                shutil.copyfile(ROOT / "ccacc_shell.sh", final / "ccacc_shell.sh")
+                self.env["FIXTURE_CORE"] = str(self.core)
+                self.harness("require_shell_hook", success=False)
+                self.cli("configure-shell")
+                self.harness("require_shell_hook")
+                self.assertIn("new tools", hook.read_text())
+                self.assertNotIn("old tools", hook.read_text())
+                self.assertEqual(json.loads((private / "managed.json").read_text())["script"], str(self.core))
+                self.assertEqual((private / "original-alias.json").read_bytes(), original)
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+                self.assertFalse(self.launches.exists())
+
+    def test_unnamed_launch_unsets_inherited_and_runtime_wrapper_timezone(self):
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                if shell == "zsh":
+                    self.reset_fixture()
+                self.startup(shell, "OUTER=outer TZ=UTC _op_agent env INNER=inner TZ=UTC claude --model fixture",
+                             zdotdir=shell == "zsh")
+                self.cli("configure-shell")
+                self.env["TZ"] = "America/New_York"
+                self.executable("_op_agent", '#!/bin/bash\nexport TZ=Asia/Tokyo\nexec "$@"\n')
+                self.harness("main new")
+                hook = shlex.quote(str(self.home / ".ccacc-shell/hook.sh"))
+                self.interactive(shell, f". {hook}\nclaude /login\n", startup=False)
+                launched = self.records(self.launches)[0]
+                self.assertEqual(launched["browser"], "false")
+                self.assertIsNone(launched["tz"])
+                self.assertEqual(launched["args"], ["--model", "fixture", "/login"])
+                self.assertEqual((launched["outer"], launched["inner"]), ("outer", "inner"))
+                self.assertFalse((self.accounts / ".pending-timezone").exists())
+
+    def test_getter_distinguishes_unnamed_from_invalid_active_metadata(self):
+        self.startup("bash")
+        self.cli("configure-shell")
+        active = self.accounts / ".active"
+        active.unlink()
+        before = self.home_snapshot()
+        result = self.cli("timezone", success=False)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "", ""))
+        self.assertEqual(self.home_snapshot(), before)
+        for content in ("", "sydney\n\n", "missing\n", "../outside\n"):
+            active.write_text(content)
+            before = self.home_snapshot()
+            result = self.cli("timezone", success=False)
+            self.assertEqual((result.returncode, result.stdout), (1, ""))
+            self.assertEqual(self.home_snapshot(), before)
+        active.write_text("sydney\n")
+        for content in ("", "{bad", "[]", "{} {}"):
+            (self.accounts / "sydney.json").write_text(content)
+            self.assertEqual(self.cli("timezone", success=False).returncode, 1)
+        (self.accounts / "sydney.json").write_text("{}")
+        self.assertEqual(self.cli("timezone").stdout, "Australia/Sydney\n")
 
     def test_explicit_install_never_sources_corrupt_or_orphaned_hook(self):
         for shell in ("bash", "zsh"):
@@ -403,33 +558,33 @@ apply_surge() { :; }
                 if shell == "zsh":
                     self.reset_fixture()
                 self.startup(shell, "TZ=UTC claude --model fixture", zdotdir=shell == "zsh")
-                self.cli("install")
+                self.cli("configure-shell")
                 private = self.home / ".ccacc-shell"
                 hook = private / "hook.sh"
                 record = private / "managed.json"
                 saved_record = record.read_bytes()
                 hook.write_text('printf executed > "$HOME/hook-executed"\n')
                 before = self.home_snapshot()
-                result = self.cli("install", success=False)
+                result = self.cli("configure-shell", success=False)
                 self.assertIn("inspect and move aside", result.stderr)
                 self.assertEqual(self.home_snapshot(), before)
                 self.assertFalse((self.home / "hook-executed").exists())
                 record.unlink()
                 before = self.home_snapshot()
-                self.cli("install", success=False)
+                self.cli("configure-shell", success=False)
                 self.assertEqual(self.home_snapshot(), before)
                 self.assertFalse((self.home / "hook-executed").exists())
                 # Explicit fixture-only manual recovery retains the verified
                 # original record and regenerates a missing hook safely.
                 record.write_bytes(saved_record)
                 hook.unlink()
-                self.cli("install")
+                self.cli("configure-shell")
                 self.harness("require_shell_hook")
                 self.assertFalse((self.home / "hook-executed").exists())
 
     def test_corrupt_hook_is_not_sourced_by_zsh_installed_check(self):
         self.startup("zsh", "TZ=UTC claude", zdotdir=True)
-        self.cli("install")
+        self.cli("configure-shell")
         hook = self.home / ".ccacc-shell/hook.sh"
         hook.write_text('printf executed > "$HOME/hook-executed"\n')
         before = self.home_snapshot()
@@ -440,7 +595,7 @@ apply_surge() { :; }
 
     def test_check_uses_actual_zsh_startup_paths_and_deployment(self):
         self.startup("zsh", "TZ=UTC claude", zdotdir=True)
-        self.cli("install")
+        self.cli("configure-shell")
         before = self.home_snapshot()
         self.harness("require_shell_hook")
         self.assertEqual(self.home_snapshot(), before)
@@ -455,7 +610,7 @@ apply_surge() { :; }
         changed.mkdir()
         (self.home / ".zshenv").write_text("ZDOTDIR=" + shlex.quote(str(changed)) + "\n")
         result = self.harness("use_command sydney", success=False)
-        self.assertIn("ccacc install", result.stderr)
+        self.assertIn("curl -fsSL", result.stderr)
         self.assertFalse((self.home / "operations").exists())
 
     def test_alias_content_stays_out_of_external_jq_arguments(self):
@@ -467,7 +622,7 @@ apply_surge() { :; }
                 rc.write("builtin alias " + shlex.quote("work-claude=" + definition) + "\n")
         self.assertEqual(self.probe()["definition"], definition)
         # Exercise raw alias backup through real core paths with an explicit timezone.
-        self.cli("install")
+        self.cli("configure-shell")
         self.harness("main save captured --alias work-claude --timezone UTC")
         backup = json.loads((self.accounts / ".aliases/captured.json").read_text())
         self.assertEqual(backup["definition"], definition)

@@ -352,7 +352,8 @@ claude_process_ids() {
     local processes current_uid
     current_uid=$(id -u) || return 1
     processes=$(ps -axo pid=,uid=,comm=) || return 1
-    printf '%s\n' "$processes" | awk -v uid="$current_uid" '
+    # Process names/arguments may contain arbitrary bytes, not valid UTF-8.
+    printf '%s\n' "$processes" | LC_ALL=C awk -v uid="$current_uid" '
         $2 == uid && ($3 == "claude" || $0 ~ /\/claude$/ ||
             $0 ~ /\/\.local\/share\/claude\/versions\/[0-9][^\/[:space:]]*$/) { print $1 }
     '
@@ -1408,7 +1409,7 @@ cleanup_runtime_is_safe() {
     local processes status pids pid
     processes=$(ps -ax -o pid=,comm=,args= 2>/dev/null) && [ -n "$processes" ] || return 1
     status=0
-    printf '%s\n' "$processes" | awk '
+    printf '%s\n' "$processes" | LC_ALL=C awk '
         NF < 2 || $1 !~ /^[0-9]+$/ { invalid = 1 }
         {
             command = $2; sub(/^.*\//, "", command)
@@ -1424,7 +1425,7 @@ cleanup_runtime_is_safe() {
             | if type == "number" and . > 0 and floor == . then . else error("unverifiable bridge PID") end' "$CLAUDE_JSON") || return 1
         for pid in $pids; do
             # A successful full snapshot must prove each recorded owner absent.
-            if printf '%s\n' "$processes" | awk -v pid="$pid" '$1 == pid { found = 1 } END { exit !found }'; then return 1; fi
+            if printf '%s\n' "$processes" | LC_ALL=C awk -v pid="$pid" '$1 == pid { found = 1 } END { exit !found }'; then return 1; fi
         done
     fi
 }

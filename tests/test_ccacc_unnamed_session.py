@@ -710,6 +710,45 @@ main new
                       success=False, process_mocks=False)
         self.assertEqual(self.snapshot(), before)
 
+    def test_new_accepts_non_utf8_process_args_with_absent_bridge_owner(self):
+        self.run_body("main new")
+        config = json.loads(self.config.read_text())
+        config["replBridgePlaceholders"] = {"session_fixture": {"pid": 654}}
+        self.config.write_text(json.dumps(config))
+        self.fixture.env["LC_ALL"] = "en_US.UTF-8"
+        result = self.run_body(r'''
+ps() { printf '321 /bin/other other\377\n'; }
+main new
+''', process_mocks=False)
+        self.assertNotIn("towc", result.stderr)
+        self.assertNotIn("replBridgePlaceholders", json.loads(self.config.read_text()))
+
+    def test_non_utf8_process_args_still_block_live_runtime_owners(self):
+        self.run_body("main new")
+        self.fixture.env["LC_ALL"] = "en_US.UTF-8"
+        for command in ("/bin/claude", "/bin/other"):
+            with self.subTest(command=command):
+                config = json.loads(self.config.read_text())
+                if command == "/bin/other":
+                    config["replBridgePlaceholders"] = {"session_fixture": {"pid": 321}}
+                self.config.write_text(json.dumps(config))
+                before = self.snapshot()
+                result = self.run_body(
+                    "ps() { printf '321 " + command + r" other\377\n'; }; main new",
+                    success=False, process_mocks=False)
+                self.assertIn("Live or unverifiable", result.stderr)
+                self.assertNotIn("towc", result.stderr)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_claude_process_ids_accepts_non_utf8_executable_paths(self):
+        self.fixture.env["LC_ALL"] = "en_US.UTF-8"
+        result = self.run_body(r'''
+ps() { printf '321 %s /tmp/other\377\n654 %s /bin/claude\n' "$(id -u)" "$(id -u)"; }
+claude_process_ids
+''', process_mocks=False)
+        self.assertEqual(result.stdout, "654\n")
+        self.assertNotIn("towc", result.stderr)
+
     def test_cleanup_never_signals_pid_one(self):
         self.run_body(r'''
 source "$FIXTURE_CORE" help >/dev/null

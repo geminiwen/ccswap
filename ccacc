@@ -72,6 +72,8 @@ ACCOUNT_KEYS='[
 ]'
 
 # Files and folders cccleaner wipes; they are moved in and out with the account (<backup name>|<path>)
+# ~/.claude/cache is deliberately absent: its changelog, model catalog and closed-issue list
+# are account-neutral and rebuild themselves, so they stay shared and are never archived.
 ACCOUNT_PATHS=(
     "backups|$CONFIG_DIR/backups"
     "debug|$CONFIG_DIR/debug"
@@ -89,7 +91,6 @@ ACCOUNT_PATHS=(
     "telemetry|$CONFIG_DIR/telemetry"
     "todos|$CONFIG_DIR/todos"
     "history.jsonl|$CONFIG_DIR/history.jsonl"
-    "cache|$CONFIG_DIR/cache"
     "gh-pr-status-cache.json|$CONFIG_DIR/gh-pr-status-cache.json"
     "cli-nodejs-cache|$HOME/Library/Caches/claude-cli-nodejs"
 )
@@ -1774,7 +1775,8 @@ new_command() {
         echo "Error: Cannot read valid credentials; cleanup incomplete" >&2; return 1;
     }
     for entry in "${ACCOUNT_PATHS[@]}"; do cleanup_paths+=("${entry#*|}"); done
-    for entry in ide daemon jobs remote-settings.json policy-limits.json policy-limits.json.stamp.json plugins/plugin-directory-cache-v2.json plugins/plugin-catalog-cache.json; do
+    # ide/ holds live IDE discovery locks, not account data; it is never cleared here.
+    for entry in daemon jobs remote-settings.json policy-limits.json policy-limits.json.stamp.json plugins/plugin-directory-cache-v2.json plugins/plugin-catalog-cache.json; do
         cleanup_paths+=("$CONFIG_DIR/$entry")
     done
     _ccacc_shell_path "$HOME/.claude_backups" dir || {

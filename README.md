@@ -202,12 +202,15 @@ The archive includes these `~/.claude` paths:
 ```text
 backups/  debug/  file-history/  feedback/drafts/  paste-cache/  plans/
 projects/  sessions/  session-env/  shell-snapshots/  statsig/  tasks/
-telemetry/  todos/  cache/  stats-cache.json  history.jsonl  gh-pr-status-cache.json
+telemetry/  todos/  stats-cache.json  history.jsonl  gh-pr-status-cache.json
 ```
+
+`~/.claude/cache` stays shared and is never archived: its changelog, model catalog
+and closed-issue list do not belong to an account and rebuild themselves.
 
 It also includes `~/Library/Caches/claude-cli-nodejs`. `feedback/drafts` is stored
 under the stash label `feedback-drafts`; the external CLI cache uses
-`cli-nodejs-cache`. `new` additionally clears bounded `ide`, `daemon`, `jobs`,
+`cli-nodejs-cache`. `new` additionally clears bounded `daemon`, `jobs`,
 remote/policy cache files, plugin directory/catalog caches and recognized
 timestamped cleaner recovery copies. Those extra runtime paths are not part of
 the account archive.

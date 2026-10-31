@@ -1010,8 +1010,8 @@ main new
         self.login()
         for name in ("backups/.hidden", "file-history/old", "feedback/drafts/draft", "projects/old", "todos/old",
                      "shell-snapshots/old", "statsig/old", "debug/old", "plans/old", "paste-cache/old",
-                     "telemetry/old", "session-env/old", "tasks/old", "sessions/old", "ide/old", "daemon/old",
-                     "jobs/old", "cache/old", "history.jsonl", "stats-cache.json", "remote-settings.json",
+                     "telemetry/old", "session-env/old", "tasks/old", "sessions/old", "daemon/old",
+                     "jobs/old", "history.jsonl", "stats-cache.json", "remote-settings.json",
                      "policy-limits.json", "policy-limits.json.stamp.json", "plugins/plugin-directory-cache-v2.json",
                      "plugins/plugin-catalog-cache.json"):
             path = self.home / ".claude" / name
@@ -1020,6 +1020,7 @@ main new
         preserved = {}
         for name in ("settings.json", "settings.local.json", "skills/fixture/SKILL.md", "plugins/installed/fixture",
                      "knowledge/keep.md", ".device-keys.json", "commands/keep.md", "mcp-oauth-state.json",
+                     "cache/changelog.md", "ide/30067.lock",
                      "accounts/saved.json", "accounts/saved.credentials", "accounts/saved.surge",
                      "accounts/.timezones/saved", "accounts/.aliases/saved.json", "accounts/.check.enc"):
             path = self.home / ".claude" / name
@@ -1048,7 +1049,7 @@ main new
         self.assertFalse((recovery / "claude_dir_20261031_010101").exists())
         self.assertEqual({p: p.read_bytes() for p in preserved}, preserved)
         self.assertEqual(self.hook_snapshot(), hook)
-        for name in ("sessions", "ide", "daemon", "jobs", "cache", "backups", "feedback/drafts", "history.jsonl",
+        for name in ("sessions", "daemon", "jobs", "backups", "feedback/drafts", "history.jsonl",
                      "remote-settings.json", "policy-limits.json", "plugins/plugin-catalog-cache.json"):
             self.assertFalse((self.home / ".claude" / name).exists(), name)
         self.assertEqual(json.loads(self.credentials.read_text()), self.shared)

@@ -34,10 +34,10 @@ class UnnamedSessionTests(unittest.TestCase):
 source "$FIXTURE_CORE" help >/dev/null
 read_credentials() {
     printf 'read\n' >> "$SESSION_OPERATIONS"
-    if [ -f "$CREDENTIALS_FILE" ]; then cat "$CREDENTIALS_FILE"; fi
+    if [ -f "$STRAY_CREDENTIALS_FILE" ]; then cat "$STRAY_CREDENTIALS_FILE"; fi
 }
-write_credentials() { printf 'write\n' >> "$SESSION_OPERATIONS"; printf '%s\n' "$1" > "$CREDENTIALS_FILE"; }
-delete_credentials() { printf 'delete\n' >> "$SESSION_OPERATIONS"; rm -f "$CREDENTIALS_FILE"; }
+write_credentials() { printf 'write\n' >> "$SESSION_OPERATIONS"; printf '%s\n' "$1" > "$STRAY_CREDENTIALS_FILE"; }
+delete_credentials() { printf 'delete\n' >> "$SESSION_OPERATIONS"; rm -f "$STRAY_CREDENTIALS_FILE"; }
 # Deliberately plaintext fixture backups: never use real credentials or encryption.
 encrypt_to() { cat > "$1"; }
 decrypt_from() { cat "$1"; }
@@ -835,7 +835,7 @@ main new
             # Pending was already replaced when the last metadata write fails.
             'rm() { if [ "$2" = "$ACTIVE_FILE" ]; then return 1; fi; command rm "$@"; }',
             # A failed write can have changed the store; rollback must still run.
-            'write_credentials() { printf "%s\\n" "$1" > "$CREDENTIALS_FILE"; '
+            'write_credentials() { printf "%s\\n" "$1" > "$STRAY_CREDENTIALS_FILE"; '
             '[ "$1" != "$(printf "%s" "$1" | jq -c "del(.claudeAiOauth)")" ]; }',
         )
         for failure in failures:

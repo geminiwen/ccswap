@@ -1,6 +1,6 @@
 #!/bin/bash
 # Public bootstrap: curl https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash
-# --prefix names the bin directory itself, not its parent. No sudo/package installs.
+# macOS only. --prefix names the bin directory itself, not its parent. No sudo/package installs.
 
 ccacc_install_main() (
     set -eu
@@ -25,6 +25,10 @@ ccacc_install_main() (
             *) usage >&2; fail 'unknown argument' ;;
         esac
     done
+    # ccacc stores logins in the macOS keychain; refuse other platforms before
+    # touching the filesystem or the network.
+    platform=$(uname -s 2>/dev/null) || platform=
+    [ "$platform" = Darwin ] || fail "ccacc supports macOS only (uname -s reported '${platform:-unknown}'); nothing was installed"
     [ -n "${HOME:-}" ] || fail 'HOME must name an absolute directory'
 
     # Reject ambiguous paths rather than resolving through symlinks. This matches

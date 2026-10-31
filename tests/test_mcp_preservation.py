@@ -18,10 +18,6 @@ TARGET = {
     'futureField': 'fixture-must-not-restore',
 }
 MOCKS = r'''
-command() {
-    if [ "$BACKEND" = linux ] && [ "$1" = -v ] && [ "$2" = security ]; then return 1; fi
-    builtin command "$@"
-}
 security() {
     if [ "$1" = delete-generic-password ]; then
         printf 'delete\n' >> "$MUTATIONS"
@@ -59,7 +55,7 @@ def main():
     (ROOT / '.orca').mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=ROOT / '.orca', prefix='mcp-preservation-') as root:
         root = Path(root).resolve()
-        for backend in ('macos', 'linux'):
+        for backend in ('macos',):
             counter = 0
 
             def run(body, current=BASE, target=TARGET, read_fail=False, expect_success=True):
@@ -69,7 +65,7 @@ def main():
                 fixture.mkdir()
                 home = fixture / 'home'
                 (home / '.claude/accounts').mkdir(parents=True)
-                state = fixture / 'keychain.json' if backend == 'macos' else home / '.claude/.credentials.json'
+                state = fixture / 'keychain.json'
                 state.write_text(current if isinstance(current, str) else json.dumps(current))
                 (fixture / 'target.json').write_text(target if isinstance(target, str) else json.dumps(target))
                 (fixture / 'mutations').write_text('')
@@ -81,7 +77,7 @@ def main():
                 }))
                 env = dict(os.environ, HOME=str(home), TMPDIR=str(fixture), STATE=str(state),
                            MUTATIONS=str(fixture / 'mutations'), FIXTURE=str(fixture),
-                           BACKEND=backend, READ_FAIL='yes' if read_fail else '')
+                           READ_FAIL='yes' if read_fail else '')
                 env.pop('BASH_ENV', None)
                 env.pop('ENV', None)
                 result = subprocess.run(['bash', '-c', SOURCE + '\n' + MOCKS + '\n' + body],
@@ -118,11 +114,10 @@ def main():
                 assert state.read_text() == invalid
                 assert (fixture / 'mutations').read_text() == ''
 
-            if backend == 'macos':
-                fixture, state = run('replace_credentials "$(cat "$FIXTURE/target.json")"',
-                                     read_fail=True, expect_success=False)
-                assert json.loads(state.read_text()) == BASE
-                assert (fixture / 'mutations').read_text() == ''
+            fixture, state = run('replace_credentials "$(cat "$FIXTURE/target.json")"',
+                                 read_fail=True, expect_success=False)
+            assert json.loads(state.read_text()) == BASE
+            assert (fixture / 'mutations').read_text() == ''
 
             fixture, _ = run(r'''
 write_backup example credentials "$(cat "$FIXTURE/target.json")"
@@ -183,7 +178,7 @@ use_command original --yes
             expected['claudeAiOauth']['accessToken'] = 'fixture-original-refreshed'
             expected['mcpOAuth']['extra'] = {'accessToken': 'fixture-new-shared'}
             assert json.loads(state.read_text()) == expected
-    print(f'PASS: {count} isolated checks across mocked macOS Keychain and Linux files; '
+    print(f'PASS: {count} isolated checks against the mocked macOS Keychain; '
           'legacy backups, logout/new, roundtrip with new MCP auth, corruption guards, and login-only encrypted backups.')
 
 

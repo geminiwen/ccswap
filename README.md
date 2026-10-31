@@ -1,12 +1,20 @@
 # ccacc
 
-Switch official Claude Code accounts on macOS and Linux, keeping each account's
+Switch official Claude Code accounts on macOS, keeping each account's
 login, account-bound configuration, history and session files together.
+
+## Requirements
+
+- macOS only. Claude logins are read from and written to the macOS keychain
+  (`security`, `osascript`); the installer and every command except `help` and
+  `--version` refuse other platforms.
+- Bash (the system Bash 3.2 works), `curl` and `jq`; account backups also
+  require `openssl`.
+- Bash or Zsh as the interactive shell for the launch hook.
 
 ## Installation
 
-Install Bash, `curl` and `jq` first; account backups also require `openssl`.
-The shell hook supports Bash and Zsh. Install or update with the same command:
+Install or update with the same command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/geminiwen/ccswap/main/install.sh | bash

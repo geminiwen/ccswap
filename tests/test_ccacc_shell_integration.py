@@ -329,6 +329,19 @@ apply_surge() { :; }
         self.assertFalse((self.home / "operations").exists())
         self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
 
+    def test_non_macos_platform_is_refused_except_help_and_version(self):
+        self.executable("uname", '#!/bin/bash\n[ "$1" = -s ] || exit 86\nprintf "Linux\\n"\n')
+        before = self.home_snapshot()
+        for command in (("list",), ("current",), ("use", "tokyo", "--no-yolo"), ("save", "fresh"),
+                        ("new",), ("rm", "tokyo"), ("configure-shell",), ("timezone",)):
+            with self.subTest(command=command):
+                result = self.cli(*command, success=False)
+                self.assertIn("ccacc supports macOS only (uname -s reported 'Linux')", result.stderr)
+        for command in (("help",), ("--version",), ()):
+            with self.subTest(command=command):
+                self.cli(*command)
+        self.assertEqual(self.home_snapshot(), before)
+
     def test_configure_shell_needs_metadata_only_and_preserves_credentials(self):
         self.startup("bash", "TZ=UTC claude")
         (self.home / ".claude.json").unlink()

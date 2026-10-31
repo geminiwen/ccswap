@@ -85,6 +85,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIsNotNone(target, name)
             (self.bin / name).symlink_to(target)
         self.executable("curl", CURL)
+        self.executable("uname", '#!/bin/bash\n[ "$1" = -s ] || exit 86\nprintf "%s\\n" "${FAKE_UNAME-Darwin}"\n')
         self.payloads = self.fixture / "payloads"
         self.payloads.mkdir()
         (self.payloads / "ccacc").write_text(CORE)
@@ -102,7 +103,7 @@ class InstallerTests(unittest.TestCase):
                         EXPECTED_CORE=str(self.prefix / "ccacc"))
         for name in ("BASH_ENV", "ENV", "ZDOTDIR", "CLAUDE_CONFIG_DIR",
                      "CCACC_INSTALL_REPO", "CCACC_INSTALL_REF", "SETUP_EXIT", "DOWNLOAD_FAIL",
-                     "API_FAIL", "MUTABLE_REF_ADVANCES"):
+                     "API_FAIL", "MUTABLE_REF_ADVANCES", "FAKE_UNAME"):
             self.env.pop(name, None)
 
     def executable(self, name, body):
@@ -275,6 +276,17 @@ class InstallerTests(unittest.TestCase):
                     self.assert_old_pair()
                 finally:
                     hidden.rename(path)
+
+    def test_non_macos_is_refused_before_any_download_or_write(self):
+        self.existing_pair()
+        for platform in ("Linux", ""):
+            with self.subTest(platform=platform):
+                self.env["FAKE_UNAME"] = platform
+                result = self.run_installer(success=False)
+                self.assertIn("supports macOS only", result.stderr)
+                self.assertFalse(self.download_log.exists())
+                self.assertFalse(self.stage_log.exists())
+                self.assert_old_pair()
 
     def test_partial_download_of_either_file_never_clobbers(self):
         self.existing_pair()

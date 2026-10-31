@@ -13,9 +13,9 @@ import test_ccacc_shell_integration as integration
 
 MOCKS = r'''
 source "$FIXTURE_CORE" help >/dev/null
-read_credentials() { printf 'read\n' >> "$OPS"; cat "$CREDENTIALS_FILE"; }
-write_credentials() { printf 'write\n' >> "$OPS"; printf '%s\n' "$1" > "$CREDENTIALS_FILE"; }
-delete_credentials() { printf 'delete\n' >> "$OPS"; rm -f "$CREDENTIALS_FILE"; }
+read_credentials() { printf 'read\n' >> "$OPS"; cat "$STRAY_CREDENTIALS_FILE"; }
+write_credentials() { printf 'write\n' >> "$OPS"; printf '%s\n' "$1" > "$STRAY_CREDENTIALS_FILE"; }
+delete_credentials() { printf 'delete\n' >> "$OPS"; rm -f "$STRAY_CREDENTIALS_FILE"; }
 encrypt_to() { cat > "$1"; }
 decrypt_from() { cat "$1"; }
 ask_password() { printf 'password\n' >> "$OPS"; MASTER_PASSWORD=fixture; }
@@ -355,7 +355,7 @@ for entry in "${ACCOUNT_PATHS[@]}"; do rm -rf "${entry#*|}"; done
         result = self.run_body(r'''
 rm -f "$ACTIVE_FILE"
 printf '{"mcpServers":{"shared":{}}}' > "$CLAUDE_JSON"
-printf '{"mcpOAuth":{"shared":"shared-secret"}}' > "$CREDENTIALS_FILE"
+printf '{"mcpOAuth":{"shared":"shared-secret"}}' > "$STRAY_CREDENTIALS_FILE"
 for entry in "${ACCOUNT_PATHS[@]}"; do rm -rf "${entry#*|}"; done
 main use tokyo --no-yolo
 ''')

@@ -1,14 +1,13 @@
 #!/bin/bash
-# ccacc – Claude Code official account switcher for macOS/Linux
-# Claude login and account history follow the account: only claudeAiOauth from
-# "Claude Code-credentials" (or ~/.claude/.credentials.json on Linux), the account-bound keys of
+# ccacc – Claude Code official account switcher for macOS
+# Claude login and account history follow the account: only claudeAiOauth from the
+# "Claude Code-credentials" keychain item, the account-bound keys of
 # ~/.claude.json, the history/state folders under ~/.claude and the Claude CLI cache.
 # Keychain items with a suffix (other CLAUDE_CONFIG_DIRs, Orca accounts), the shared Cowork
 # device keys and the Claude desktop app are never touched. MCP OAuth and other
 # unrelated credential fields remain shared and are never restored from account backups.
 # Login backups are files encrypted with one master password (AES-256-CBC, PBKDF2)
-# Make it executable: chmod +x ccacc
-# Move to PATH: sudo mv ccacc /usr/local/bin/
+# Install with install.sh, which keeps ccacc beside its sourced companion ccacc_shell.sh
 
 set -e
 
@@ -19,7 +18,9 @@ INSTALL_COMMAND="curl -fsSL https://raw.githubusercontent.com/geminiwen/ccswap/m
 # Always the default config dir, whatever CLAUDE_CONFIG_DIR says
 CONFIG_DIR="$HOME/.claude"
 CLAUDE_JSON="$HOME/.claude.json"
-CREDENTIALS_FILE="$CONFIG_DIR/.credentials.json"
+# Claude Code on macOS can fall back to this plaintext file when the keychain is unavailable.
+# ccacc never stores logins there; 'new' only scrubs a stray claudeAiOauth from it.
+STRAY_CREDENTIALS_FILE="$CONFIG_DIR/.credentials.json"
 KEYCHAIN_SERVICE="Claude Code-credentials"
 DEVICE_KEY_SERVICE="Claude Code-device-keys"
 DEVICE_KEY_FILE="$CONFIG_DIR/.device-keys.json"
@@ -120,7 +121,7 @@ Commands:
   -v, --version         Show version information
 
 An account is everything cccleaner would wipe:
-  - only claudeAiOauth from "Claude Code-credentials" (macOS) or ~/.claude/.credentials.json (Linux)
+  - only claudeAiOauth from the "Claude Code-credentials" keychain item
   - the account-bound keys of ~/.claude.json (IDs, oauthAccount, caches, counters, projects, ...)
   - ~/.claude history/state folders (projects, file-history, statsig, telemetry, history.jsonl, ...)
   - ~/Library/Caches/claude-cli-nodejs
@@ -467,8 +468,7 @@ stop_claude() {
 # Function to point out Cowork device keys: Claude Code keeps them under one fixed keychain name
 # shared by every config dir, so ccacc leaves them alone (checks existence only, never reads them)
 note_device_keys() {
-    if [ -e "$DEVICE_KEY_FILE" ] || { command -v security &> /dev/null \
-        && security find-generic-password -s "$DEVICE_KEY_SERVICE" > /dev/null 2>&1; }; then
+    if [ -e "$DEVICE_KEY_FILE" ] || { security find-generic-password -s "$DEVICE_KEY_SERVICE" > /dev/null 2>&1; }; then
         echo -e "${YELLOW}Note: Cowork device keys (${DEVICE_KEY_SERVICE}) are shared by all Claude Code config dirs and are not switched${NC}"
     fi
 }
@@ -527,31 +527,18 @@ keychain_write() {
     [ "$(keychain_read "$1" "$2")" = "$3" ]
 }
 
-# Functions to read/write/delete Claude Code's default credentials (keychain on macOS, file elsewhere).
+# Functions to read/write/delete Claude Code's default credentials in the macOS keychain.
 # `security -s` matches the service name exactly, so suffixed items are never affected
 read_credentials() {
-    if command -v security &> /dev/null; then
-        keychain_read "$KEYCHAIN_SERVICE" "$USER"
-    elif [ -f "$CREDENTIALS_FILE" ]; then
-        cat "$CREDENTIALS_FILE"
-    fi
+    keychain_read "$KEYCHAIN_SERVICE" "$USER"
 }
 
 write_credentials() {
-    if command -v security &> /dev/null; then
-        keychain_write "$KEYCHAIN_SERVICE" "$USER" "$1"
-    else
-        (umask 077; printf '%s\n' "$1" > "$CREDENTIALS_FILE") || return 1
-        chmod 600 "$CREDENTIALS_FILE"
-    fi
+    keychain_write "$KEYCHAIN_SERVICE" "$USER" "$1"
 }
 
 delete_credentials() {
-    if command -v security &> /dev/null; then
-        security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" > /dev/null 2>&1 || true
-    else
-        rm -f "$CREDENTIALS_FILE"
-    fi
+    security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" > /dev/null 2>&1 || true
 
     local left
     left=$(read_credentials) && [ -z "$left" ]
@@ -690,11 +677,7 @@ new_identity() {
     local user_id=$(od -An -v -tx1 -N32 /dev/urandom | tr -d ' \n')
     local machine_id=$(od -An -v -tx1 -N32 /dev/urandom | tr -d ' \n')
     local uuid
-    if command -v uuidgen &> /dev/null; then
-        uuid=$(uuidgen | tr '[:upper:]' '[:lower:]')
-    else
-        uuid=$(cat /proc/sys/kernel/random/uuid)
-    fi
+    uuid=$(uuidgen | tr '[:upper:]' '[:lower:]')
 
     jq -n --arg user_id "$user_id" --arg anonymous_id "claudecode.v1.${uuid}" --arg machine_id "$machine_id" \
         '{userID: $user_id, anonymousId: $anonymous_id, machineID: $machine_id}'
@@ -1529,18 +1512,18 @@ cleanup_matching_active() {
 # both stores; malformed optional files fail preflight before either is changed.
 cleanup_credentials_file_is_valid() {
     jq -se 'length == 1 and (.[0] | type) == "object" and
-        (.[0].claudeAiOauth == null or (.[0].claudeAiOauth | type) == "object")' "$CREDENTIALS_FILE" >/dev/null
+        (.[0].claudeAiOauth == null or (.[0].claudeAiOauth | type) == "object")' "$STRAY_CREDENTIALS_FILE" >/dev/null
 }
 
 cleanup_optional_credentials_file() {
     local temporary status=0
-    [ -f "$CREDENTIALS_FILE" ] || return 0
+    [ -f "$STRAY_CREDENTIALS_FILE" ] || return 0
     cleanup_credentials_file_is_valid || return 1
-    jq -e 'has("claudeAiOauth")' "$CREDENTIALS_FILE" >/dev/null || status=$?
+    jq -e 'has("claudeAiOauth")' "$STRAY_CREDENTIALS_FILE" >/dev/null || status=$?
     case "$status" in 0) ;; 1) return 0 ;; *) return 1 ;; esac
     temporary=$(mktemp "$CONFIG_DIR/.credentials.XXXXXXXX") || return 1
-    if ! jq 'del(.claudeAiOauth)' "$CREDENTIALS_FILE" > "$temporary" \
-        || ! chmod 600 "$temporary" || ! mv "$temporary" "$CREDENTIALS_FILE"; then
+    if ! jq 'del(.claudeAiOauth)' "$STRAY_CREDENTIALS_FILE" > "$temporary" \
+        || ! chmod 600 "$temporary" || ! mv "$temporary" "$STRAY_CREDENTIALS_FILE"; then
         rm -f "$temporary"
         return 1
     fi
@@ -1566,8 +1549,8 @@ clean_unnamed_session() {
     [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] || return 1
     credentials=$(read_credentials) && credentials=$(claude_login_only "$credentials") || return 1
     [ "$credentials" = '{}' ] || return 1
-    if [ -f "$CREDENTIALS_FILE" ]; then
-        cleanup_credentials_file_is_valid && ! jq -e '.claudeAiOauth != null' "$CREDENTIALS_FILE" >/dev/null || return 1
+    if [ -f "$STRAY_CREDENTIALS_FILE" ]; then
+        cleanup_credentials_file_is_valid && ! jq -e '.claudeAiOauth != null' "$STRAY_CREDENTIALS_FILE" >/dev/null || return 1
     fi
     jq -e '.oauthAccount == null' "$CLAUDE_JSON" >/dev/null || return 1
     for entry in "${ACCOUNT_PATHS[@]}"; do
@@ -1661,8 +1644,8 @@ cleanup_rollback() {
         if [ -n "$credentials" ]; then write_credentials "$credentials" || failed=yes
         else delete_credentials || failed=yes; fi
         if [ "$optional_existed" = yes ]; then
-            (umask 077; printf '%s' "$optional_credentials" > "$CREDENTIALS_FILE") || failed=yes
-        else rm -f "$CREDENTIALS_FILE" || failed=yes; fi
+            (umask 077; printf '%s' "$optional_credentials" > "$STRAY_CREDENTIALS_FILE") || failed=yes
+        else rm -f "$STRAY_CREDENTIALS_FILE" || failed=yes; fi
         restored=$(read_credentials) && [ "$restored" = "$credentials" ] || failed=yes
     fi
     if [ -n "$config_attempted" ]; then cleanup_restore_snapshot config.json "$CLAUDE_JSON" || failed=yes; fi
@@ -1696,18 +1679,18 @@ new_command() {
     validate_unnamed_session || return 1
     # Validate the entire bounded cleanup set, including optional credentials,
     # before stopping processes or modifying any account/session metadata.
-    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE" "$UNNAMED_SESSION_FILE"; do
+    for path in "$CLAUDE_JSON" "$STRAY_CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE" "$UNNAMED_SESSION_FILE"; do
         _ccacc_shell_path "$path" file || { echo "Error: Unsafe cleanup path; cleanup incomplete: $path" >&2; return 1; }
     done
     if [ -f "$CLAUDE_JSON" ]; then
         jq -se 'length == 1 and (.[0] | type) == "object"' "$CLAUDE_JSON" >/dev/null || return 1
     fi
-    if [ -f "$CREDENTIALS_FILE" ]; then
+    if [ -f "$STRAY_CREDENTIALS_FILE" ]; then
         cleanup_credentials_file_is_valid || {
             echo "Error: Malformed optional credentials file; cleanup incomplete, credentials unchanged" >&2; return 1;
         }
         optional_existed=yes
-        optional_credentials=$(cat "$CREDENTIALS_FILE" && printf '.') || return 1
+        optional_credentials=$(cat "$STRAY_CREDENTIALS_FILE" && printf '.') || return 1
         optional_credentials=${optional_credentials%.}
     fi
     credentials=$(read_credentials) && claude_login_only "$credentials" >/dev/null || {
@@ -1746,7 +1729,7 @@ new_command() {
     # No probe writes: permission and ancestor checks are read-only. Check all
     # metadata/config/stash destinations before any irreversible work begins.
     _ccacc_shell_path "$CLEANUP_RECOVERY_DIR" dir || return 1
-    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE" "$UNNAMED_SESSION_FILE"; do
+    for path in "$CLAUDE_JSON" "$STRAY_CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE" "$UNNAMED_SESSION_FILE"; do
         cleanup_file_is_writable "$path" || { echo "Error: Cleanup destination is not writable: $path" >&2; return 1; }
     done
     cleanup_parent_is_writable "$CLEANUP_RECOVERY_DIR/data" || return 1
@@ -1861,8 +1844,22 @@ delete_command() (
     echo -e "${GREEN}Deleted account: ${name}${NC}"
 )
 
+# ccacc relies on the macOS keychain (security, osascript); refuse anything else.
+require_macos() {
+    local platform
+    platform=$(uname -s 2>/dev/null) || platform=''
+    if [ "$platform" != Darwin ]; then
+        echo "Error: ccacc supports macOS only (uname -s reported '${platform:-unknown}')" >&2
+        return 1
+    fi
+}
+
 # Main function
 main() {
+    case "${1:-}" in
+        help|--help|-h|--version|-v|"") ;;
+        *) require_macos || exit 1 ;;
+    esac
     case "${1:-}" in
         list|ls)
             list_accounts

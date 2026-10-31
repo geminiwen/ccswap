@@ -439,7 +439,7 @@ main new
         self.saved_active()
         before = self.snapshot()
         result = self.run_body("main surge kept", success=False)
-        self.assertIn("save kept", result.stderr)
+        self.assertIn("chosen when 'kept' is first saved", result.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.operations(), [])
 
@@ -526,20 +526,19 @@ main new
             self.assertIsNone(self.fixture.records(self.fixture.launches)[-1]["tz"])
             self.assertEqual(self.snapshot(), before)
 
-    def test_saved_zone_wins_legacy_pending_and_failed_activation_keeps_legacy(self):
+    def test_explicit_zone_wins_legacy_pending_and_failed_activation_keeps_legacy(self):
         self.run_body("main new")
         self.login()
         self.pending.write_text("Asia/Tokyo\n")
-        self.fixture.account("chosen", "UTC")
-        profile = (self.accounts / "chosen.json").read_bytes()
         operations = self.operations()
-        self.run_body('mkdir "$HOME/activation-directory"; ACTIVE_FILE="$HOME/activation-directory"; main save chosen', success=False)
+        self.run_body('mkdir "$HOME/activation-directory"; ACTIVE_FILE="$HOME/activation-directory"; main save chosen --timezone UTC', success=False)
         self.assertTrue(self.pending.exists())
         self.assertFalse(self.active.exists())
         self.assertFalse((self.accounts / "chosen.credentials.enc").exists())
-        self.assertEqual((self.accounts / "chosen.json").read_bytes(), profile)
+        self.assertFalse((self.accounts / "chosen.json").exists())
+        self.assertFalse((self.accounts / ".timezones/chosen").exists())
         self.assertEqual(self.operations(), operations)
-        self.run_body("main save chosen")
+        self.run_body("main save chosen --timezone UTC")
         self.assertFalse(self.pending.exists())
         self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
 
@@ -610,26 +609,26 @@ main new
                     self.assertEqual(self.hook_snapshot(), hook)
                     self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
 
-    def test_save_uses_saved_zone_or_explicit_override_and_retains_pending_on_failure(self):
+    def test_save_uses_explicit_zone_and_retains_pending_on_failure(self):
         self.run_body("main new", stdin="yes\n3\n")
         self.login()
-        self.fixture.account("chosen", "UTC")
         before = self.selection.read_bytes()
         for failure in ("ask_password() { return 1; }", "save_account() { return 1; }",
                         'setup_surge() { return 1; }'):
             with self.subTest(failure=failure):
-                self.run_body(failure + "; main save chosen", success=False)
+                self.run_body(failure + "; main save chosen --timezone UTC", success=False)
                 self.assertEqual(self.selection.read_bytes(), before)
                 self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
                 self.assertFalse(self.active.exists())
-                self.assertEqual(self.fixture.cli("timezone", "chosen").stdout, "UTC\n")
-        result = self.run_body("main save chosen", stdin="")
+                self.assertFalse((self.accounts / "chosen.json").exists())
+                self.fixture.cli("timezone", "chosen", success=False)
+        result = self.run_body("main save chosen --timezone UTC", stdin="")
         self.assertNotIn("Choose timezone", result.stderr)
         self.assertEqual(self.fixture.cli("timezone").stdout, "UTC\n")
         self.assertFalse(self.selection.exists())
         self.run_body("main new", stdin="yes\n2\n")
         self.login()
-        self.run_body("main save chosen --timezone Europe/Paris")
+        self.run_body("main save other --timezone Europe/Paris")
         self.assertEqual(self.fixture.cli("timezone").stdout, "Europe/Paris\n")
         self.assertFalse(self.selection.exists())
 

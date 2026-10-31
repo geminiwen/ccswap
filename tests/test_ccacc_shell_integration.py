@@ -342,6 +342,40 @@ apply_surge() { :; }
                 self.cli(*command)
         self.assertEqual(self.home_snapshot(), before)
 
+    def test_save_refuses_existing_inactive_profile_before_prompts_or_changes(self):
+        self.startup("bash", "TZ=UTC claude")
+        self.cli("configure-shell")
+        traces = {
+            "tokyo": None,  # an inactive account with profile JSON and timezone
+            "jsononly": lambda: (self.accounts / "jsononly.json").write_text("{}"),
+            "loginonly": lambda: (self.accounts / "loginonly.credentials.enc").write_text("x"),
+            "zoneonly": lambda: (self.accounts / ".timezones/zoneonly").write_text("UTC\n"),
+            "stashonly": lambda: ((self.accounts / "stashonly").mkdir(),
+                                  (self.accounts / "stashonly/history.jsonl").write_text("x")),
+            "danglingonly": lambda: (self.accounts / "danglingonly.json").symlink_to(
+                self.fixture / "missing-target"),
+        }
+        for create in traces.values():
+            if create:
+                create()
+        before = self.home_snapshot()
+        for name in traces:
+            for args in ("", " --timezone UTC"):
+                with self.subTest(name=name, args=args):
+                    result = self.harness(f"main save {name}{args}", success=False, stdin="1\n")
+                    self.assertIn(f"Error: Account '{name}' already exists and is not active; "
+                                  f"choose another name, or run 'ccacc use {name}' / "
+                                  f"'ccacc rm {name}' first", result.stderr)
+                    self.assertNotIn("Choose timezone", result.stderr)
+                    self.assertEqual(self.home_snapshot(), before)
+                    self.assertFalse((self.home / "operations").exists())
+        self.assertEqual((self.accounts / ".active").read_text(), "sydney\n")
+        # The active profile can still be refreshed under its own name, reusing its zone.
+        result = self.harness("main save sydney")
+        self.assertNotIn("Choose timezone", result.stderr)
+        self.assertIn("password", (self.home / "operations").read_text())
+        self.assertEqual(self.cli("timezone").stdout, "Australia/Sydney\n")
+
     def test_configure_shell_needs_metadata_only_and_preserves_credentials(self):
         self.startup("bash", "TZ=UTC claude")
         (self.home / ".claude.json").unlink()
@@ -446,10 +480,10 @@ apply_surge() { :; }
         hook.write_text('printf executed > "$HOME/hook-executed"\n')
         before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
                   for p in (self.home / ".bashrc", self.home / ".bash_profile", *hook.parent.iterdir())}
-        self.harness("main save next --timezone UTC")
+        self.harness("main save second --timezone UTC")
         self.harness("main new")
         self.env["SHELL"] = "/bin/unsupported-fixture-shell"
-        self.harness("main save next --timezone UTC")
+        self.harness("main save third --timezone UTC")
         self.harness("main new")
         self.assertEqual({p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino) for p in before}, before)
         self.assertFalse((self.home / "hook-executed").exists())

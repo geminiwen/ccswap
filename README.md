@@ -55,6 +55,15 @@ ccacc rm work                               # Confirm deletion of that profile a
 ccacc help
 ```
 
+`save <name>` creates a new profile or refreshes the **active** one under its own
+name. If `<name>` already exists (its profile JSON, encrypted login, saved timezone
+or history stash) and is not the active profile, save fails before any prompt or
+change:
+
+```text
+Error: Account 'work' already exists and is not active; choose another name, or run 'ccacc use work' / 'ccacc rm work' first
+```
+
 Save/use share one master password for encrypted login backups. Save leaves
 history and session directories in place while that account is active.
 Deleting an active profile leaves its current login/history in place but removes
@@ -73,7 +82,7 @@ A selected zone applies immediately to the unnamed session, before login or save
 It does **not** choose the timezone for a later save. Save's priority is:
 
 1. Explicit `ccacc save <name> --timezone <ZONE>`.
-2. That saved profile's existing timezone.
+2. When re-saving the active profile, its existing timezone.
 3. Its own required preset/custom picker, with no blank/default choice.
 
 A successful save or use clears unnamed-session metadata; failed saves retain it.
@@ -136,7 +145,7 @@ before cleanup; ccacc warns and refuses cleanup while those owners remain live.
 
 | Operation | Saved or moved data |
 | --- | --- |
-| `save <name>` | Only `claudeAiOauth` goes into `<name>.credentials.enc`; account-bound `~/.claude.json` fields go into `<name>.json`. Save also records the independently chosen timezone and optional Surge policies. Live directories stay in place. |
+| `save <name>` | Creates a new profile or refreshes the active one; other existing names are refused. Only `claudeAiOauth` goes into `<name>.credentials.enc`; account-bound `~/.claude.json` fields go into `<name>.json`. Save also records the independently chosen timezone and optional Surge policies. Live directories stay in place. |
 | `use <name>` | Updates the outgoing login/config backup, moves its account directories into `~/.claude/accounts/<outgoing>/`, and restores the target's saved login/config and directory stash. Saved timezone and Surge choices stay unchanged. |
 | `new` | Never auto-saves login/config or creates a named profile. After confirmation it logs out and resets account state. If the active saved identity matches the current identity, archive paths move into its stash; unmatched/unnamed paths are cleared. |
 

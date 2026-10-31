@@ -109,7 +109,7 @@ Commands:
   list, ls              List saved accounts
   current               Show the current Claude account
   save <name> [--timezone <ZONE>]
-                        Back up the current account and its timezone
+                        Back up the current account (new name or the active one)
   timezone [name]       Print the current session TZ or a named account's saved TZ
   use [name] [--yes] [--yolo|--no-yolo]
                         Pick a saved account, back up outgoing data, choose launch mode
@@ -138,7 +138,9 @@ Without a name, use requires a terminal: arrows or j/k move, Return selects,
 q, Esc, Ctrl-C or EOF cancel. --yes never automatically selects a profile.
 Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
 New offers a timezone for the unnamed session; blank or EOF leaves TZ unset.
-Save uses --timezone, then the saved account zone, then its own required picker.
+Save refuses an existing name unless it is the active profile; run 'ccacc use <name>'
+or 'ccacc rm <name>' first. Save uses --timezone, then the active profile's saved zone,
+then its own required picker.
 The unnamed selection applies only to the current session, never to save.
 Invalid choices fail before account changes; save requires an answer. Aliases never choose TZ.
 
@@ -1123,8 +1125,15 @@ save_command() (
     local _ccacc_profile_tx_dir='' _ccacc_profile_tx_committed='' _ccacc_profile_tx_writes=''
     local -a _ccacc_profile_tx_entries
     umask 077
+    check_name "$name" || return 1
     load_shell_companion || return 1
     cleanup_is_complete || return 1
+    # Only the active profile may be refreshed under its own name. Any other
+    # existing profile is refused before any prompt, password or mutation.
+    if profile_exists "$name" && [ "$(active_account)" != "$name" ]; then
+        echo "Error: Account '$name' already exists and is not active; choose another name, or run '$SCRIPT_NAME use $name' / '$SCRIPT_NAME rm $name' first" >&2
+        return 1
+    fi
     prepare_account_metadata "$@" || return 1
     check_ready || return 1
     # Every successful save invalidates current runtime consent, even for the
@@ -1177,6 +1186,17 @@ report_outgoing_backup() {
     done
     if [ "$found" = false ]; then printf '      (none archived)\n' >&2; fi
     printf 'Saved timezone (TZ) and Surge choices remain unchanged.\n' >&2
+}
+
+# Any trace of a named profile (backup, login, timezone or history stash), even a
+# broken symlink, means the name is taken.
+profile_exists() {
+    local path
+    for path in "$ACCOUNTS_DIR/$1.json" "$ACCOUNTS_DIR/$1.credentials.enc" \
+        "$TIMEZONES_DIR/$1" "$ACCOUNTS_DIR/$1"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then return 0; fi
+    done
+    return 1
 }
 
 # Shared by discovery and the final selected-target check; never reads credentials.
@@ -1381,7 +1401,7 @@ use_command() (
         return 1
     fi
     zone=$(timezone_command "$name") || {
-        echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME save $name --timezone <ZONE>' first" >&2
+        echo "Error: No valid saved timezone for '$name'; remove it with '$SCRIPT_NAME rm $name' and save the login again with --timezone <ZONE>" >&2
         return 1
     }
     check_ready || return 1
@@ -1794,7 +1814,8 @@ new_command() {
 
 # Compatibility redirect: only save records per-profile metadata.
 surge_command() {
-    echo "Error: Surge policies are recorded by '$SCRIPT_NAME save ${1:-<name>}'" >&2
+    # Re-saving keeps an existing <name>.surge, so only a fresh save asks again.
+    echo "Error: Surge policies are chosen when '${1:-<name>}' is first saved; to choose again, run '$SCRIPT_NAME rm ${1:-<name>}' and save it again" >&2
     return 1
 }
 
@@ -1874,7 +1895,7 @@ main() {
         timezone)
             [ "$#" -le 3 ] || return 1
             if [ "$#" -eq 3 ]; then
-                echo "Error: timezone is read-only; use '$SCRIPT_NAME save $2 --timezone <ZONE>'" >&2
+                echo "Error: timezone is read-only; switch with '$SCRIPT_NAME use $2', then run '$SCRIPT_NAME save $2 --timezone <ZONE>'" >&2
                 return 1
             else
                 timezone_command "${2:-}"

@@ -281,6 +281,7 @@ main use tokyo --yes --no-yolo
         self.fixture.harness("main use sydney --yolo")
         self.fixture.harness("main save renamed --timezone UTC")
         self.assertFalse(self.mode.exists())
+        self.remove_profile("sydney")
         self.fixture.harness("main save sydney --timezone UTC")
         self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
 

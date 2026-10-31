@@ -26,7 +26,7 @@ and Zsh and requires a regular absolute installation path without symlink
 components. It also works when `ccacc` is not executable: run `bash /path/to/ccacc`.
 
 ```bash
-ccacc save personal                         # Also back up the personal shell alias, if present
+ccacc save personal                         # Choose timezone on first setup; optionally back up its alias
 ccacc save work --alias work-claude         # Select a different alias to back up
 ccacc save work --timezone Australia/Sydney # Choose the timezone explicitly
 ccacc new personal --timezone Europe/London # Require a timezone before resetting login
@@ -39,11 +39,14 @@ ccacc configure-shell                       # Default to the active saved accoun
 ```
 
 `save <name>` and `new <name>` accept `--alias <alias-name>` and `--timezone <ZONE>`
-in either order. Their timezone priority is an explicit `--timezone`, an existing
-valid saved timezone, a literal TZ from the selected shell alias, then a prompt.
-There is no default timezone. Invalid input is prompted again; an empty choice
-or EOF fails before passwords, credentials, process shutdown or active-account
-changes. Invalid, missing, duplicate and unknown flags fail before any writes.
+in either order. An explicit `--timezone` takes priority; otherwise they reuse an
+existing valid timezone from `.timezones`. First setup requires an explicit numbered
+choice: UTC, Asia/Shanghai, Asia/Tokyo, Australia/Sydney, Europe/London,
+America/New_York, America/Los_Angeles, or a custom IANA timezone entry.
+There is no default or automatic detection from aliases, environment `TZ`, system
+settings or account names. Invalid input, an empty choice or EOF fails immediately
+before passwords, credentials, process shutdown, active-account changes or metadata
+writes. Invalid, missing, duplicate and unknown flags also fail before any writes.
 Save/new/use also validate the supported shell, adjacent companion, startup paths,
 managed blocks and original Claude alias without writes before accessing passwords,
 stopping processes or changing credentials. `use` requires a valid saved timezone;
@@ -65,32 +68,26 @@ An absent alias creates no alias-definition backup; save/new can still proceed
 with a saved timezone, `--timezone`, or a valid prompted choice.
 
 Backups are JSON in `~/.claude/accounts/.aliases/<account>.json`, written atomically with
-mode `600`. They contain `aliasName`, the original `definition`, and `env` with
-only a validated `TZ` when available. The hidden `.aliases` directory cannot be
-an account name and stays separate from account history stashes. For example:
+mode `600`. They contain only `aliasName` and the original `definition`.
+The hidden `.aliases` directory cannot be an account name and stays separate
+from account history stashes. For example:
 
 ```json
 {
   "aliasName": "work-claude",
-  "definition": "TZ='Asia/Tokyo' claude",
-  "env": {"TZ": "Asia/Tokyo"}
+  "definition": "TZ='Asia/Tokyo' claude"
 }
 ```
 
-TZ extraction supports leading shell assignments, optionally following `env`
-or the known `_op_agent env` wrapper,
-with bare, single-quoted, or double-quoted literal timezone values. Variables,
-command substitutions, invalid zones, and TZ text in later command arguments
-are ignored. Zones must use safe timezone-name characters and exist as files
-under `/usr/share/zoneinfo`. A new valid literal TZ replaces `env.TZ` in the alias
-backup; the independent timezone selection keeps priority for queries and saves.
-If a captured alias has no valid literal TZ, its definition is updated while any
-existing validated TZ is preserved. Other environment values are not copied to `env`;
-the full alias definition remains in the private backup.
+Alias definitions are raw backups and never provide an account timezone, even
+when they contain a literal `TZ`. New backups do not extract or store `env.TZ`.
+Legacy alias records may remain on disk; their `env.TZ` is ignored. Zones selected
+explicitly must use safe timezone-name characters and exist as files under
+`/usr/share/zoneinfo`.
 
-`ccacc timezone` reads valid independent timezone metadata first, then falls back
-to a valid TZ in the captured alias backup. It never starts a shell, asks for a master
-password, accesses credentials, stops processes, or changes account state. It
+`ccacc timezone` reads only independent `.timezones` metadata. It never prompts,
+starts a shell, asks for a master password, accesses credentials, stops processes,
+or changes account state. It
 prints one validated timezone and a newline on success. Missing or invalid TZ
 returns nonzero with no stdout. `ccacc rm <account>` also removes that account's alias backup and
 independent timezone metadata; metadata alone does not make an account appear

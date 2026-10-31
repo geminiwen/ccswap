@@ -221,6 +221,27 @@ apply_surge() { :; }
                 # Installing for another account never changes the active account.
                 self.assertEqual(self.records(self.launches)[0]["tz"], "Australia/Sydney")
 
+    def test_runtime_hook_never_prompts_or_uses_legacy_alias_timezone(self):
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                if shell == "zsh":
+                    self.reset_fixture()
+                self.startup(shell, "TZ=Asia/Tokyo claude", zdotdir=shell == "zsh")
+                self.cli("configure-shell")
+                (self.accounts / ".timezones/sydney").unlink()
+                aliases = self.accounts / ".aliases"
+                aliases.mkdir()
+                (aliases / "sydney.json").write_text(json.dumps({"env": {"TZ": "Asia/Tokyo"}}))
+                before = {path.relative_to(self.home): path.read_bytes()
+                          for path in self.home.rglob("*") if path.is_file()}
+                hook = shlex.quote(str(self.home / ".ccacc-shell/hook.sh"))
+                result = self.interactive(shell, f". {hook}\nclaude\nexit 0\n", startup=False)
+                self.assertIn("cannot read the active account timezone", result.stderr)
+                self.assertNotIn("Choose timezone", result.stderr)
+                self.assertFalse(self.launches.exists())
+                self.assertEqual(before, {path.relative_to(self.home): path.read_bytes()
+                                          for path in self.home.rglob("*") if path.is_file()})
+
     def test_save_new_use_and_same_account_use_install_hook(self):
         self.startup("bash", "TZ=UTC claude --model fixture")
         result = self.harness("main save sydney --timezone Australia/Sydney")
@@ -309,11 +330,12 @@ apply_surge() { :; }
         definition = f"TOKEN={secret} TZ=Asia/Tokyo claude --model fixture"
         self.startup("zsh", definition, zdotdir=True)
         self.assertEqual(self.probe()["definition"], definition)
-        # Exercise alias_timezone and write_alias_backup through real core paths.
-        self.harness("main save captured --alias claude")
+        # Exercise raw alias backup through real core paths with an explicit timezone.
+        self.harness("main save captured --alias claude --timezone UTC")
         backup = json.loads((self.accounts / ".aliases/captured.json").read_text())
         self.assertEqual(backup["definition"], definition)
-        self.assertEqual(backup["env"], {"TZ": "Asia/Tokyo"})
+        self.assertNotIn("env", backup)
+        self.assertEqual(self.cli("timezone", "captured").stdout, "UTC\n")
         self.assertNotIn(secret.encode(), self.argv.read_bytes())
         self.assertFalse(self.launches.exists())
 

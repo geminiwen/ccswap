@@ -117,8 +117,9 @@ Login backups are encrypted with one master password, asked once per save/use/ne
 Folders are moved, not copied, so switching is instant.
 With Surge installed, save/new ask which Surge policies the account uses and use applies them;
 without Surge no policy selection is asked.
-Save/new require a timezone: explicit --timezone, existing saved TZ, literal alias TZ,
-then a timezone prompt. An unanswered prompt fails before account changes.
+Save/new reuse a valid saved timezone or accept explicit --timezone <ZONE>.
+First setup requires a numbered timezone choice or custom IANA entry, with no default.
+Invalid or unanswered choices fail before account changes. Aliases never choose TZ.
 
 Left alone: CLAUDE_CONFIG_DIR, suffixed keychain items, the shared Cowork device keys,
 mcpOAuth, unrelated credential fields, mcpServers, settings and the Claude desktop app.
@@ -220,26 +221,6 @@ probe_alias() {
     ' 2>/dev/null
 }
 
-# Read only leading assignments (optionally after env or _op_agent env). Shell punctuation,
-# expansions and arbitrary later command arguments cannot supply a TZ. Parsing
-# stays in jq; even quotes and command substitutions in the definition are data.
-alias_timezone() {
-    printf '%s' "$1" | jq -Rsr '
-        def word: "^(?<word>(?:[^ \\t\\r\\n;|&<>()\"\u0027\\\\]|\\\\[^\\n]|\u0027[^\u0027]*\u0027|\"[^\"]*\")+)(?<rest>[\\s\\S]*)$";
-        def assignments($s; $tz):
-            ($s | sub("^[ \\t]+"; "")) as $s
-            | ((try ($s | capture(word)) catch null) // null) as $next
-            | if $next == null then $tz
-              elif ($next.word | test("^[A-Za-z_][A-Za-z0-9_]*=")) then
-                assignments($next.rest; if ($next.word | startswith("TZ=")) then $next.word else $tz end)
-              else $tz end;
-        (sub("^[ \\t]*(?:_op_agent[ \\t]+)?env[ \\t]+"; ""))
-        | assignments(.; "")
-        | try capture("^TZ=(?:\u0027(?<single>[A-Za-z0-9_+/-]+)\u0027|\"(?<double>[A-Za-z0-9_+/-]+)\"|(?<bare>[A-Za-z0-9_+/-]+))$")
-          | .single // .double // .bare // empty
-    '
-}
-
 valid_timezone() {
     [[ "$1" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] \
         && [ -f "/usr/share/zoneinfo/$1" ]
@@ -259,17 +240,11 @@ alias_command() {
 }
 
 write_alias_backup() {
-    local name="$1" alias_name="$2" captured="$3" definition zone temp_alias
-    definition=$(printf '%s' "$captured" | jq -r '.definition') || return 1
-    zone=$(alias_timezone "$definition") || return 1
-    if ! valid_timezone "$zone"; then
-        # Dynamic aliases cannot supply a literal TZ; retain only validated saved metadata.
-        zone=$(timezone_command "$name") || zone=""
-    fi
+    local name="$1" alias_name="$2" captured="$3" temp_alias
     mkdir -p -m 700 "$ACCOUNTS_DIR" "$ALIASES_DIR"
     temp_alias=$(mktemp "$ALIASES_DIR/.alias.XXXXXX") || return 1
-    if ! printf '%s' "$captured" | jq --arg name "$alias_name" --arg zone "$zone" \
-        '{aliasName: $name, definition: .definition, env: (if $zone == "" then {} else {TZ: $zone} end)}' \
+    if ! printf '%s' "$captured" | jq --arg name "$alias_name" \
+        '{aliasName: $name, definition: .definition}' \
         > "$temp_alias" || ! chmod 600 "$temp_alias" \
         || ! mv -f "$temp_alias" "$ALIASES_DIR/${name}.json"; then
         rm -f "$temp_alias"
@@ -284,15 +259,38 @@ timezone_command() {
     if [ -z "$name" ]; then name=$(active_account); fi
     check_name "$name" >/dev/null 2>&1 || return 1
     # Raw private metadata is exactly one zone, optionally followed by one newline.
-    if zone=$(jq -Rser 'select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\n?\\z"))
-        | rtrimstr("\n")' "$TIMEZONES_DIR/$name" 2>/dev/null) && valid_timezone "$zone"; then
-        printf '%s\n' "$zone"
-        return 0
-    fi
-    zone=$(jq -ser 'select(length == 1) | .[0].env.TZ | select(type == "string")
-        | select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\z"))' \
-        "$ALIASES_DIR/${name}.json" 2>/dev/null) || return 1
+    zone=$(jq -Rser 'select(test("^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*\\n?\\z"))
+        | rtrimstr("\n")' "$TIMEZONES_DIR/$name" 2>/dev/null) || return 1
     valid_timezone "$zone" || return 1
+    printf '%s\n' "$zone"
+}
+
+# An explicit first-setup choice only; never infer a zone from the environment,
+# host settings, account name or alias. stdout contains only the validated zone.
+choose_timezone() {
+    local name="$1" choice zone index
+    local zones=(UTC Asia/Shanghai Asia/Tokyo Australia/Sydney Europe/London America/New_York America/Los_Angeles)
+    printf "Timezone setup for '%s' (required, no default):\n" "$name" >&2
+    for ((index = 0; index < ${#zones[@]}; index++)); do
+        printf '  %s) %s\n' "$((index + 1))" "${zones[$index]}" >&2
+    done
+    printf '  8) Custom IANA timezone\nChoose timezone (1-8): ' >&2
+    if ! IFS= read -r choice; then
+        echo "Error: Timezone required; use --timezone <ZONE>" >&2
+        return 1
+    fi
+    case "$choice" in
+        [1-7]) zone="${zones[$((choice - 1))]}" ;;
+        8)
+            printf 'IANA timezone (e.g. Europe/Paris): ' >&2
+            if ! IFS= read -r zone; then
+                echo "Error: Timezone required; use --timezone <ZONE>" >&2
+                return 1
+            fi
+            ;;
+        *) echo "Error: Invalid timezone choice; select a number from 1 to 8" >&2; return 1 ;;
+    esac
+    valid_timezone "$zone" || { echo "Error: Invalid timezone" >&2; return 1; }
     printf '%s\n' "$zone"
 }
 
@@ -393,30 +391,16 @@ prepare_account_metadata() {
         shift 2
     done
     command -v jq >/dev/null || return 1
+    zone="$requested_zone"
+    if [ -z "$zone" ]; then zone=$(timezone_command "$name") || zone=""; fi
+    if [ -z "$zone" ]; then zone=$(choose_timezone "$name") || return 1; fi
+    PREPARED_TIMEZONE="$zone"
     if ! PREPARED_ALIAS=$(probe_alias "$PREPARED_ALIAS_NAME"); then
         echo "Warning: Could not query shell alias; backup unchanged" >&2
         PREPARED_ALIAS=""
     elif [ "$(printf '%s' "$PREPARED_ALIAS" | jq -r '.missing // false')" = true ]; then
         PREPARED_ALIAS=""
     fi
-    zone="$requested_zone"
-    if [ -z "$zone" ]; then zone=$(timezone_command "$name") || zone=""; fi
-    if [ -z "$zone" ] && [ -n "$PREPARED_ALIAS" ]; then
-        zone=$(alias_timezone "$(printf '%s' "$PREPARED_ALIAS" | jq -r '.definition')") || return 1
-        if ! valid_timezone "$zone"; then zone=""; fi
-    fi
-    while [ -z "$zone" ]; do
-        printf 'Timezone for %s (e.g. Australia/Sydney or UTC): ' "$name" >&2
-        if ! IFS= read -r zone || [ -z "$zone" ]; then
-            echo "Error: Timezone required; use --timezone <ZONE>" >&2
-            return 1
-        fi
-        if ! valid_timezone "$zone"; then
-            echo "Error: Invalid timezone" >&2
-            zone=""
-        fi
-    done
-    PREPARED_TIMEZONE="$zone"
 }
 
 save_prepared_metadata() {

@@ -55,7 +55,7 @@ ccacc_install_main() (
         esac
     done
     case "$ref" in
-        ''|/*|*/|*//*|*..*|*/./*|.|*[!A-Za-z0-9_./-]*) fail 'invalid CCACC_INSTALL_REF' ;;
+        ''|/*|*/|*//*|*..*|./*|*/./*|*/.|.|*[!A-Za-z0-9_./-]*) fail 'invalid CCACC_INSTALL_REF' ;;
     esac
 
     for tool in bash curl jq mkdir mktemp chmod cp mv rm; do
@@ -100,7 +100,27 @@ ccacc_install_main() (
     trap 'exit 143' TERM
     chmod 700 "$stage" || fail 'cannot secure staging directory'
 
-    base=https://raw.githubusercontent.com/$repo/$ref
+    # Resolve mutable names once so a branch update cannot mix file revisions.
+    # Full commit IDs already identify immutable content and need no API call.
+    commit=$ref
+    if ! [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        encoded_ref=$(jq --null-input --raw-output --arg ref "$ref" '$ref | @uri') \
+            || fail 'cannot encode CCACC_INSTALL_REF; existing installation was not changed'
+        curl --disable --fail --silent --show-error --location --proto '=https' \
+            --proto-redir '=https' --output "$stage/commit.json" \
+            "https://api.github.com/repos/$repo/commits/$encoded_ref" \
+            || fail 'commit lookup failed; existing installation was not changed; rerun the installer'
+        # Slurp rejects multiple JSON responses. Validate before command
+        # substitution so a SHA containing a trailing newline cannot pass.
+        commit=$(jq --slurp --exit-status --raw-output '
+            if length == 1 and (.[0] | type == "object") then
+                .[0].sha | select(type == "string")
+                | select(length == 40 and test("^[0-9a-fA-F]+$"))
+            else empty end
+        ' "$stage/commit.json") \
+            || fail 'invalid commit lookup response; existing installation was not changed'
+    fi
+    base=https://raw.githubusercontent.com/$repo/$commit
     for file in ccacc ccacc_shell.sh; do
         # Both the original URL and every redirect must stay on HTTPS.
         curl --disable --fail --silent --show-error --location --proto '=https' \
@@ -155,6 +175,16 @@ ccacc_install_main() (
         exit 1
     fi
     printf 'Setup complete. To update this shell, run:\n  source %q\nOr open a new terminal.\n' "$HOME/.ccacc-shell/hook.sh"
+    case "$prefix" in
+        *:*)
+            # Colons separate PATH entries; this directory cannot be one entry.
+            printf 'To run ccacc by its absolute path:\n  bash %q\n' "$prefix/ccacc" ;;
+        *)
+            case ":${PATH:-}:" in
+                *:"$prefix":*) ;;
+                *) printf 'To add ccacc to this shell PATH, run:\n  export PATH=%q:"$PATH"\n' "$prefix" ;;
+            esac ;;
+    esac
 )
 
 ccacc_install_main "$@"

@@ -13,7 +13,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
-TOOLS = ("bash", "mkdir", "mktemp", "chmod", "cp", "mv", "rm")
+TOOLS = ("bash", "jq", "mkdir", "mktemp", "chmod", "cp", "mv", "rm")
+COMMIT = "1234567890abcdef" * 2 + "12345678"
+NEXT_COMMIT = "abcdef1234567890" * 2 + "abcdef12"
 CORE = r'''#!/bin/bash
 set -eu
 printf '%s\0' "$0" "$@" >> "$SETUP_LOG"
@@ -37,11 +39,17 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --output) output=$2; shift 2 ;;
         --proto|--proto-redir) [ "$2" = '=https' ] || exit 87; shift 2 ;;
-        https://raw.githubusercontent.com/*) url=$1; shift ;;
+        https://raw.githubusercontent.com/*|https://api.github.com/*) url=$1; shift ;;
         --disable|--fail|--silent|--show-error|--location) shift ;;
         *) exit 88 ;;
     esac
 done
+case "$url" in
+    https://api.github.com/*)
+        [ "${API_FAIL:-}" != yes ] || exit 22
+        printf '%s' "$COMMIT_RESPONSE" > "$output"
+        exit 0 ;;
+esac
 file=${url##*/}
 case "$file" in ccacc|ccacc_shell.sh) ;; *) exit 89 ;; esac
 printf '%s\n' "$output" >> "$STAGE_LOG"
@@ -50,6 +58,13 @@ if [ "${DOWNLOAD_FAIL:-}" = "$file" ]; then
     exit 22
 fi
 /bin/cp "$PAYLOADS/$file" "$output"
+if [ "${MUTABLE_REF_ADVANCES:-}" = yes ]; then
+    revision=${url%/*}; revision=${revision##*/}
+    if [ "$revision" = main ] && [ -f "$BRANCH_STATE" ]; then
+        printf '#!/bin/bash\nFIXTURE_HELPER=changed\n' > "$output"
+    fi
+    if [ "$file" = ccacc ]; then printf '%s' "$NEXT_COMMIT" > "$BRANCH_STATE"; fi
+fi
 '''
 
 
@@ -69,7 +84,6 @@ class InstallerTests(unittest.TestCase):
             target = shutil.which(name)
             self.assertIsNotNone(target, name)
             (self.bin / name).symlink_to(target)
-        self.executable("jq", "#!/bin/bash\nexit 0\n")
         self.executable("curl", CURL)
         self.payloads = self.fixture / "payloads"
         self.payloads.mkdir()
@@ -83,9 +97,12 @@ class InstallerTests(unittest.TestCase):
                         SHELL="/bin/bash", TMPDIR=str(self.fixture),
                         PAYLOADS=str(self.payloads), SETUP_LOG=str(self.setup_log),
                         DOWNLOAD_LOG=str(self.download_log), STAGE_LOG=str(self.stage_log),
+                        COMMIT_RESPONSE='{"sha":"' + COMMIT + '"}',
+                        BRANCH_STATE=str(self.fixture / "branch-state"), NEXT_COMMIT=NEXT_COMMIT,
                         EXPECTED_CORE=str(self.prefix / "ccacc"))
         for name in ("BASH_ENV", "ENV", "ZDOTDIR", "CLAUDE_CONFIG_DIR",
-                     "CCACC_INSTALL_REPO", "CCACC_INSTALL_REF", "SETUP_EXIT", "DOWNLOAD_FAIL"):
+                     "CCACC_INSTALL_REPO", "CCACC_INSTALL_REF", "SETUP_EXIT", "DOWNLOAD_FAIL",
+                     "API_FAIL", "MUTABLE_REF_ADVANCES"):
             self.env.pop(name, None)
 
     def executable(self, name, body):
@@ -132,13 +149,18 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.prefix / "ccacc_shell.sh").stat().st_mode), 0o600)
         args = self.log_args(self.download_log)
         for file in ("ccacc", "ccacc_shell.sh"):
-            self.assertIn("https://raw.githubusercontent.com/geminiwen/ccswap/main/" + file, args)
+            self.assertIn("https://raw.githubusercontent.com/geminiwen/ccswap/" + COMMIT + "/" + file, args)
+        self.assertEqual(args.count("https://api.github.com/repos/geminiwen/ccswap/commits/main"), 1)
         for flag in ("--disable", "--fail", "--location", "--proto", "--proto-redir"):
-            self.assertEqual(args.count(flag), 2)
+            self.assertEqual(args.count(flag), 3)
         self.assertEqual(self.log_args(self.setup_log), [str(self.prefix / "ccacc"), "configure-shell"])
         self.assertIn("source " + shlex.quote(str(self.home / ".ccacc-shell/hook.sh")),
                       self.shell_unescape_source(result.stdout))
         self.assertIn("new terminal", result.stdout)
+        line = next(line.strip() for line in result.stdout.splitlines() if line.strip().startswith("export PATH="))
+        probe = subprocess.run(["/bin/bash", "-c", line + "\ncommand -v ccacc"], env=self.env,
+                               text=True, capture_output=True, timeout=15, check=True)
+        self.assertEqual(probe.stdout.strip(), str(self.prefix / "ccacc"))
         for stage in self.stage_log.read_text().splitlines():
             self.assertFalse(Path(stage).parent.exists())
 
@@ -159,8 +181,74 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue((self.prefix / "ccacc").is_file())
         args = self.log_args(self.download_log)
         for name in ("ccacc", "ccacc_shell.sh"):
-            self.assertIn("https://raw.githubusercontent.com/fixture-owner/fixture.repo/release/test-1/" + name, args)
+            self.assertIn("https://raw.githubusercontent.com/fixture-owner/fixture.repo/" + COMMIT + "/" + name, args)
+        self.assertIn("https://api.github.com/repos/fixture-owner/fixture.repo/commits/release%2Ftest-1", args)
         self.assertFalse((self.home / ".local").exists())
+
+    def test_main_advances_but_downloads_use_one_resolved_commit(self):
+        self.env["MUTABLE_REF_ADVANCES"] = "yes"
+        self.run_installer()
+        self.assertEqual(Path(self.env["BRANCH_STATE"]).read_text(), NEXT_COMMIT)
+        urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
+        self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccswap/commits/main",
+                               "https://raw.githubusercontent.com/geminiwen/ccswap/" + COMMIT + "/ccacc",
+                               "https://raw.githubusercontent.com/geminiwen/ccswap/" + COMMIT + "/ccacc_shell.sh"])
+
+    def test_explicit_full_sha_bypasses_api(self):
+        for commit in (COMMIT, COMMIT.upper()):
+            with self.subTest(commit=commit):
+                self.download_log.unlink(missing_ok=True)
+                self.env.update(CCACC_INSTALL_REF=commit, API_FAIL="yes")
+                self.run_installer()
+                urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
+                self.assertEqual(urls, ["https://raw.githubusercontent.com/geminiwen/ccswap/" + commit + "/" + name
+                                        for name in ("ccacc", "ccacc_shell.sh")])
+
+    def test_api_failure_and_invalid_responses_never_clobber_or_fetch_files(self):
+        self.existing_pair()
+        responses = ["", "not json", "null", "[]", "{}", '{"sha":null}',
+                     '{"sha":1234567890123456789012345678901234567890}',
+                     '{"sha":["' + COMMIT + '"]}', '{"sha":"' + COMMIT + 'g"}',
+                     '{"sha":"' + COMMIT[:-1] + '"}', '{"sha":"' + "g" * 40 + '"}',
+                     '{"sha":"' + COMMIT + '\\n"}',
+                     '{"sha":"' + COMMIT + '"}\n{"sha":"' + NEXT_COMMIT + '"}']
+        for api_fail, response in [("yes", self.env["COMMIT_RESPONSE"]),
+                                   *(("", response) for response in responses)]:
+            with self.subTest(api_fail=api_fail, response=response):
+                self.download_log.unlink(missing_ok=True)
+                self.env.update(API_FAIL=api_fail, COMMIT_RESPONSE=response)
+                self.run_installer(success=False)
+                self.assert_old_pair()
+                self.assertFalse(self.stage_log.exists())
+                urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
+                self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccswap/commits/main"])
+
+    def test_short_sha_is_resolved_through_api(self):
+        self.env["CCACC_INSTALL_REF"] = COMMIT[:12]
+        self.run_installer()
+        self.assertIn("https://api.github.com/repos/geminiwen/ccswap/commits/" + COMMIT[:12],
+                      self.log_args(self.download_log))
+
+    def test_missing_prefix_on_path_prints_executable_export(self):
+        self.prefix = self.fixture / "bin with 'quotes' $dollar `ticks`"
+        self.env["EXPECTED_CORE"] = str(self.prefix / "ccacc")
+        result = self.run_installer("--prefix", str(self.prefix))
+        line = next(line.strip() for line in result.stdout.splitlines() if line.strip().startswith("export PATH="))
+        probe = subprocess.run(["/bin/bash", "-c", line + '\ncommand -v ccacc\nprintf "%s" "$PATH"'],
+                               env=self.env, text=True, capture_output=True, timeout=15, check=True)
+        self.assertEqual(probe.stdout, str(self.prefix / "ccacc") + "\n" + str(self.prefix) + ":" + self.env["PATH"])
+
+    def test_prefix_already_on_path_needs_no_export(self):
+        self.env["PATH"] += ":" + str(self.prefix)
+        self.assertNotIn("export PATH=", self.run_installer().stdout)
+
+    def test_colon_prefix_prints_usable_absolute_command(self):
+        self.prefix = self.fixture / "bin:with colon"
+        self.env["EXPECTED_CORE"] = str(self.prefix / "ccacc")
+        result = self.run_installer("--prefix", str(self.prefix))
+        line = next(line for line in result.stdout.splitlines() if line.startswith("  bash "))
+        self.assertEqual(shlex.split(line), ["bash", str(self.prefix / "ccacc")])
+        self.assertNotIn("export PATH=", result.stdout)
 
     def test_stdin_is_not_consumed_by_setup(self):
         command = ["/bin/bash", "-c", 'bash "$1"; status=$?; IFS= read -r line; '
@@ -174,7 +262,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.log_args(self.setup_log), [str(self.prefix / "ccacc"), "configure-shell"])
 
     def test_missing_prerequisites_fail_before_download_or_clobber(self):
-        for name in ("curl", "jq", *TOOLS):
+        for name in ("curl", *TOOLS):
             with self.subTest(tool=name):
                 self.existing_pair()
                 path = self.bin / name
@@ -244,7 +332,10 @@ import sys
 args = sys.argv[1:]
 output = Path(args[args.index('--output') + 1])
 assert stat.S_IMODE(output.parent.stat().st_mode) == 0o700
-shutil.copyfile(Path(os.environ['PAYLOADS']) / output.name, output)
+if args[-1].startswith('https://api.github.com/'):
+    output.write_text(os.environ['COMMIT_RESPONSE'])
+else:
+    shutil.copyfile(Path(os.environ['PAYLOADS']) / output.name, output)
 ''')
         self.run_installer()
 
@@ -318,8 +409,11 @@ shutil.copyfile(Path(os.environ['PAYLOADS']) / output.name, output)
         for args in cases:
             with self.subTest(args=args):
                 self.run_installer(*args, success=False)
-        for name, values in (("CCACC_INSTALL_REPO", ["a", "a/b/c", "a/..", "a:b/c", "a/b?token=secret"]),
-                             ("CCACC_INSTALL_REF", ["../main", "/main", "main/", "main?token=secret"])):
+        for name, values in (("CCACC_INSTALL_REPO", ["a", "a/b/c", "a/..", "a:b/c", "a/b?token=secret",
+                                                    "/b", "a/", "./b", "a//b", "a/b#fragment"]),
+                             ("CCACC_INSTALL_REF", ["../main", "/main", "main/", "main?token=secret",
+                                                   "./main", "main/.", "main/./next", "main//next",
+                                                   "main%2Fnext", "main#fragment", COMMIT + "\n"])):
             for value in values:
                 with self.subTest(name=name, value=value):
                     self.env[name] = value

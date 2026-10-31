@@ -65,7 +65,7 @@ new_identity() { printf '{"userID":"new-fixture-id","anonymousId":"new-anonymous
     def new_input(self, zone_answer=""):
         # The confirmation is asked only for a login no matching profile owns.
         plan = self.run_body("new_cleanup_plan").stdout.strip()
-        return ("yes\n" if plan.startswith("ask:") else "") + zone_answer
+        return ("" if plan == "clean" or plan.startswith("save:") else "yes\n") + zone_answer
 
     def mismatch_active(self):
         config = json.loads(self.config.read_text())
@@ -476,10 +476,40 @@ main new
         self.saved_active()
         self.run_body("main new")
         self.ops.unlink(missing_ok=True)
+        profiles = {p: p.read_bytes() for p in self.accounts.glob("kept.*")}
         result = self.run_body("main new")
         self.assertIn("Not logged in; cleaning without a backup.", result.stderr)
         self.assertNotIn("Have you already run", result.stderr)
         self.assertNotIn("password", self.operations())
+        self.assertEqual({p: p.read_bytes() for p in profiles}, profiles)
+
+    def logout_keeping_active(self):
+        credentials = json.loads(self.credentials.read_text())
+        credentials.pop("claudeAiOauth")
+        self.credentials.write_text(json.dumps(credentials))
+        config = json.loads(self.config.read_text())
+        config.pop("oauthAccount")
+        self.config.write_text(json.dumps(config))
+
+    def test_logged_out_with_active_profile_asks_and_never_saves(self):
+        self.saved_active()
+        self.logout_keeping_active()
+        before = self.snapshot()
+        result = self.run_body("main new", success=False, stdin="n\n")
+        self.assertIn("Not logged in, but profile 'kept' is active", result.stderr)
+        self.assertIn("Cleanup cancelled", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn("stop", self.operations())
+        profiles = {p: p.read_bytes() for p in self.accounts.glob("kept.*")}
+        result = self.run_body(r'''
+save_account() { printf 'unexpected-save' >> "$SESSION_OPERATIONS"; return 98; }
+main new
+''', stdin="yes\n")
+        self.assertIn("Cleaned current account", result.stdout)
+        self.assertNotIn("unexpected-save", self.operations())
+        self.assertNotIn("password", self.operations())
+        self.assertEqual({p: p.read_bytes() for p in profiles}, profiles)
+        self.assertFalse(self.active.exists())
 
     def test_legacy_surge_setter_cannot_write_outside_save(self):
         self.saved_active()

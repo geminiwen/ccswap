@@ -1754,7 +1754,8 @@ cleanup_rollback() {
 
 # How new treats the current login before cleaning it:
 #   save:<name>  logged in as the active profile's identity; refresh that backup first
-#   clean        logged out, and any active profile owns the history; nothing to lose
+#   clean        logged out and no active profile; nothing to lose
+#   logout:<name> logged out while a profile is active; ask, never save over its backup
 #   ask:<name>   the active profile does not match the current login
 #   ask:         a login that no profile owns
 # Reads only ~/.claude.json while logged in; credentials only to prove a logout.
@@ -1771,15 +1772,16 @@ new_cleanup_plan() {
         || [ "$credentials" != '{}' ] \
         || { [ -f "$STRAY_CREDENTIALS_FILE" ] && ! jq -e '.claudeAiOauth == null' "$STRAY_CREDENTIALS_FILE" >/dev/null 2>&1; }; then
         echo "ask:$active"
-    elif [ -z "$active" ] || [ "$matching" = "$active" ]; then
+    elif [ -z "$active" ]; then
         echo clean
     else
-        echo "ask:$active"
+        echo "logout:$active"
     fi
 }
 
 # Full current-account cleanup. The active profile's own login is backed up
-# first; a logout is cleaned directly; anything else needs confirmation.
+# first; a logout with no active profile is cleaned directly; anything else
+# needs confirmation.
 new_command() {
     local active confirmation credentials entry path label selected_zone plan save_name=''
     local optional_credentials='' optional_existed='' credentials_attempted='' config_attempted='' metadata_attempted=''
@@ -1810,7 +1812,9 @@ new_command() {
         clean)
             echo "Not logged in; cleaning without a backup." >&2 ;;
         *)
-            if [ -n "${plan#ask:}" ]; then
+            if [ "${plan%%:*}" = logout ]; then
+                echo "Not logged in, but profile '${plan#logout:}' is active; its saved login will not be updated." >&2
+            elif [ -n "${plan#ask:}" ]; then
                 echo "The current login does not match active profile '${plan#ask:}'; that profile will not be updated." >&2
             fi
             printf "Have you already run '$SCRIPT_NAME save <name>' to back up this account? (y/N): " >&2

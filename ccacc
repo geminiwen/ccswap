@@ -67,6 +67,7 @@ ACCOUNT_PATHS=(
     "paste-cache|$CONFIG_DIR/paste-cache"
     "plans|$CONFIG_DIR/plans"
     "projects|$CONFIG_DIR/projects"
+    "sessions|$CONFIG_DIR/sessions"
     "session-env|$CONFIG_DIR/session-env"
     "shell-snapshots|$CONFIG_DIR/shell-snapshots"
     "stats-cache.json|$CONFIG_DIR/stats-cache.json"
@@ -1556,7 +1557,7 @@ cleanup_is_complete() {
 }
 
 clean_unnamed_session() {
-    local credentials path entry
+    local credentials path entry session_entry
     [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] || return 1
     credentials=$(read_credentials) && credentials=$(claude_login_only "$credentials") || return 1
     [ "$credentials" = '{}' ] || return 1
@@ -1566,6 +1567,15 @@ clean_unnamed_session() {
     jq -e '.oauthAccount == null' "$CLAUDE_JSON" >/dev/null || return 1
     for entry in "${ACCOUNT_PATHS[@]}"; do
         path=${entry#*|}
+        # A logged-out CLI may leave only an empty registry directory. This
+        # contains no session to preserve; hidden entries and links still count.
+        if [ "$path" = "$CONFIG_DIR/sessions" ] && [ -d "$path" ] && [ ! -L "$path" ]; then
+            [ -r "$path" ] && [ -x "$path" ] || return 1
+            for session_entry in "$path"/* "$path"/.[!.]* "$path"/..?*; do
+                [ ! -e "$session_entry" ] && [ ! -L "$session_entry" ] || return 1
+            done
+            continue
+        fi
         [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
     done
 }
@@ -1699,7 +1709,7 @@ new_command() {
         echo "Error: Cannot read valid credentials; cleanup incomplete" >&2; return 1;
     }
     for entry in "${ACCOUNT_PATHS[@]}"; do cleanup_paths+=("${entry#*|}"); done
-    for entry in sessions ide daemon jobs remote-settings.json policy-limits.json policy-limits.json.stamp.json plugins/plugin-directory-cache-v2.json plugins/plugin-catalog-cache.json; do
+    for entry in ide daemon jobs remote-settings.json policy-limits.json policy-limits.json.stamp.json plugins/plugin-directory-cache-v2.json plugins/plugin-catalog-cache.json; do
         cleanup_paths+=("$CONFIG_DIR/$entry")
     done
     _ccacc_shell_path "$HOME/.claude_backups" dir || {

@@ -58,6 +58,14 @@ class UseConfirmationTests(unittest.TestCase):
         cache = self.home / "Library/Caches/claude-cli-nodejs"
         cache.mkdir(parents=True)
         (cache / "cache").write_text("cache-secret")
+        self.sessions = self.home / ".claude/sessions"
+        self.sessions.mkdir()
+        self.session_bytes = {
+            "fixture-session.json": b'{"id":"synthetic-sydney-session","pid":12345}\n',
+            "fixture-session.key": b"\x00\xffsynthetic-session-key\x01\n",
+        }
+        for name, content in self.session_bytes.items():
+            (self.sessions / name).write_bytes(content)
         # Exercise the same presence predicate as stash_paths, including broken links.
         (self.home / ".claude/plans").symlink_to("absent-fixture-plan")
         # Preserve real implementations while observing ordering at their boundaries.
@@ -138,6 +146,9 @@ class UseConfirmationTests(unittest.TestCase):
         self.assertEqual((self.accounts / "sydney/history.jsonl").read_text(), "latest-history-secret\n")
         self.assertFalse((self.home / ".claude/history.jsonl").exists())
         self.assertEqual((self.accounts / "sydney/feedback-drafts/draft").read_text(), "draft-secret")
+        self.assertEqual({p.name: p.read_bytes() for p in (self.accounts / "sydney/sessions").iterdir()},
+                         self.session_bytes)
+        self.assertFalse(self.sessions.exists())
         self.assertTrue((self.accounts / "sydney/plans").is_symlink())
         self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"], {"shared": "shared-secret"})
         self.assertEqual((self.accounts / ".timezones/sydney").read_text(), "Australia/Sydney\n")
@@ -153,7 +164,7 @@ class UseConfirmationTests(unittest.TestCase):
         self.assertIn("profile 'sydney', then switch to 'tokyo'", stderr)
         self.assertIn("Encrypted Claude login credentials (claudeAiOauth only)", stderr)
         self.assertNotIn("Account-bound ~/.claude.json keys present:", stderr)
-        for path in ("~/.claude/history.jsonl", "~/.claude/feedback/drafts", "~/.claude/plans",
+        for path in ("~/.claude/history.jsonl", "~/.claude/feedback/drafts", "~/.claude/plans", "~/.claude/sessions",
                      "~/Library/Caches/claude-cli-nodejs"):
             self.assertIn(path, stderr)
         self.assertNotIn("~/.claude/telemetry", stderr)
@@ -164,6 +175,27 @@ class UseConfirmationTests(unittest.TestCase):
             self.assertNotIn(secret, stderr + stdout)
         self.assert_switched()
         self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
+
+    def test_sessions_roundtrip_moves_exact_json_and_key_bytes(self):
+        target = self.accounts / "tokyo/sessions"
+        target.mkdir(parents=True)
+        target_bytes = {
+            "target.json": b'{"id":"synthetic-tokyo-session"}\n',
+            "target.key": b"\xfe\x00synthetic-target-key\x02",
+        }
+        for name, content in target_bytes.items():
+            (target / name).write_bytes(content)
+        self.run_body("main use tokyo --yes --no-yolo")
+        self.assertFalse(target.exists())
+        self.assertEqual({p.name: p.read_bytes() for p in self.sessions.iterdir()}, target_bytes)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.accounts / "sydney/sessions").iterdir()},
+                         self.session_bytes)
+        target_bytes["next.json"] = b'{"id":"synthetic-new-tokyo-session"}\n'
+        (self.sessions / "next.json").write_bytes(target_bytes["next.json"])
+        self.run_body("main use sydney --yes --no-yolo")
+        self.assertEqual({p.name: p.read_bytes() for p in self.sessions.iterdir()}, self.session_bytes)
+        self.assertEqual({p.name: p.read_bytes() for p in target.iterdir()}, target_bytes)
+        self.assertFalse((self.accounts / "sydney/sessions").exists())
 
     def test_use_isolates_account_caches_with_legacy_and_current_backups(self):
         caches = {

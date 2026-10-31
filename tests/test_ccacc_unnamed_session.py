@@ -119,6 +119,17 @@ main new
         (projects / "history.json").write_text("fixture history")
         (self.home / ".claude/settings.json").write_text("shared settings")
 
+    def seed_sessions(self):
+        sessions = self.home / ".claude/sessions"
+        sessions.mkdir()
+        contents = {
+            "synthetic-session.json": b'{"id":"fixture-session","pid":12345}\n',
+            "synthetic-session.key": b"\x00\xfffixture-key-bytes\x02\n",
+        }
+        for name, content in contents.items():
+            (sessions / name).write_bytes(content)
+        return contents
+
     def test_fresh_bootstrap_new_fake_login_and_named_save(self):
         for rc in self.rcs:
             rc.chmod(0o444)
@@ -164,6 +175,7 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
 
     def test_active_profile_is_saved_and_stashed_before_clean(self):
         self.saved_active()
+        sessions = self.seed_sessions()
         hook = self.hook_snapshot()
         policies = (self.accounts / "kept.surge").read_bytes()
         drafts = self.home / ".claude/feedback/drafts"
@@ -177,6 +189,8 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
                          {"claudeAiOauth": {"accessToken": "prior-backup"}})
         self.assertEqual((self.accounts / "kept/projects/history.json").read_text(), "fixture history")
         self.assertFalse((self.home / ".claude/projects").exists())
+        self.assertFalse((self.home / ".claude/sessions").exists())
+        self.assertEqual({p.name: p.read_bytes() for p in (self.accounts / "kept/sessions").iterdir()}, sessions)
         self.assertEqual((self.accounts / "kept/feedback-drafts/draft.txt").read_text(), "saved feedback draft")
         self.assertEqual(json.loads(self.credentials.read_text()), self.shared)
         self.assertEqual((self.accounts / "kept.surge").read_bytes(), policies)
@@ -189,6 +203,107 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
         self.assertNotIn("setup-surge", operations)
         self.assertNotIn("apply-surge", operations)
         self.assertEqual(self.hook_snapshot(), hook)
+
+    def test_matching_new_archives_sessions_and_restores_them_on_use(self):
+        self.saved_active()
+        sessions = self.seed_sessions()
+        self.run_body("main save kept --timezone UTC")
+        # Save writes profile metadata, leaving the live session files in place.
+        live = self.home / ".claude/sessions"
+        self.assertEqual({p.name: p.read_bytes() for p in live.iterdir()}, sessions)
+        self.assertFalse((self.accounts / "kept/sessions").exists())
+        self.run_body("main new", stdin="yes\n3\n")
+        self.assertFalse(live.exists())
+        self.assertEqual({p.name: p.read_bytes() for p in (self.accounts / "kept/sessions").iterdir()}, sessions)
+        self.run_body("main use kept")
+        self.assertEqual({p.name: p.read_bytes() for p in live.iterdir()}, sessions)
+        self.assertFalse((self.accounts / "kept/sessions").exists())
+
+    def test_new_sessions_cancellation_conflict_and_rollback_preserve_bytes(self):
+        self.saved_active()
+        sessions = self.seed_sessions()
+        before = self.snapshot()
+        self.run_body("main new", success=False, stdin="n\n")
+        self.assertEqual(self.snapshot(), before)
+        self.run_body("main new", success=False, stdin="yes\nq\n")
+        self.assertEqual(self.snapshot(), before)
+        stash = self.accounts / "kept/sessions"
+        stash.mkdir(parents=True)
+        (stash / "existing.key").write_bytes(b"synthetic-existing-stash")
+        before = self.snapshot()
+        self.run_body("main new", success=False)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn("stop", self.operations())
+        self.assertNotIn("write", self.operations())
+        (stash / "existing.key").unlink()
+        stash.rmdir()
+        self.run_body(r'''
+rm() {
+    if [ "$2" = "$ACTIVE_FILE" ]; then return 1; fi
+    command rm "$@"
+}
+main new
+''', success=False)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.home / ".claude/sessions").iterdir()}, sessions)
+        self.assertFalse(stash.exists())
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+
+    def test_unmatched_and_unnamed_new_clear_synthetic_sessions(self):
+        self.saved_active()
+        profile = (self.accounts / "kept.json").read_bytes()
+        for active in ("mismatched", "unnamed"):
+            with self.subTest(active=active):
+                self.seed_sessions()
+                if active == "mismatched":
+                    config = json.loads(self.config.read_text())
+                    config["userID"] = "different-unsaved-identity"
+                    self.config.write_text(json.dumps(config))
+                else:
+                    self.active.unlink(missing_ok=True)
+                self.run_body("main new")
+                self.assertFalse((self.home / ".claude/sessions").exists())
+                self.assertFalse((self.accounts / "kept/sessions").exists())
+                self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+                self.assertEqual((self.accounts / "kept.json").read_bytes(), profile)
+
+    def test_clean_unnamed_empty_sessions_registry_can_use_saved_profile(self):
+        self.saved_active()
+        self.run_body("main new")
+        (self.home / ".claude/sessions").mkdir()
+        self.run_body("main use kept")
+        self.assertEqual(self.active.read_text(), "kept\n")
+
+    def test_unnamed_sessions_entries_and_unsafe_registry_still_block_use(self):
+        self.saved_active()
+        self.run_body("main new")
+        sessions = self.home / ".claude/sessions"
+        sessions.mkdir()
+        for name in ("session.json", "session.key", ".hidden.key", "nested", "dangling.key"):
+            entry = sessions / name
+            if name == "nested":
+                entry.mkdir()
+            elif name == "dangling.key":
+                entry.symlink_to("absent-synthetic-session-key")
+            else:
+                entry.write_bytes(b"synthetic-unowned-session-data")
+            before = self.snapshot()
+            self.run_body("main use kept --yes --no-yolo", success=False)
+            self.assertEqual(self.snapshot(), before)
+            if entry.is_dir():
+                entry.rmdir()
+            else:
+                entry.unlink()
+        sessions.chmod(0o000)
+        try:
+            self.run_body("main use kept --yes --no-yolo", success=False)
+            self.assertFalse(self.active.exists())
+        finally:
+            sessions.chmod(0o700)
+        sessions.rmdir()
+        sessions.symlink_to(self.fixture.fixture, target_is_directory=True)
+        self.run_body("main use kept --yes --no-yolo", success=False)
+        self.assertFalse(self.active.exists())
+        self.assertNotIn("password", self.operations())
 
     def test_save_records_account_caches_and_new_removes_them(self):
         self.saved_active()

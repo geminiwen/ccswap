@@ -165,6 +165,37 @@ class UseConfirmationTests(unittest.TestCase):
         self.assert_switched()
         self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
 
+    def test_use_isolates_account_caches_with_legacy_and_current_backups(self):
+        caches = {
+            "cachedArtifactRoster": {"accountWuid": "outgoing-account", "orgWuid": "outgoing-org"},
+            "cachedUsageUtilization": {"orgWuid": "outgoing-org", "utilization": 42},
+        }
+        target_caches = {
+            "cachedArtifactRoster": {"accountWuid": "target-account", "orgWuid": "target-org"},
+            "cachedUsageUtilization": {"orgWuid": "target-org", "utilization": 7},
+        }
+        config_path = self.home / ".claude.json"
+        for incoming in ({}, target_caches):
+            with self.subTest(incoming=incoming):
+                config = json.loads(config_path.read_text())
+                config.update(caches)
+                config_path.write_text(json.dumps(config))
+                (self.accounts / "tokyo.json").write_text(json.dumps({"userID": "target-id", **incoming}))
+                self.run_body("main use tokyo --yes --no-yolo")
+                saved = json.loads((self.accounts / "sydney.json").read_text())
+                switched = json.loads(config_path.read_text())
+                for key, value in caches.items():
+                    self.assertEqual(saved[key], value)
+                    if key in incoming:
+                        self.assertEqual(switched[key], incoming[key])
+                    else:
+                        self.assertNotIn(key, switched)
+                self.assertEqual(switched["mcpServers"], config["mcpServers"])
+                self.run_body("main use sydney --yes --no-yolo")
+                restored = json.loads(config_path.read_text())
+                for key, value in caches.items():
+                    self.assertEqual(restored[key], value)
+
     def test_no_empty_eof_and_ctrl_c_preserve_all_state(self):
         for answer in (b"n\n", b"\n", b"\x04", b"\x03", b"unexpected\n"):
             with self.subTest(answer=answer):

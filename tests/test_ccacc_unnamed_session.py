@@ -189,6 +189,27 @@ mv "$HOME/logged-in.json" "$HOME/.claude.json"
         self.assertNotIn("apply-surge", operations)
         self.assertEqual(self.hook_snapshot(), hook)
 
+    def test_save_records_account_caches_and_new_removes_them(self):
+        self.saved_active()
+        caches = {
+            "cachedArtifactRoster": {"accountWuid": "fixture-account", "orgWuid": "fixture-org", "artifacts": []},
+            "cachedUsageUtilization": {"orgWuid": "fixture-org", "utilization": 42},
+        }
+        config = json.loads(self.config.read_text())
+        config.update(caches)
+        self.config.write_text(json.dumps(config))
+        self.run_body("main save kept --timezone UTC")
+        saved = (self.accounts / "kept.json").read_bytes()
+        for key, value in caches.items():
+            self.assertEqual(json.loads(saved)[key], value)
+        self.run_body("main new")
+        cleaned = json.loads(self.config.read_text())
+        for key in caches:
+            self.assertNotIn(key, cleaned)
+        self.assertEqual((self.accounts / "kept.json").read_bytes(), saved)
+        self.assertEqual(cleaned["mcpServers"], config["mcpServers"])
+        self.assertEqual(cleaned["settings"], config["settings"])
+
     def test_saved_account_uuid_can_prove_history_ownership_without_user_id(self):
         self.saved_active()
         config = json.loads(self.config.read_text())
@@ -709,6 +730,21 @@ main new
         self.run_body("claude_process_ids() { :; }; ps() { printf '321 /bin/other other\\n'; }; main new",
                       success=False, process_mocks=False)
         self.assertEqual(self.snapshot(), before)
+
+    def test_new_explains_claude_desktop_and_browser_helper_blockers(self):
+        self.run_body("main new")
+        for executable in ("/Applications/Claude.app/Contents/MacOS/Claude",
+                           "/Applications/Claude.app/Contents/Helpers/chrome-native-host"):
+            with self.subTest(executable=executable):
+                before = self.snapshot()
+                result = self.run_body(
+                    "ps() { printf '321 " + executable + "\\n'; }; main new",
+                    success=False, process_mocks=False)
+                self.assertIn("using Claude.app alongside ccacc is not recommended", result.stderr)
+                self.assertIn("Fully quit Claude.app and any browser running its extension", result.stderr)
+                self.assertEqual(result.stderr.count("Warning: Claude.app"), 1)
+                self.assertIn("Live or unverifiable", result.stderr)
+                self.assertEqual(self.snapshot(), before)
 
     def test_new_accepts_non_utf8_process_args_with_absent_bridge_owner(self):
         self.run_body("main new")

@@ -43,6 +43,7 @@ ACCOUNT_KEYS='[
     "oauthAccount", "chromeExtension", "hasShownOpus45Notice",
     "cachedChangelog", "cachedStatsigGates", "cachedDynamicConfigs", "cachedGrowthBookFeatures",
     "cachedGrowthBookFeaturesAt", "metricsStatusCache", "clientDataCache", "clientDataCacheSlots",
+    "cachedArtifactRoster", "cachedUsageUtilization",
     "additionalModelOptionsCache", "overageCreditGrantCache", "groveConfigCache",
     "passesEligibilityCache", "s1mAccessCache", "changelogLastFetched", "lastPlanModeUse",
     "passesUpsellSeenCount", "passesLastSeenRemaining",
@@ -689,6 +690,7 @@ reset_account_state() {
             .hasAvailableSubscription, .penguinModeOrgEnabled,
             .cachedChangelog, .cachedStatsigGates, .cachedDynamicConfigs, .cachedGrowthBookFeatures,
             .cachedGrowthBookFeaturesAt, .metricsStatusCache, .clientDataCache, .clientDataCacheSlots,
+            .cachedArtifactRoster, .cachedUsageUtilization,
             .additionalModelOptionsCache, .overageCreditGrantCache,
             .firstStartTime, .lastShownEmergencyTip, .companion, .lastOnboardingVersion, .lastReleaseNotesSeen,
             .githubRepoPaths, .replBridgePlaceholders)
@@ -1413,11 +1415,19 @@ cleanup_runtime_is_safe() {
         NF < 2 || $1 !~ /^[0-9]+$/ { invalid = 1 }
         {
             command = $2; sub(/^.*\//, "", command)
+            desktop_path = ($0 ~ /\/Claude[.]app\//)
+            if (desktop_path) desktop = 1
             if (command == "claude" || command == "Claude" || command ~ /^claude-(daemon|bridge|background)$/ ||
-                $0 ~ /\/Claude[.]app\// || $0 ~ /\/\.claude\/(daemon|jobs|sessions|ide)\// ||
+                desktop_path || $0 ~ /\/\.claude\/(daemon|jobs|sessions|ide)\// ||
                 (command ~ /^(node|bun|deno)$/ && $0 ~ /(\/\.claude\/|@anthropic-ai\/claude-code)/)) live = 1
         }
-        END { if (invalid) exit 2; if (live) exit 0; exit 1 }
+        END {
+            if (desktop) {
+                print "Warning: Claude.app or one of its helpers is running; using Claude.app alongside ccacc is not recommended." > "/dev/stderr"
+                print "Fully quit Claude.app and any browser running its extension, then retry." > "/dev/stderr"
+            }
+            if (invalid) exit 2; if (live) exit 0; exit 1
+        }
     ' || status=$?
     [ "$status" -eq 1 ] || return 1
     if [ -f "$CLAUDE_JSON" ]; then

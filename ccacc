@@ -28,6 +28,7 @@ ALIASES_DIR="$ACCOUNTS_DIR/.aliases"
 TIMEZONES_DIR="$ACCOUNTS_DIR/.timezones"
 PENDING_TIMEZONE_FILE="$ACCOUNTS_DIR/.pending-timezone"
 ACTIVE_FILE="$ACCOUNTS_DIR/.active"
+CLEANUP_RECOVERY_DIR="$ACCOUNTS_DIR/.cleanup-recovery"
 CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
 MASTER_PASSWORD=""
 SURGE_CLI=""
@@ -274,6 +275,7 @@ read_timezone_file() {
 timezone_command() {
     local name="${1:-}"
     if [ -z "$name" ]; then
+        [ ! -e "$CLEANUP_RECOVERY_DIR" ] || return 1
         name=$(active_account)
         if [ -z "$name" ]; then
             read_timezone_file "$PENDING_TIMEZONE_FILE"
@@ -570,7 +572,7 @@ write_credentials() {
     if command -v security &> /dev/null; then
         keychain_write "$KEYCHAIN_SERVICE" "$USER" "$1"
     else
-        (umask 077; printf '%s\n' "$1" > "$CREDENTIALS_FILE")
+        (umask 077; printf '%s\n' "$1" > "$CREDENTIALS_FILE") || return 1
         chmod 600 "$CREDENTIALS_FILE"
     fi
 }
@@ -733,7 +735,8 @@ new_identity() {
 # (keys the account doesn't have are removed, so nothing of the previous account is left behind)
 set_account_state() {
     local state="$1"
-    local temp_config=$(mktemp)
+    local temp_config
+    temp_config=$(mktemp) || return 1
 
     if ! jq --argjson keys "$ACCOUNT_KEYS" --argjson state "$state" \
         'with_entries(select(.key as $k | $keys | index($k) | not))
@@ -743,13 +746,17 @@ set_account_state() {
         return 1
     fi
 
-    cp "$temp_config" "$CLAUDE_JSON"
+    if ! cp "$temp_config" "$CLAUDE_JSON"; then
+        rm -f "$temp_config"
+        return 1
+    fi
     rm -f "$temp_config"
 }
 
 # Function to reset the account-bound keys like a fresh install (the same resets cccleaner does), with new IDs
 reset_account_state() {
-    local temp_config=$(mktemp)
+    local temp_config
+    temp_config=$(mktemp) || return 1
     local now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
 
     if ! jq --argjson ids "$(new_identity)" --arg now "$now" '
@@ -805,7 +812,10 @@ reset_account_state() {
         return 1
     fi
 
-    cp "$temp_config" "$CLAUDE_JSON"
+    if ! cp "$temp_config" "$CLAUDE_JSON"; then
+        rm -f "$temp_config"
+        return 1
+    fi
     rm -f "$temp_config"
 }
 
@@ -1001,6 +1011,7 @@ apply_surge() {
 
 # Function to print the active account name (empty if none)
 active_account() {
+    [ ! -e "$CLEANUP_RECOVERY_DIR" ] || return 0
     if [ -f "$ACTIVE_FILE" ]; then
         local name=$(cat "$ACTIVE_FILE")
         if check_name "$name" >/dev/null 2>&1 && [ -f "$ACCOUNTS_DIR/${name}.json" ]; then
@@ -1071,6 +1082,7 @@ show_current() {
 save_command() {
     local name="${1:-}"
     require_shell_hook || return 1
+    cleanup_is_complete || return 1
     prepare_account_metadata "$@" || return 1
     check_ready || return 1
     ask_password || return 1
@@ -1091,6 +1103,7 @@ save_command() {
 use_command() {
     local name="${1:-}" zone
     require_shell_hook || return 1
+    cleanup_is_complete || return 1
     check_name "$name" || return 1
     if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
         echo -e "${RED}Error: Account '${name}' not found${NC}"
@@ -1102,7 +1115,7 @@ use_command() {
         echo "Error: No valid saved timezone for '$name'; run '$SCRIPT_NAME timezone $name <ZONE>' first" >&2
         return 1
     }
-    check_ready
+    check_ready || return 1
 
     local active=$(active_account)
     if [ "$active" = "$name" ]; then
@@ -1110,14 +1123,21 @@ use_command() {
         return 0
     fi
 
-    ask_password
+    # A clean pending session has nothing to back up. An unsaved login or
+    # history must be named first, before passwords/processes or any writes.
+    if [ -z "$active" ] && ! clean_pending_session; then
+        echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
+        return 1
+    fi
+    ask_password || return 1
     stop_claude || return 1
     note_device_keys
-    backup_active
-    load_account "$name"
-    stash_paths "$active"
-    unstash_paths "$name"
-    echo "$name" > "$ACTIVE_FILE"
+    if [ -n "$active" ]; then backup_active || return 1; fi
+    load_account "$name" || return 1
+    if [ -n "$active" ]; then stash_paths "$active" || return 1; fi
+    unstash_paths "$name" || return 1
+    echo "$name" > "$ACTIVE_FILE" || return 1
+    rm -f "$PENDING_TIMEZONE_FILE" || return 1
     echo -e "${GREEN}Switched to Claude account: ${name} ($(current_email))${NC}"
     apply_surge "$name"
 }
@@ -1213,11 +1233,125 @@ cleanup_optional_credentials_file() {
     fi
 }
 
+cleanup_is_complete() {
+    if [ -e "$CLEANUP_RECOVERY_DIR" ] || [ -L "$CLEANUP_RECOVERY_DIR" ]; then
+        echo "Error: Previous cleanup incomplete; recovery data retained at $CLEANUP_RECOVERY_DIR" >&2
+        echo "Restore the paths in manifest.json and config/metadata copies before removing that directory; credentials may require a saved encrypted profile or login." >&2
+        return 1
+    fi
+}
+
+clean_pending_session() {
+    local credentials path entry
+    read_timezone_file "$PENDING_TIMEZONE_FILE" >/dev/null || return 1
+    credentials=$(read_credentials) && credentials=$(claude_login_only "$credentials") || return 1
+    [ "$credentials" = '{}' ] || return 1
+    if [ -f "$CREDENTIALS_FILE" ]; then
+        cleanup_credentials_file_is_valid && ! jq -e '.claudeAiOauth != null' "$CREDENTIALS_FILE" >/dev/null || return 1
+    fi
+    jq -e '.oauthAccount == null' "$CLAUDE_JSON" >/dev/null || return 1
+    for entry in "${ACCOUNT_PATHS[@]}"; do
+        path=${entry#*|}
+        [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+    done
+}
+
+# Check deterministic filesystem failures before moving history or touching
+# credentials. A missing parent can be created only under a writable ancestor.
+cleanup_parent_is_writable() {
+    local parent
+    parent=$(dirname "$1")
+    while [ ! -e "$parent" ]; do parent=$(dirname "$parent"); done
+    [ -d "$parent" ] && [ -w "$parent" ] && [ -x "$parent" ]
+}
+
+cleanup_file_is_writable() {
+    cleanup_parent_is_writable "$1" && { [ ! -e "$1" ] || [ -w "$1" ]; }
+}
+
+# These helpers use new_command's local transaction arrays and in-memory
+# credential snapshots. No Keychain secret is ever written to recovery files.
+cleanup_stage_and_reset() {
+    local index path entry label
+    for ((index=0; index<${#cleanup_paths[@]}; index++)); do
+        path=${cleanup_paths[index]}
+        if [ -e "$path" ]; then
+            if ! mv "$path" "$CLEANUP_RECOVERY_DIR/data/$index"; then
+                # A cross-filesystem move can leave a destination even on
+                # failure. Keep it for rollback/inspection rather than purge it.
+                if [ -e "$CLEANUP_RECOVERY_DIR/data/$index" ]; then
+                    staged_locations[index]="$CLEANUP_RECOVERY_DIR/data/$index"
+                fi
+                return 1
+            fi
+            staged_locations[index]="$CLEANUP_RECOVERY_DIR/data/$index"
+        fi
+    done
+    credentials_attempted=yes
+    replace_credentials '' && cleanup_optional_credentials_file || return 1
+    config_attempted=yes
+    if [ ! -f "$CLAUDE_JSON" ]; then (umask 077; printf '{}\n' > "$CLAUDE_JSON") || return 1; fi
+    reset_account_state || return 1
+    if [ -n "$active" ]; then
+        mkdir -p -m 700 "$ACCOUNTS_DIR/$active" || return 1
+        for ((index=0; index<${#ACCOUNT_PATHS[@]}; index++)); do
+            if [ -n "${staged_locations[index]}" ]; then
+                entry=${ACCOUNT_PATHS[index]}; label=${entry%%|*}
+                mv "${staged_locations[index]}" "$ACCOUNTS_DIR/$active/$label" || return 1
+                staged_locations[index]="$ACCOUNTS_DIR/$active/$label"
+            fi
+        done
+    fi
+    metadata_attempted=yes
+    set_pending_timezone "$zone" && rm -f "$ACTIVE_FILE"
+}
+
+cleanup_restore_snapshot() {
+    if [ -f "$CLEANUP_RECOVERY_DIR/$1" ]; then
+        cp -p "$CLEANUP_RECOVERY_DIR/$1" "$2"
+    else
+        rm -f "$2"
+    fi
+}
+
+cleanup_rollback() {
+    local index path failed='' restored
+    for ((index=${#cleanup_paths[@]}-1; index>=0; index--)); do
+        [ -n "${staged_locations[index]}" ] || continue
+        path=${cleanup_paths[index]}
+        # Never overwrite anything that appeared while cleanup was running.
+        if [ -e "$path" ] || [ -L "$path" ] \
+            || ! mv "${staged_locations[index]}" "$path"; then failed=yes; fi
+    done
+    if [ -n "$credentials_attempted" ]; then
+        if [ -n "$credentials" ]; then write_credentials "$credentials" || failed=yes
+        else delete_credentials || failed=yes; fi
+        if [ "$optional_existed" = yes ]; then
+            (umask 077; printf '%s' "$optional_credentials" > "$CREDENTIALS_FILE") || failed=yes
+        else rm -f "$CREDENTIALS_FILE" || failed=yes; fi
+        restored=$(read_credentials) && [ "$restored" = "$credentials" ] || failed=yes
+    fi
+    if [ -n "$config_attempted" ]; then cleanup_restore_snapshot config.json "$CLAUDE_JSON" || failed=yes; fi
+    if [ -n "$metadata_attempted" ]; then
+        cleanup_restore_snapshot active "$ACTIVE_FILE" || failed=yes
+        cleanup_restore_snapshot pending-timezone "$PENDING_TIMEZONE_FILE" || failed=yes
+    fi
+    if [ -z "$failed" ] && rm -rf -- "$CLEANUP_RECOVERY_DIR"; then
+        echo "Error: Account cleanup failed; previous account, credentials and history restored" >&2
+    else
+        echo "Error: Account cleanup incomplete; rollback incomplete, recovery data retained at $CLEANUP_RECOVERY_DIR" >&2
+        echo "No Keychain secrets were stored on disk; restore manifest.json paths and config/metadata copies, then use a saved encrypted profile or login if credentials could not be restored." >&2
+    fi
+}
+
 # Full current-account cleanup after explicit backup confirmation; never auto-save.
 new_command() {
     local active confirmation zone='' pending='' zone_seen='' credentials entry path label
-    local -a cleanup_paths
+    local optional_credentials='' optional_existed='' credentials_attempted='' config_attempted='' metadata_attempted=''
+    local index destination
+    local -a cleanup_paths staged_locations
     require_shell_hook || return 1
+    cleanup_is_complete || return 1
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --timezone)
@@ -1245,6 +1379,9 @@ new_command() {
         cleanup_credentials_file_is_valid || {
             echo "Error: Malformed optional credentials file; cleanup incomplete, credentials unchanged" >&2; return 1;
         }
+        optional_existed=yes
+        optional_credentials=$(cat "$CREDENTIALS_FILE" && printf '.') || return 1
+        optional_credentials=${optional_credentials%.}
     fi
     credentials=$(read_credentials) && claude_login_only "$credentials" >/dev/null || {
         echo "Error: Cannot read valid credentials; cleanup incomplete" >&2; return 1;
@@ -1279,32 +1416,64 @@ new_command() {
             fi
         done
     fi
+    # No probe writes: permission and ancestor checks are read-only. Check all
+    # metadata/config/stash destinations before any irreversible work begins.
+    _ccacc_shell_path "$CLEANUP_RECOVERY_DIR" dir || return 1
+    for path in "$CLAUDE_JSON" "$CREDENTIALS_FILE" "$ACTIVE_FILE" "$PENDING_TIMEZONE_FILE"; do
+        cleanup_file_is_writable "$path" || { echo "Error: Cleanup destination is not writable: $path" >&2; return 1; }
+    done
+    cleanup_parent_is_writable "$CLEANUP_RECOVERY_DIR/data" || return 1
+    for path in "${cleanup_paths[@]}"; do
+        if [ -e "$path" ]; then
+            cleanup_parent_is_writable "$path" || { echo "Error: History parent is not writable: $path" >&2; return 1; }
+        fi
+    done
+    if [ -n "$active" ]; then
+        for entry in "${ACCOUNT_PATHS[@]}"; do
+            cleanup_parent_is_writable "$ACCOUNTS_DIR/$active/${entry%%|*}" || {
+                echo "Error: Saved history parent is not writable" >&2; return 1;
+            }
+        done
+    fi
     if [ -z "$(active_account)" ]; then pending=$(read_timezone_file "$PENDING_TIMEZONE_FILE") || pending=''; fi
     [ -n "$zone" ] || zone=$pending
     if [ -z "$zone" ]; then zone=$(choose_timezone 'unnamed session') || return 1; fi
     cleanup_stop_processes && cleanup_runtime_is_safe || {
         echo "Error: Live or unverifiable processes/runtime owners; cleanup incomplete" >&2; return 1;
     }
-    if [ -n "$active" ]; then
-        # Existing save files remain untouched. Move only live history, retaining
-        # prior stash entries when their live counterpart is absent.
-        for entry in "${ACCOUNT_PATHS[@]}"; do
-            label=${entry%%|*}; path=${entry#*|}
-            if [ -e "$path" ]; then
-                mkdir -p -m 700 "$ACCOUNTS_DIR/$active" || return 1
-                mv "$path" "$ACCOUNTS_DIR/$active/$label" || return 1
-            fi
-        done
-    fi
     mkdir -p -m 700 "$CONFIG_DIR" || return 1
-    if [ ! -f "$CLAUDE_JSON" ]; then (umask 077; printf '{}\n' > "$CLAUDE_JSON") || return 1; fi
-    if ! replace_credentials '' || ! cleanup_optional_credentials_file || ! reset_account_state; then
-        echo "Error: Account cleanup incomplete" >&2; return 1
-    fi
-    for path in "${cleanup_paths[@]}"; do
-        cleanup_path_is_safe "$path" && rm -rf -- "$path" || { echo "Error: Account cleanup incomplete: $path" >&2; return 1; }
+    mkdir -p -m 700 "$ACCOUNTS_DIR" || return 1
+    # One bounded recovery directory also invalidates the active fastpath if the
+    # process exits or rollback fails. Its manifest contains paths, never secrets.
+    mkdir -m 700 "$CLEANUP_RECOVERY_DIR" || return 1
+    if ! mkdir -m 700 "$CLEANUP_RECOVERY_DIR/data"; then return 1; fi
+    for entry in "config.json|$CLAUDE_JSON" "active|$ACTIVE_FILE" "pending-timezone|$PENDING_TIMEZONE_FILE"; do
+        label=${entry%%|*}; path=${entry#*|}
+        if [ -f "$path" ] && ! cp -p "$path" "$CLEANUP_RECOVERY_DIR/$label"; then
+            rm -rf -- "$CLEANUP_RECOVERY_DIR"
+            return 1
+        fi
     done
-    set_pending_timezone "$zone" && rm -f "$ACTIVE_FILE" || { echo "Error: Session setup incomplete" >&2; return 1; }
+    if ! (
+        set -o pipefail
+        umask 077
+        for ((index=0; index<${#cleanup_paths[@]}; index++)); do
+            [ -e "${cleanup_paths[index]}" ] || continue
+            destination=''
+            if [ -n "$active" ] && [ "$index" -lt "${#ACCOUNT_PATHS[@]}" ]; then
+                entry=${ACCOUNT_PATHS[index]}; destination="$ACCOUNTS_DIR/$active/${entry%%|*}"
+            fi
+            jq -cn --arg source "${cleanup_paths[index]}" --arg staged "$CLEANUP_RECOVERY_DIR/data/$index" \
+                --arg saved "$destination" '{source:$source, staged:$staged, saved:$saved}' || exit 1
+        done | jq -s . > "$CLEANUP_RECOVERY_DIR/manifest.json"
+    ); then rm -rf -- "$CLEANUP_RECOVERY_DIR"; return 1; fi
+    if ! cleanup_stage_and_reset; then
+        cleanup_rollback
+        return 1
+    fi
+    rm -rf -- "$CLEANUP_RECOVERY_DIR" || {
+        echo "Error: Session cleaned, but recovery removal incomplete: $CLEANUP_RECOVERY_DIR" >&2; return 1;
+    }
     echo "Cleaned current account; started unnamed Claude session (logged out)."
     echo "Run 'claude /login', then '$SCRIPT_NAME save <name>' to name and save it."
 }

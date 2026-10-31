@@ -42,6 +42,7 @@ encrypt_to() { cat > "$1"; }
 decrypt_from() { cat "$1"; }
 ask_password() { printf 'password\n' >> "$SESSION_OPERATIONS"; MASTER_PASSWORD=fixture; }
 stop_claude() { printf 'stop\n' >> "$SESSION_OPERATIONS"; }
+note_device_keys() { :; }
 setup_surge() { printf 'setup-surge\n' >> "$SESSION_OPERATIONS"; }
 apply_surge() { printf 'apply-surge\n' >> "$SESSION_OPERATIONS"; }
 new_identity() { printf '{"userID":"new-fixture-id","anonymousId":"new-anonymous","machineID":"new-machine"}'; }
@@ -319,6 +320,213 @@ main new --timezone UTC
         self.run_body("main new --timezone UTC", success=False)
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(self.pending.exists())
+
+    def test_readonly_config_and_accounts_fail_before_cleanup(self):
+        self.saved_active()
+        for path, mode in ((self.config, 0o444), (self.credentials, 0o444), (self.accounts, 0o555)):
+            old_mode = path.stat().st_mode & 0o777
+            path.chmod(mode)
+            try:
+                before = self.snapshot()
+                result = self.run_body("main new --timezone UTC", success=False)
+                self.assertNotIn("Cleaned current account", result.stdout)
+                self.assertEqual(self.snapshot(), before)
+                self.assertNotIn("stop", self.operations())
+                self.assertNotIn("write", self.operations())
+            finally:
+                path.chmod(old_mode)
+
+    def test_readonly_stash_parent_fails_before_cleanup(self):
+        self.saved_active()
+        stash = self.accounts / "kept"
+        stash.mkdir()
+        stash.chmod(0o555)
+        try:
+            before = self.snapshot()
+            self.run_body("main new --timezone UTC", success=False)
+            self.assertEqual(self.snapshot(), before)
+            self.assertNotIn("stop", self.operations())
+        finally:
+            stash.chmod(0o700)
+
+    def test_reset_copy_failure_is_propagated(self):
+        self.saved_active()
+        before = self.config.read_bytes()
+        self.run_body('cp() { return 1; }; if reset_account_state; then exit 99; fi')
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_late_cleanup_failures_restore_history_credentials_and_markers(self):
+        self.saved_active()
+        config = self.config.read_bytes()
+        credentials = self.credentials.read_bytes()
+        profiles = {p: p.read_bytes() for p in self.accounts.glob("kept.*")}
+        recovery_copy = self.home / ".claude_backups/claude_dir_20261031_010101/history"
+        recovery_copy.parent.mkdir(parents=True)
+        recovery_copy.write_text("existing cleaner recovery history")
+        failures = (
+            'set_pending_timezone() { return 1; }',
+            'reset_account_state() { printf "{}" > "$CLAUDE_JSON"; return 1; }',
+            # The real reset helper runs under !, where Bash disables errexit.
+            'cp() { if [ "$1" != -p ] && [ "$2" = "$CLAUDE_JSON" ]; then return 1; fi; command cp "$@"; }',
+            # Pending was already replaced when the last metadata write fails.
+            'rm() { if [ "$2" = "$ACTIVE_FILE" ]; then return 1; fi; command rm "$@"; }',
+            # A failed write can have changed the store; rollback must still run.
+            'write_credentials() { printf "%s\\n" "$1" > "$CREDENTIALS_FILE"; '
+            '[ "$1" != "$(printf "%s" "$1" | jq -c "del(.claudeAiOauth)")" ]; }',
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                result = self.run_body(failure + '; main new --timezone UTC', success=False)
+                self.assertIn("restored", result.stderr)
+                self.assertNotIn("Cleaned current account", result.stdout)
+                self.assertEqual(self.config.read_bytes(), config)
+                self.assertEqual(self.credentials.read_bytes(), credentials)
+                self.assertEqual(self.active.read_text(), "kept\n")
+                self.assertFalse(self.pending.exists())
+                self.assertEqual((self.home / ".claude/projects/history.json").read_text(), "fixture history")
+                self.assertFalse((self.accounts / "kept/projects").exists())
+                self.assertEqual({p: p.read_bytes() for p in profiles}, profiles)
+                self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+                self.assertEqual(recovery_copy.read_text(), "existing cleaner recovery history")
+
+    def test_partial_history_move_is_rolled_back_without_overwriting_stashes(self):
+        self.saved_active()
+        history = self.home / ".claude/history.jsonl"
+        history.write_text("another history")
+        config = self.config.read_bytes()
+        self.run_body(r'''
+mv() {
+    if [ "$1" = "$CONFIG_DIR/history.jsonl" ]; then return 1; fi
+    command mv "$@"
+}
+main new --timezone UTC
+''', success=False)
+        self.assertEqual(self.config.read_bytes(), config)
+        self.assertEqual(history.read_text(), "another history")
+        self.assertEqual((self.home / ".claude/projects/history.json").read_text(), "fixture history")
+        self.assertEqual(self.active.read_text(), "kept\n")
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+
+    def test_failed_rollback_retains_history_and_blocks_same_active_fastpath(self):
+        self.saved_active()
+        result = self.run_body(r'''
+reset_account_state() { printf '{}' > "$CLAUDE_JSON"; return 1; }
+mv() {
+    case "$1" in */.cleanup-recovery/data/*) return 1 ;; esac
+    command mv "$@"
+}
+main new --timezone UTC
+''', success=False)
+        recovery = self.accounts / ".cleanup-recovery"
+        self.assertTrue(recovery.is_dir())
+        self.assertIn(str(recovery), result.stderr)
+        self.assertIn("fixture history", "".join(p.read_text() for p in recovery.rglob("*") if p.is_file()))
+        self.assertNotIn("fixture-login", "".join(p.read_text() for p in recovery.rglob("*") if p.is_file()))
+        self.assertEqual(recovery.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((recovery / "manifest.json").stat().st_mode & 0o777, 0o600)
+        before = self.snapshot()
+        result = self.run_body("main use kept", success=False)
+        self.assertNotIn("already active", result.stdout)
+        self.assertIn("incomplete", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_failed_move_that_created_destination_restores_history(self):
+        self.saved_active()
+        self.run_body(r'''
+mv() {
+    command mv "$@" || return 1
+    [ "$1" != "$CONFIG_DIR/projects" ]
+}
+main new --timezone UTC
+''', success=False)
+        self.assertEqual((self.home / ".claude/projects/history.json").read_text(), "fixture history")
+        self.assertEqual(self.active.read_text(), "kept\n")
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+
+    def test_keychain_rollback_failure_retains_no_secret_and_blocks_mutation(self):
+        self.saved_active()
+        keychain = self.fixture.fixture / "keychain.json"
+        keychain.write_text(json.dumps({**self.shared, "claudeAiOauth": {"accessToken": "keychain-only-secret"}}))
+        self.fixture.env["SESSION_KEYCHAIN"] = str(keychain)
+        self.run_body(r'''
+read_credentials() { cat "$SESSION_KEYCHAIN"; }
+write_credentials() {
+    if printf '%s' "$1" | jq -e 'has("claudeAiOauth")' >/dev/null; then return 1; fi
+    printf '%s' "$1" > "$SESSION_KEYCHAIN"
+}
+reset_account_state() { return 1; }
+main new --timezone UTC
+''', success=False)
+        recovery = self.accounts / ".cleanup-recovery"
+        self.assertTrue(recovery.is_dir())
+        self.assertNotIn("keychain-only-secret", "".join(p.read_text() for p in recovery.rglob("*") if p.is_file()))
+        self.assertNotIn("claudeAiOauth", json.loads(keychain.read_text()))
+        for command in ("main use kept", "main save kept", "main new --timezone UTC"):
+            before = self.snapshot()
+            self.run_body(command, success=False)
+            self.assertEqual(self.snapshot(), before)
+
+    def test_failed_new_restores_existing_pending_session(self):
+        self.run_body("main new --timezone Asia/Tokyo")
+        self.login("pending@example.invalid")
+        credentials = self.credentials.read_bytes()
+        config = self.config.read_bytes()
+        self.run_body("set_pending_timezone() { return 1; }; main new --timezone UTC", success=False)
+        self.assertEqual(self.pending.read_text(), "Asia/Tokyo\n")
+        self.assertEqual(self.credentials.read_bytes(), credentials)
+        self.assertEqual(self.config.read_bytes(), config)
+        self.assertFalse(self.active.exists())
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+
+    def test_new_loggedout_session_can_restore_saved_profile(self):
+        self.saved_active()
+        self.run_body("main new --timezone Asia/Tokyo")
+        profiles = {p: p.read_bytes() for p in self.accounts.glob("kept.*")}
+        result = self.run_body("main use kept")
+        self.assertIn("Switched", result.stdout)
+        self.assertEqual(self.active.read_text(), "kept\n")
+        self.assertFalse(self.pending.exists())
+        self.assertEqual({p: p.read_bytes() for p in profiles}, profiles)
+        self.assertEqual([p.name for p in self.accounts.glob("*.json")], ["kept.json"])
+        self.assertEqual((self.home / ".claude/projects/history.json").read_text(), "fixture history")
+        self.assertEqual(json.loads(self.credentials.read_text())["claudeAiOauth"], {"accessToken": "prior-backup"})
+        self.assertEqual(json.loads(self.credentials.read_text())["mcpOAuth"], self.shared["mcpOAuth"])
+
+    def test_new_unsaved_login_refuses_use_without_mutation(self):
+        self.saved_active()
+        self.run_body("main new --timezone Asia/Tokyo")
+        self.login("unsaved@example.invalid")
+        before = self.snapshot()
+        operations = self.operations()
+        result = self.run_body("main use kept", success=False)
+        self.assertIn("save", result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.operations(), operations + ["read"])
+
+    def test_pending_restore_config_write_failure_cannot_claim_success(self):
+        self.saved_active()
+        self.run_body("main new --timezone Asia/Tokyo")
+        config = self.config.read_bytes()
+        result = self.run_body('cp() { return 1; }; main use kept', success=False)
+        self.assertIn("Failed to restore", result.stdout + result.stderr)
+        self.assertNotIn("Switched", result.stdout)
+        self.assertEqual(self.config.read_bytes(), config)
+        self.assertFalse(self.active.exists())
+        self.assertEqual(self.pending.read_text(), "Asia/Tokyo\n")
+        self.assertEqual((self.accounts / "kept/projects/history.json").read_text(), "fixture history")
+
+    def test_pending_keychain_login_and_unowned_history_refuse_use(self):
+        self.saved_active()
+        self.run_body("main new --timezone Asia/Tokyo")
+        before = self.snapshot()
+        self.run_body('read_credentials() { printf \'{"claudeAiOauth":{"accessToken":"unsaved-keychain"}}\'; }; main use kept', success=False)
+        self.assertEqual(self.snapshot(), before)
+        history = self.home / ".claude/projects"
+        history.mkdir()
+        (history / "unsaved").write_text("must save first")
+        before = self.snapshot()
+        self.run_body("main use kept", success=False)
+        self.assertEqual(self.snapshot(), before)
 
     def test_full_cleanup_whitelist_preserves_saved_and_shared_assets(self):
         self.accounts.mkdir(parents=True)

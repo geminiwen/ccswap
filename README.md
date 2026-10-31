@@ -117,6 +117,26 @@ operation with an incomplete/error result, rather than reporting a full cleanup.
 Recognized timestamped `claude_...` recovery copies in `~/.claude_backups` are
 cleared; unrecognized backup names and all named ccacc profile backups remain.
 
+Cleanup checks writable config, metadata and history parents before stopping
+processes. It stages the bounded history/cache paths, including recognized cleaner
+recovery copies, until credentials, config and pending-session metadata succeed.
+On failure it restores the prior history, config, credentials and session markers
+where possible; Keychain snapshots stay in memory. No cleanup-success message is
+printed for a failed write.
+
+If rollback cannot finish, one protected directory at
+`~/.claude/accounts/.cleanup-recovery` retains the remaining data and blocks
+`save`, `new` and `use`, including the already-active shortcut. Its `manifest.json`
+lists original `source`, temporary `staged` and optional profile-stash `saved`
+paths. Restore each missing source from its remaining staged/saved copy without
+overwriting existing data, and restore `config.json`, `active` and
+`pending-timezone` to their original locations when those copies are present.
+After checking the restored files, remove the recovery directory; a credential
+restore failure requires the existing encrypted profile or a fresh login.
+Recovery files contain no new plaintext Keychain snapshot. A process interruption
+also leaves this guard in place for inspection instead of claiming an account is
+already active.
+
 Saved profiles, their independent timezones and Surge settings, MCP/shared device
 keys, settings, skills, plugins, knowledge, hooks, other config directories and
 Desktop state remain intact. When the active saved profile's identity matches the
@@ -133,6 +153,10 @@ zone so `claude /login` works before a profile has a name. Then `ccacc save <nam
 backs up the login, activates the named profile and clears pending metadata only
 after a successful save and activation. Repeated cleanup still requires backup
 confirmation, and can reuse the explicitly selected pending timezone.
+From a clean logged-out pending session, `ccacc use <saved-name>` restores an
+existing profile directly and clears pending metadata without creating an empty
+profile. Once the new session has a Claude login or unowned history, `use` refuses
+until `ccacc save <name>` preserves it.
 
 Run `ccacc install` explicitly, then **source the printed hook path once in your
 current shell**. Installation requires only `jq`, Bash or Zsh, the adjacent companion

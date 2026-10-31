@@ -140,6 +140,14 @@ A clean logged-out unnamed session can `use <saved-name>` directly without
 creating an empty profile. An unsaved Claude OAuth login or unowned history must
 first be preserved with `save <name>`; `use` refuses to discard it.
 
+When switching between saved accounts, `use` first updates the outgoing account's
+backup from its current login and account-bound config, then restores the target
+account. Current history and session directories are stashed for the outgoing
+account and restored when returning. A failed outgoing backup stops the switch.
+Selecting the already-active account never reloads its older backup; it only
+updates the current YOLO choice. This automatic backup keeps the saved timezone
+and Surge choice; only an explicit `save` configures those choices.
+
 On every Claude launch the hook reads the current timezone status. A valid active
 profile requires its saved zone; an unnamed session runs with `TZ` truly unset even
 if the calling shell has a zone. Only the child environment changes.

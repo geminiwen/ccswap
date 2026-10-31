@@ -159,12 +159,28 @@ printf '%s' "$(cat "$FIXTURE/target.json")" | encrypt_to "$ACCOUNTS_DIR/other.cr
 printf '{"userID":"fixture-other-id"}' > "$ACCOUNTS_DIR/other.json"
 set_timezone other UTC
 set_timezone original UTC
-use_command other
-jq '.mcpOAuth.extra = {accessToken:"fixture-new-shared"}' "$STATE" > "$FIXTURE/refreshed.json"
+# Changes made after the initial save must survive a same-account selection
+# and a round trip. Exercise real backup/restore with only system IO mocked.
+jq '.claudeAiOauth.accessToken = "fixture-original-refreshed"' "$STATE" > "$FIXTURE/refreshed.json"
 cp "$FIXTURE/refreshed.json" "$STATE"
+jq '.numStartups = 42' "$CLAUDE_JSON" > "$FIXTURE/config.json"
+cp "$FIXTURE/config.json" "$CLAUDE_JSON"
+printf 'fixture-original-latest\n' > "$CONFIG_DIR/history.jsonl"
 use_command original
+[ "$(jq -r '.claudeAiOauth.accessToken' "$STATE")" = fixture-original-refreshed ]
+[ "$(jq -r '.numStartups' "$CLAUDE_JSON")" = 42 ]
+use_command other
+jq '.mcpOAuth.extra = {accessToken:"fixture-new-shared"} | .claudeAiOauth.accessToken = "fixture-other-refreshed"' "$STATE" > "$FIXTURE/refreshed.json"
+cp "$FIXTURE/refreshed.json" "$STATE"
+printf 'fixture-other-latest\n' > "$CONFIG_DIR/history.jsonl"
+use_command original
+[ "$(jq -r '.numStartups' "$CLAUDE_JSON")" = 42 ]
+[ "$(cat "$CONFIG_DIR/history.jsonl")" = fixture-original-latest ]
+[ "$(cat "$ACCOUNTS_DIR/other/history.jsonl")" = fixture-other-latest ]
+[ "$(read_backup other credentials | jq -r '.claudeAiOauth.accessToken')" = fixture-other-refreshed ]
 ''')
             expected = json.loads(json.dumps(BASE))
+            expected['claudeAiOauth']['accessToken'] = 'fixture-original-refreshed'
             expected['mcpOAuth']['extra'] = {'accessToken': 'fixture-new-shared'}
             assert json.loads(state.read_text()) == expected
     print(f'PASS: {count} isolated checks across mocked macOS Keychain and Linux files; '

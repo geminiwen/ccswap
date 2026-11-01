@@ -17,6 +17,13 @@ import test_ccacc_use_confirmation as confirmation
 
 ENTER = '\x1b[?1049h'
 LEAVE = '\x1b[0m\x1b[?25h\x1b[?1049l\x1b[0m\x1b[?25h'
+# The only colours the picker itself emits; red is deliberately not among them.
+PALETTE = ('\x1b[1m', '\x1b[2m', '\x1b[32m', '\x1b[33m', '\x1b[36m', '\x1b[1;35m')
+
+
+def plain(output):
+    """Screen text without colour/reverse codes, for label assertions."""
+    return re.sub(r'\x1b\[[0-9;]*m', '', output)
 
 
 def rendered_frames(output, rows, columns):
@@ -42,6 +49,8 @@ def rendered_frames(output, rows, columns):
                     reverse = True
                 elif token == '\x1b[0m':
                     reverse = False
+                elif token in PALETTE:
+                    pass
                 else:
                     assert token == '\x1b[?25h', token
             else:
@@ -275,8 +284,8 @@ class ProfilePickerTests(unittest.TestCase):
     def test_initial_current_saved_labels_and_enter_fast_path(self):
         status, menu, stdout = self.run_pty(["--no-yolo"], b"\r")
         self.assertEqual(status, 0, menu + stdout)
-        self.assertIn("> sydney (active) | saved-sydney@example.test | TZ=Australia/Sydney", menu)
-        self.assertIn("  tokyo | saved-tokyo@example.test | TZ=Asia/Tokyo", menu)
+        self.assertIn("> sydney (active) | saved-sydney@example.test | TZ=Australia/Sydney", plain(menu))
+        self.assertIn("  tokyo | saved-tokyo@example.test | TZ=Asia/Tokyo", plain(menu))
         self.assertNotIn("Confirm outgoing backup", menu)
         self.assertEqual(self.case.operations(), ["stage"])
         self.assertNotIn("Choose saved profile", stdout)
@@ -287,7 +296,7 @@ class ProfilePickerTests(unittest.TestCase):
             with self.subTest(keys=keys):
                 status, menu, stdout = self.run_pty(keys=keys, yolo=b"n\n")
                 self.assertEqual(status, 0, menu + stdout)
-                self.assertIn("> tokyo | saved-tokyo@example.test", menu)
+                self.assertIn("> tokyo | saved-tokyo@example.test", plain(menu))
                 self.assertNotIn("Confirm outgoing backup", menu)
                 self.assertLess(menu.index(LEAVE), menu.index("YOLO?"))
                 self.assertLess(menu.index("YOLO?"), menu.index("Backed up outgoing"))
@@ -394,6 +403,44 @@ class ProfilePickerTests(unittest.TestCase):
         self.assertNotIn("\x1b[31m", menu)
         self.assertFalse((self.case.home / "injected").exists())
 
+    def test_plan_label_comes_from_saved_metadata_and_is_sanitized(self):
+        for name, account, label in (
+                ("sydney", {"planDisplayName": "Ultra", "organizationType": "claude_max"}, "Ultra"),
+                ("tokyo", {"organizationType": "claude_team"}, "Team")):
+            path = self.accounts / f"{name}.json"
+            saved = json.loads(path.read_text())
+            saved["oauthAccount"].update(account)
+            path.write_text(json.dumps(saved))
+        status, menu, _ = self.run_pty()
+        self.assertEqual(status, 1)
+        self.assertIn("> sydney (active) | Ultra | saved-sydney@example.test", plain(menu))
+        self.assertIn("  tokyo | Team | saved-tokyo@example.test", plain(menu))
+        # The plan is display-only metadata: never credentials, never raw escapes.
+        saved = json.loads((self.accounts / "tokyo.json").read_text())
+        saved["oauthAccount"] = {"emailAddress": "saved-tokyo@example.test", "planDisplayName": "Ul\u001b[31mtra"}
+        (self.accounts / "tokyo.json").write_text(json.dumps(saved))
+        status, menu, _ = self.run_pty()
+        self.assertIn("  tokyo | Ul?[31mtra | saved-tokyo@example.test", plain(menu))
+        self.assertNotIn("\x1b[31m", menu)
+        self.assertEqual(self.case.operations(), [])
+
+    def test_rows_are_coloured_unless_no_color_is_set(self):
+        status, menu, _ = self.run_pty()
+        self.assertEqual(status, 1)
+        self.assertIn("\x1b[1msydney", menu)
+        self.assertIn("\x1b[32m (active)", menu)
+        self.assertIn("\x1b[36msaved-tokyo@example.test", menu)
+        self.assertIn("\x1b[33mTZ=Asia/Tokyo", menu)
+        self.fixture.env["NO_COLOR"] = "1"
+        try:
+            status, menu, _ = self.run_pty()
+        finally:
+            del self.fixture.env["NO_COLOR"]
+        self.assertEqual(status, 1)
+        self.assertIn("> sydney (active) | saved-sydney@example.test", plain(menu))
+        for colour in PALETTE:
+            self.assertNotIn(colour, menu)
+
     def test_missing_or_invalid_timezone_display_and_selection_validation(self):
         for zone in (None, "bad\u001b[31m"):
             with self.subTest(zone=zone):
@@ -425,7 +472,7 @@ class ProfilePickerTests(unittest.TestCase):
                                             size=(9, 45))
         self.assertEqual(status, 0, menu)
         self.assertEqual(stdout, "account09\n")
-        self.assertIn("> account00 | TZ=UTC", menu)
+        self.assertIn("> account00 | TZ=UTC", plain(menu))
         self.assertIn("Profiles 6-10 of 22", menu)
         self.assertNotIn("account19", menu)
 

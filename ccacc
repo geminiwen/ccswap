@@ -100,6 +100,8 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[1;35m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Function to show usage
@@ -1058,6 +1060,24 @@ current_email() {
     echo "${email:-not logged in}"
 }
 
+# Print a saved profile's Claude plan, e.g. "Ultra", "Team" or "Max 5x"; empty
+# when unknown. Reads only the saved oauthAccount metadata, never credentials.
+# The server's own planDisplayName wins; otherwise the organization type names
+# the plan. Printable ASCII only, so it is safe to render in the picker.
+account_plan_label() {
+    jq -r '
+        (.oauthAccount? | if type == "object" then . else {} end) as $account
+        | def text($v): if ($v | type) == "string" then $v else "" end;
+        if text($account.planDisplayName) != "" then text($account.planDisplayName)
+        else
+            ({claude_team: "Team", claude_enterprise: "Enterprise", claude_pro: "Pro", claude_max: "Max"}
+                [text($account.organizationType)] // "") as $plan
+            | (first(text($account.organizationRateLimitTier) | capture("_(?<size>[0-9]+x)$") | .size) // null) as $size
+            | if $plan == "Max" and $size then "Max \($size)" else $plan end
+        end
+        | gsub("[^ -~]"; "?") | .[0:40]' "$1" 2>/dev/null
+}
+
 # Function to list saved accounts
 list_accounts() {
     check_ready
@@ -1070,6 +1090,9 @@ list_accounts() {
             found=1
             local name=$(basename "$file" .json)
             local email=$(jq -r '.oauthAccount.emailAddress // "not logged in"' "$file")
+            local plan=$(account_plan_label "$file")
+            email="${CYAN}${email}${NC}"
+            [ -z "$plan" ] || email="$email ${MAGENTA}[$plan]${NC}"
             local surge=""
             if [ -f "$ACCOUNTS_DIR/${name}.surge" ]; then
                 surge=" [Surge: $(jq -r 'to_entries | map("\(.key)=\(.value)") | join(", ")' "$ACCOUNTS_DIR/${name}.surge")]"
@@ -1276,11 +1299,17 @@ valid_saved_account() {
 # substitution and redirected caller stdout both work. Keep ISIG enabled for
 # Ctrl-C and restore the exact terminal state on every exit (including signals).
 pick_saved_account() (
-    local file name email zone active='' selected=0 index start end key suffix
-    local tty_state='' size rows=24 columns=80 page first row line marker
+    local file name email plan zone active='' selected=0 index start end key suffix
+    local tty_state='' size rows=24 columns=80 page first
     local screen=false resized=false read_status interrupted=0 read_started
     local LC_ALL=C
-    local -a names labels
+    local -a names plans emails zones
+    # Colour only the picker's own text; NO_COLOR (any value) turns it off.
+    local c_title=$'\033[1m' c_name=$'\033[1m' c_active=$'\033[32m' c_sep=$'\033[2m'
+    local c_plan=$'\033[1;35m' c_email=$'\033[36m' c_zone=$'\033[33m' c_hint=$'\033[2m'
+    if [ -n "${NO_COLOR:-}" ]; then
+        c_title='' c_name='' c_active='' c_sep='' c_plan='' c_email='' c_zone='' c_hint=''
+    fi
     # A local SECONDS loses its clock behavior in Bash 3.2. This assignment is
     # confined to the picker subshell and keeps Bash's elapsed-time variable.
     SECONDS=0
@@ -1294,7 +1323,7 @@ pick_saved_account() (
         active=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z"))
             | rtrimstr("\n")' "$ACTIVE_FILE" 2>/dev/null) || active=''
     fi
-    names=() labels=()
+    names=() plans=() emails=() zones=()
     for file in "$ACCOUNTS_DIR"/*.json; do
         name=${file##*/}; name=${name%.json}
         valid_saved_account "$name" || continue
@@ -1302,17 +1331,14 @@ pick_saved_account() (
         # newlines, bidi controls or shell code. Cap before rendering, too.
         email=$(jq -r '(.oauthAccount? | if type == "object" then .emailAddress else null end)
             | if type == "string" then gsub("[^ -~]"; "?") | .[0:160] else "" end' "$file") || email=''
+        plan=$(account_plan_label "$file") || plan=''
         zone=''
         if [ -f "$TIMEZONES_DIR/$name" ] && [ ! -L "$TIMEZONES_DIR/$name" ]; then
             zone=$(read_timezone_file "$TIMEZONES_DIR/$name") || zone=''
         fi
         index=${#names[@]}
-        names[index]=$name
-        line="$name"
-        [ "$name" != "$active" ] || { selected=$index; line="$line (active)"; }
-        [ -z "$email" ] || line="$line | $email"
-        [ -z "$zone" ] || line="$line | TZ=$zone"
-        labels[index]=$line
+        names[index]=$name; plans[index]=$plan; emails[index]=$email; zones[index]=$zone
+        [ "$name" != "$active" ] || selected=$index
     done
     if [ "${#names[@]}" -eq 0 ]; then
         echo "No saved profiles. Save the current account with: ccacc save <name> --timezone <ZONE>" >&2
@@ -1345,7 +1371,35 @@ pick_saved_account() (
     _ccacc_picker_line() {
         # No newlines, including at the right/bottom edge. Absolute positioning
         # clears pending autowrap before another printable character is sent.
-        printf '\033[%s;1H' "$1" >&2 && printf '%-*.*s' "$columns" "$columns" "$2" >&2
+        printf '\033[%s;1H' "$1" >&2 && printf '%s%-*.*s\033[0m' "${3:-}" "$columns" "$columns" "$2" >&2
+    }
+    # One coloured piece of a profile row, cut to the columns still left, so an
+    # escape sequence is never split and the row never wraps. Every piece starts
+    # from a reset and reapplies the row's reverse video, if any.
+    _ccacc_picker_piece() {
+        local text="$2"
+        [ "$left" -gt 0 ] || return 0
+        text=${text:0:left}
+        printf '\033[0m%s%s%s' "$base" "$1" "$text" >&2 || return 1
+        left=$((left - ${#text}))
+    }
+    _ccacc_picker_row() {
+        local index="$2" base='' left=$columns marker=' '
+        [ "$index" -ne "$selected" ] || { base=$'\033[7m'; marker='>'; }
+        printf '\033[%s;1H' "$1" >&2 || return 1
+        _ccacc_picker_piece '' "$marker " || return 1
+        _ccacc_picker_piece "$c_name" "${names[index]}" || return 1
+        if [ "${names[index]}" = "$active" ]; then _ccacc_picker_piece "$c_active" ' (active)' || return 1; fi
+        if [ -n "${plans[index]}" ]; then
+            _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_plan" "${plans[index]}" || return 1
+        fi
+        if [ -n "${emails[index]}" ]; then
+            _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_email" "${emails[index]}" || return 1
+        fi
+        if [ -n "${zones[index]}" ]; then
+            _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_zone" "TZ=${zones[index]}" || return 1
+        fi
+        printf '\033[0m%s%*s\033[0m' "$base" "$left" '' >&2
     }
     _ccacc_picker_render() {
         size=$(stty size <&3 2>/dev/null) || return 1
@@ -1362,20 +1416,16 @@ pick_saved_account() (
         [ "$end" -le "${#names[@]}" ] || end=${#names[@]}
         printf '\033[0m\033[2J\033[H' >&2 || return 1
         if [ "$rows" -ge 3 ]; then
-            _ccacc_picker_line 1 'Choose saved profile' || return 1
+            _ccacc_picker_line 1 'Choose saved profile' "$c_title" || return 1
         fi
         for ((index=start; index<end; index++)); do
-            row=$((first + index - start))
-            marker=' '; [ "$index" -ne "$selected" ] || marker='>'
-            [ "$index" -ne "$selected" ] || printf '\033[7m' >&2 || return 1
-            _ccacc_picker_line "$row" "$marker ${labels[index]}" || return 1
-            printf '\033[0m' >&2 || return 1
+            _ccacc_picker_row "$((first + index - start))" "$index" || return 1
         done
         if [ "$rows" -ge 4 ]; then
-            _ccacc_picker_line "$((rows - 1))" "Profiles $((start + 1))-$end of ${#names[@]} | Selected: ${names[selected]}" || return 1
+            _ccacc_picker_line "$((rows - 1))" "Profiles $((start + 1))-$end of ${#names[@]} | Selected: ${names[selected]}" "$c_hint" || return 1
         fi
         if [ "$rows" -ge 2 ]; then
-            _ccacc_picker_line "$rows" 'Up/Down j/k: move | Return: select | q/Esc: cancel' || return 1
+            _ccacc_picker_line "$rows" 'Up/Down j/k: move | Return: select | q/Esc: cancel' "$c_hint" || return 1
         fi
     }
     # Suppress echo even between reads and while drawing. Keep ISIG enabled.

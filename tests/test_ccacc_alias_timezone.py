@@ -226,7 +226,7 @@ main use foo
         (self.accounts / "listed.json").write_text(json.dumps({"oauthAccount": {
             "emailAddress": "listed@example.test", "organizationType": "claude_max",
             "organizationRateLimitTier": "default_claude_max_5x"}}))
-        self.assertIn("listed listed@example.test [Max 5x]", re.sub(r"\x1b\[[0-9;]*m", "", self.run_cli("list").stdout))
+        self.assertIn("listed listed@example.test [Max]", re.sub(r"\x1b\[[0-9;]*m", "", self.run_cli("list").stdout))
 
     def test_save_preserves_legacy_data_without_probes_or_new_backups(self):
         (self.home / ".claude.json").write_text("{}")

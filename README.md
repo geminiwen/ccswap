@@ -113,8 +113,7 @@ and `q`, Esc, Ctrl-C or EOF cancels. It requires terminal stdin and stderr.
 Each row shows the profile name, its Claude plan, email and timezone, in colour
 unless `NO_COLOR` is set; `list` shows the plan in brackets too. The plan comes
 from the saved account metadata only: Claude's own plan name (such as Ultra) when
-it is recorded, otherwise the organization type (Team, Enterprise, Pro, or Max
-with its 5x/20x limit).
+it is recorded, otherwise the organization type (Team, Enterprise, Pro or Max).
 
 Switching between saved accounts automatically saves the latest outgoing login
 and account configuration, then archives its history/session/cache paths,

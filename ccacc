@@ -1030,7 +1030,7 @@ current_email() {
     echo "${email:-not logged in}"
 }
 
-# Print a saved profile's Claude plan, e.g. "Ultra", "Team" or "Max 5x"; empty
+# Print a saved profile's Claude plan, e.g. "Ultra", "Team" or "Max"; empty
 # when unknown. Reads only the saved oauthAccount metadata, never credentials.
 # The server's own planDisplayName wins; otherwise the organization type names
 # the plan. Printable ASCII only, so it is safe to render in the picker.
@@ -1041,9 +1041,7 @@ account_plan_label() {
         if text($account.planDisplayName) != "" then text($account.planDisplayName)
         else
             ({claude_team: "Team", claude_enterprise: "Enterprise", claude_pro: "Pro", claude_max: "Max"}
-                [text($account.organizationType)] // "") as $plan
-            | (first(text($account.organizationRateLimitTier) | capture("_(?<size>[0-9]+x)$") | .size) // null) as $size
-            | if $plan == "Max" and $size then "Max \($size)" else $plan end
+                [text($account.organizationType)] // "")
         end
         | gsub("[^ -~]"; "?") | .[0:40]' "$1" 2>/dev/null
 }

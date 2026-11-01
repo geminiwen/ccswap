@@ -235,7 +235,11 @@ installed plugins, knowledge, shell hooks and Claude Desktop data remain in plac
 Meaningful project MCP definitions/selections survive `new`, including explicit
 `false`. Suffixed Keychain items, other Claude config directories and Cowork device
 keys are outside the account backup. New keeps the current Surge route; when
-Surge is available, save can record policies and use applies saved choices.
+Surge is available, save can record policies and use applies saved choices
+(also when the account is already active, undoing manual changes in Surge).
+`ccacc surge <name>` re-picks an account's policies, with its saved choices
+pre-selected, and applies them at once when that account is active. Picking needs
+Surge running; `ccacc help` lists the command whenever Surge is installed.
 
 ## Usage across accounts
 

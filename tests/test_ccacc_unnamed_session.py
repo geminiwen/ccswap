@@ -513,13 +513,10 @@ main new
         self.assertEqual({p: p.read_bytes() for p in profiles}, profiles)
         self.assertFalse(self.active.exists())
 
-    def test_legacy_surge_setter_cannot_write_outside_save(self):
+    def test_surge_command_repicks_and_applies_for_the_active_profile(self):
         self.saved_active()
-        before = self.snapshot()
-        result = self.run_body("main surge kept", success=False)
-        self.assertIn("chosen when 'kept' is first saved", result.stderr)
-        self.assertEqual(self.snapshot(), before)
-        self.assertEqual(self.operations(), [])
+        self.run_body("find_surge() { :; }\nsurge_groups() { printf '{}'; }\nmain surge kept")
+        self.assertEqual(self.operations(), ["setup-surge", "apply-surge"])
 
     def test_cancellation_precedes_credentials_prompts_processes_and_writes(self):
         self.saved_active()

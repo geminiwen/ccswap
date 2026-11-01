@@ -511,14 +511,14 @@ main use tokyo --no-yolo
                 self.assertEqual(self.snapshot(), before)
                 self.assertEqual(self.operations(), [])
 
-    def test_same_active_skips_backup_and_restore_but_selects_yolo(self):
+    def test_same_active_skips_backup_and_restore_but_selects_yolo_and_reapplies_surge(self):
         before = {p: p.read_bytes() for p in (self.credentials, self.home / ".claude.json",
                   self.accounts / "sydney.json", self.accounts / "sydney.credentials")}
         result = self.run_body("main use sydney --yolo")
         self.assertNotIn("Confirm outgoing backup", result.stderr)
         self.assertNotIn("Backed up outgoing", result.stderr)
         self.assertEqual({p: p.read_bytes() for p in before}, before)
-        self.assertEqual(self.operations(), ["stage"])
+        self.assertEqual(self.operations(), ["stage", "surge"])
         self.assertTrue(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
 
 

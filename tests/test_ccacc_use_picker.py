@@ -287,7 +287,7 @@ class ProfilePickerTests(unittest.TestCase):
         self.assertIn("> sydney (active) | saved-sydney@example.test | TZ=Australia/Sydney", plain(menu))
         self.assertIn("  tokyo | saved-tokyo@example.test | TZ=Asia/Tokyo", plain(menu))
         self.assertNotIn("Confirm outgoing backup", menu)
-        self.assertEqual(self.case.operations(), ["stage"])
+        self.assertEqual(self.case.operations(), ["stage", "surge"])
         self.assertNotIn("Choose saved profile", stdout)
         self.assertFalse(json.loads((self.accounts / ".launch-mode").read_text())["yolo"])
 

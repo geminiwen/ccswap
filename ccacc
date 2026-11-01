@@ -39,6 +39,7 @@ LEGACY_CHECK_FILE="$ACCOUNTS_DIR/.check.enc"
 # Optional user settings; ccacc only reads this file. The installer may create it.
 SETTINGS_FILE="$HOME/.ccacc/settings.json"
 SURGE_CLI=""
+SURGE_APP="/Applications/Surge.app"
 
 # Account-bound keys of ~/.claude.json: everything cccleaner clears or resets (identity IDs,
 # account caches, per-install counters and usage, project history, repo paths, bridge records).
@@ -107,7 +108,11 @@ NC='\033[0m' # No Color
 # Function to show usage
 usage() {
     # usage is listed only when ccusage is installed.
-    local usage_line=''
+    local usage_line='' surge_line='' BLUE=$'\033[0;34m' NC=$'\033[0m'
+    # surge is listed only when Surge is installed (it need not be running).
+    if command -v surge-cli >/dev/null 2>&1 || [ -d "$SURGE_APP" ]; then
+        surge_line=$'\n  surge <name>          Pick the Surge policies an account uses (use applies them)'
+    fi
     if command -v ccusage >/dev/null 2>&1; then
         usage_line=$'\n  usage [ccusage args]  Run ccusage over the current and every saved account\'s history'
     fi
@@ -119,59 +124,15 @@ Usage: $SCRIPT_NAME [COMMAND] [OPTIONS]
 Commands:
   list, ls              List saved accounts
   current               Show the current Claude account
-  save <name> [--timezone <ZONE>]
-                        Back up the current account (new name or the active one)
-  timezone [name]       Print the current session TZ or a named account's saved TZ
-  use [name] [--yolo|--no-yolo]
-                        Pick a saved account, back up outgoing data, choose launch mode
-  new
-                        Confirm prior backup, optionally choose TZ, then clean/logout
-                        (logged out; run 'claude /login', then 'ccacc save <name>')
-  rm <name>             Delete a saved account and its saved history${usage_line}
+  save <name>           Save the current account
+  use [name]            Switch to a saved account
+  new                   Log out to a clean session
+  rm <name>             Delete a saved account${surge_line}
+  timezone [name]       Print the session's or an account's timezone${usage_line}
   help                  Show this help message
   -v, --version         Show version information
 
-An account is everything cccleaner would wipe:
-  - only claudeAiOauth from the "Claude Code-credentials" keychain item
-  - the account-bound keys of ~/.claude.json (IDs, oauthAccount, caches, counters, projects, ...)
-  - ~/.claude history/state folders (projects, file-history, statsig, telemetry, history.jsonl, ...)
-  - ~/Library/Caches/claude-cli-nodejs
-Login backups are plain files (~/.claude/accounts/<name>.credentials, mode 600), not encrypted.
-Older encrypted backups ask for their master password once, then become plain files.
-New never saves credentials.
-Folders are moved, not copied, so switching is instant.
-With Surge installed, save asks which policies the account uses and use applies them;
-without Surge no policy selection is asked.
-Install/reinstall with: $INSTALL_COMMAND
-Only use requires the installed shell hook; save/new never install or repair it.
-Switching away from a saved account automatically backs it up and reports saved contents.
-Save, switching use and new ask before closing a running Claude Code (y/N); without a
-terminal they refuse while it runs. Saved timezone and Surge choices stay unchanged.
-Without a name, use requires a terminal: arrows or j/k move, Return selects,
-q, Esc, Ctrl-C or EOF cancel.
-Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
-With {"alwaysYOLO": true} in ~/.ccacc/settings.json, every use without --yolo/--no-yolo
-enables YOLO without asking. An invalid settings file makes use fail before any change.
-New offers a timezone for the unnamed session; blank or EOF leaves TZ unset.
-Save refuses an existing name unless it is the active profile; run 'ccacc use <name>'
-or 'ccacc rm <name>' first. Save uses --timezone, then the active profile's saved zone,
-then its own required picker.
-The unnamed selection applies only to the current session, never to save.
-Invalid choices fail before account changes; save requires an answer. Aliases never choose TZ.
-
-Left alone: CLAUDE_CONFIG_DIR, suffixed keychain items, the shared Cowork device keys,
-mcpOAuth, unrelated credential fields, mcpServers, settings and the Claude desktop app.
-Switching stops all Claude Code
-processes owned by the current user, including those using another config dir.
-
-Examples:
-  $INSTALL_COMMAND
-  $SCRIPT_NAME save personal
-  $SCRIPT_NAME new
-  claude /login
-  $SCRIPT_NAME save work
-  $SCRIPT_NAME use personal
-  $SCRIPT_NAME use
+Settings: ~/.ccacc/settings.json, e.g. {"alwaysYOLO": true} skips the YOLO question.
 
 EOF
 }
@@ -910,7 +871,7 @@ load_account() {
 
 # Function to find surge-cli; fails quietly when Surge isn't installed, so nothing is asked or shown
 find_surge() {
-    SURGE_CLI=$(command -v surge-cli || echo "/Applications/Surge.app/Contents/Applications/surge-cli")
+    SURGE_CLI=$(command -v surge-cli || echo "$SURGE_APP/Contents/Applications/surge-cli")
     [ -x "$SURGE_CLI" ]
 }
 
@@ -946,6 +907,9 @@ setup_surge() {
         return 0
     fi
     current=$("$SURGE_CLI" --raw environment 2>/dev/null | jq -c '.environment.ProxyGroupSelection // {}') || current="{}"
+    if [ -f "$ACCOUNTS_DIR/${name}.surge" ]; then
+        picks=$(jq -ce 'select(type == "object")' "$ACCOUNTS_DIR/${name}.surge" 2>/dev/null) || picks="{}"
+    fi
 
     echo -e "${BLUE}Surge setup for '${name}'${NC} (select groups, current policy in brackets):"
     while IFS= read -r group; do
@@ -1580,6 +1544,8 @@ use_command() (
         mv -f "$staged_mode" "$LAUNCH_MODE_FILE" || return 1
         rm -f "$UNNAMED_SESSION_FILE" || return 1
         echo -e "${YELLOW}'${name}' is already active${NC}"
+        # Re-apply the saved Surge policies, undoing manual changes in Surge.
+        apply_surge "$name" || return 1
         return 0
     fi
     confirm_close_claude use || return 1
@@ -2043,11 +2009,26 @@ usage_command() {
     CLAUDE_CONFIG_DIR="$dirs" ccusage "$@"
 }
 
-# Compatibility redirect: only save records per-profile metadata.
+# Function to (re)pick a saved account's Surge policies; applies them when it is the active account
 surge_command() {
-    # Re-saving keeps an existing <name>.surge, so only a fresh save asks again.
-    echo "Error: Surge policies are chosen when '${1:-<name>}' is first saved; to choose again, run '$SCRIPT_NAME rm ${1:-<name>}' and save it again" >&2
-    return 1
+    local name="${1:-}"
+    check_name "$name" || return 1
+    if [ ! -f "$ACCOUNTS_DIR/${name}.json" ]; then
+        echo -e "${RED}Error: Account '${name}' not found${NC}" >&2
+        return 1
+    fi
+    if ! find_surge; then
+        echo -e "${RED}Error: Surge is not installed${NC}" >&2
+        return 1
+    fi
+    if ! surge_groups >/dev/null; then
+        echo -e "${RED}Error: Surge is not running; start it and run '$SCRIPT_NAME surge ${name}' again${NC}" >&2
+        return 1
+    fi
+    setup_surge "$name" || return 1
+    if [ "$(active_account)" = "$name" ]; then
+        apply_surge "$name" || return 1
+    fi
 }
 
 # Function to delete a saved account

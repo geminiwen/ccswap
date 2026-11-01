@@ -162,6 +162,35 @@ class UsageCommandTests(unittest.TestCase):
         self.fixture.env["PATH"] = str(self.fixture.bin) + ":/usr/bin:/bin"
         self.assertNotIn("usage [ccusage args]", self.fixture.cli("help").stdout)
 
+    def hide_surge(self):
+        core = self.fixture.core
+        core.write_text(core.read_text().replace(
+            'SURGE_APP="/Applications/Surge.app"', f'SURGE_APP="{self.fixture.fixture}/NoSurge.app"', 1))
+        (self.fixture.bin / "surge-cli").unlink()
+        self.fixture.env["PATH"] = str(self.fixture.bin) + ":/usr/bin:/bin"
+
+    def test_help_lists_surge_when_the_app_or_cli_is_installed_even_if_not_running(self):
+        self.hide_surge()
+        self.assertNotIn("surge <name>", self.fixture.cli("help").stdout)
+        (self.fixture.fixture / "NoSurge.app").mkdir()
+        self.assertIn("surge <name>", self.fixture.cli("help").stdout)
+        (self.fixture.fixture / "NoSurge.app").rmdir()
+        self.fixture.executable("surge-cli", "#!/bin/bash\nexit 1\n")
+        self.assertIn("surge <name>", self.fixture.cli("help").stdout)
+
+    def test_surge_command_refuses_unknown_account_and_missing_surge(self):
+        self.hide_surge()
+        result = self.fixture.cli("surge", "nobody", success=False)
+        self.assertIn("Account 'nobody' not found", result.stderr)
+        self.accounts.mkdir(parents=True, exist_ok=True)
+        (self.accounts / "tokyo.json").write_text("{}")
+        result = self.fixture.cli("surge", "tokyo", success=False)
+        self.assertIn("Surge is not installed", result.stderr)
+        self.fixture.executable("surge-cli", "#!/bin/bash\nexit 1\n")
+        result = self.fixture.cli("surge", "tokyo", success=False)
+        self.assertIn("Surge is not running", result.stderr)
+        self.assertFalse((self.accounts / "tokyo.surge").exists())
+
     def test_missing_ccusage_explains_install(self):
         (self.fixture.bin / "ccusage").unlink()
         self.fixture.env["PATH"] = str(self.fixture.bin) + ":/usr/bin:/bin"

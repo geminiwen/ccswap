@@ -42,6 +42,7 @@ cleanup_stop_processes() { stop_claude; }
 cleanup_runtime_is_safe() { :; }
 _ccacc_shell_path() { :; }
 stop_claude() { :; }
+confirm_close_claude() { :; }
 note_device_keys() { :; }
 setup_surge() { :; }
 apply_surge() { :; }
@@ -56,7 +57,7 @@ def main():
         for backend in ('macos',):
             counter = 0
 
-            def run(body, current=BASE, target=TARGET, read_fail=False, expect_success=True):
+            def run(body, current=BASE, target=TARGET, read_fail=False, expect_success=True, stdin='yes\n'):
                 nonlocal count, counter
                 counter += 1
                 fixture = root / (backend + '-' + str(counter))
@@ -79,7 +80,7 @@ def main():
                 env.pop('BASH_ENV', None)
                 env.pop('ENV', None)
                 result = subprocess.run(['bash', '-c', SOURCE + '\n' + MOCKS + '\n' + body],
-                                        env=env, capture_output=True, text=True, input="yes\n")
+                                        env=env, capture_output=True, text=True, input=stdin)
                 assert (result.returncode == 0) == expect_success, (backend, body, result.stdout, result.stderr)
                 count += 1
                 return fixture, state
@@ -162,7 +163,7 @@ load_account legacy
 save_account original
 printf 'original\n' > "$ACTIVE_FILE"
 new_command
-''')
+''', stdin='')
             assert json.loads(state.read_text()) == {k: v for k, v in BASE.items() if k != 'claudeAiOauth'}
             assert not (fixture / 'home/.claude/accounts/fresh.credentials').exists()
 

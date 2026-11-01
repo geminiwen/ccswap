@@ -106,6 +106,11 @@ NC='\033[0m' # No Color
 
 # Function to show usage
 usage() {
+    # usage is listed only when ccusage is installed.
+    local usage_line=''
+    if command -v ccusage >/dev/null 2>&1; then
+        usage_line=$'\n  usage [ccusage args]  Run ccusage over the current and every saved account\'s history'
+    fi
     cat << EOF
 ${BLUE}ccacc – Claude Code Account Switcher v${VERSION}${NC}
 
@@ -122,7 +127,7 @@ Commands:
   new
                         Confirm prior backup, optionally choose TZ, then clean/logout
                         (logged out; run 'claude /login', then 'ccacc save <name>')
-  rm <name>             Delete a saved account and its saved history
+  rm <name>             Delete a saved account and its saved history${usage_line}
   help                  Show this help message
   -v, --version         Show version information
 
@@ -140,7 +145,8 @@ without Surge no policy selection is asked.
 Install/reinstall with: $INSTALL_COMMAND
 Only use requires the installed shell hook; save/new never install or repair it.
 Switching away from a saved account automatically backs it up and reports saved contents.
-Named noninteractive use needs no confirmation. Saved timezone and Surge choices stay unchanged.
+Save, switching use and new ask before closing a running Claude Code (y/N); without a
+terminal they refuse while it runs. Saved timezone and Surge choices stay unchanged.
 Without a name, use requires a terminal: arrows or j/k move, Return selects,
 q, Esc, Ctrl-C or EOF cancel.
 Use asks YOLO? (y/N) on a terminal; noninteractive use defaults to No.
@@ -1187,6 +1193,30 @@ _ccacc_profile_tx_finish() {
     fi
 }
 
+# save and use must not change the login under a running Claude Code, so they ask
+# before closing it: only when it is running, and only on a terminal. $1 is the
+# command name for messages (save or use).
+confirm_close_claude() {
+    local command="$1" pids answer=''
+    if ! pids=$(claude_process_ids); then
+        echo "Error: Could not inspect Claude Code processes; nothing changed" >&2
+        return 1
+    fi
+    [ -n "$pids" ] || return 0
+    if [ ! -t 0 ] || [ ! -t 2 ]; then
+        echo "Error: Claude Code is running; quit it, or run '$SCRIPT_NAME $command' in a terminal to close it, then retry" >&2
+        return 1
+    fi
+    printf 'Claude Code is running. Close it now? (y/N) ' >&2
+    if ! IFS= read -r answer; then answer=''; fi
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) echo "Cancelled; Claude Code left running and nothing changed." >&2; return 1 ;;
+    esac
+    # Never stop the Claude Code session that is running this command.
+    stop_claude --guard-ancestors >&2 || { echo "Error: Claude Code was not closed; nothing changed" >&2; return 1; }
+}
+
 # Function to save the current account as <name>
 save_command() (
     local name="${1:-}"
@@ -1204,6 +1234,7 @@ save_command() (
     fi
     prepare_account_metadata "$@" || return 1
     check_ready || return 1
+    confirm_close_claude save || return 1
     # Every successful save invalidates current runtime consent, even for the
     # same name: the current login may be a different identity. Nothing about
     # launch permissions is stored in the named profile backup.
@@ -1551,6 +1582,7 @@ use_command() (
         echo -e "${YELLOW}'${name}' is already active${NC}"
         return 0
     fi
+    confirm_close_claude use || return 1
     migrate_encrypted_backups || return 1
     stop_claude || return 1
     note_device_keys
@@ -1932,6 +1964,8 @@ new_command() {
     fi
     # Interactive and before any process stop, as in use: a plain backup must not
     # sit next to a differing encrypted one.
+    # Every check above is read-only: ask before closing Claude, the first change.
+    confirm_close_claude new || return 1
     if [ -n "$save_name" ]; then migrate_encrypted_backups || return 1; fi
     cleanup_stop_processes && cleanup_runtime_is_safe || {
         echo "Error: Live or unverifiable processes/runtime owners; cleanup incomplete" >&2; return 1;
@@ -1987,6 +2021,26 @@ new_command() {
     }
     echo "Cleaned current account; started unnamed Claude session (logged out)."
     echo "Run 'claude /login', then '$SCRIPT_NAME save <name>' to name and save it."
+}
+
+# Run ccusage over the live ~/.claude and every saved profile's archived history,
+# so usage of all accounts is counted. Read-only: nothing is moved or written.
+usage_command() {
+    local dirs="$CONFIG_DIR" dir name
+    if ! command -v ccusage >/dev/null 2>&1; then
+        echo "Error: ccusage is not installed; install it (for example 'npm install -g ccusage'), then retry" >&2
+        return 1
+    fi
+    for dir in "$ACCOUNTS_DIR"/*/; do
+        dir=${dir%/}; name=${dir##*/}
+        check_name "$name" >/dev/null 2>&1 || continue
+        if [ -d "$dir/projects" ] && [ ! -L "$dir" ] && [ ! -L "$dir/projects" ]; then
+            dirs="$dirs,$dir"
+        fi
+    done
+    # ccusage splits CLAUDE_CONFIG_DIR on commas.
+    case "$CONFIG_DIR" in *,*) echo "Error: $CONFIG_DIR contains a comma; ccusage cannot read it" >&2; return 1 ;; esac
+    CLAUDE_CONFIG_DIR="$dirs" ccusage "$@"
 }
 
 # Compatibility redirect: only save records per-profile metadata.
@@ -2100,6 +2154,10 @@ main() {
             ;;
         surge)
             surge_command "$2"
+            ;;
+        usage)
+            shift
+            usage_command "$@"
             ;;
         rm)
             delete_command "$2"

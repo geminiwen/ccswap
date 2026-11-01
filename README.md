@@ -52,6 +52,7 @@ ccacc current                               # Show current email and saved name
 ccacc timezone                              # Read the current session timezone
 ccacc timezone work                         # Read a saved profile's timezone
 ccacc rm work                               # Confirm deletion of that profile and stash
+ccacc usage daily                           # ccusage over the current and all saved accounts
 ccacc help
 ```
 
@@ -140,6 +141,10 @@ Choosing the already-active profile changes its launch mode without reloading an
 older backup. A clean logged-out unnamed session can use a saved profile directly;
 unsaved login or unowned history/session files must be saved first. An otherwise clean unnamed session may retain an empty sessions registry
 directory; any entries, including hidden files or links, still require saving.
+If Claude Code is running, `save`, switching `use` and `new` first ask
+`Claude Code is running. Close it now? (y/N)`. Only `y` closes it and continues;
+any other answer cancels with nothing changed. Without a terminal they refuse
+instead of asking, and they never close the Claude Code session that runs ccacc.
 Switching stops Claude Code processes owned by the current user, including
 those using other config directories; it leaves those other directories' credentials
 and files unchanged. Fully quit Claude.app and its browser-extension helpers
@@ -231,6 +236,15 @@ Meaningful project MCP definitions/selections survive `new`, including explicit
 `false`. Suffixed Keychain items, other Claude config directories and Cowork device
 keys are outside the account backup. New keeps the current Surge route; when
 Surge is available, save can record policies and use applies saved choices.
+
+## Usage across accounts
+
+`ccacc usage [ccusage arguments]` runs the installed `ccusage` with
+`CLAUDE_CONFIG_DIR` set to `~/.claude` plus every saved profile folder that holds
+archived history (`~/.claude/accounts/<name>/projects`), so the current and all
+saved accounts are counted. Arguments are passed through unchanged, for example
+`ccacc usage daily` or `ccacc usage monthly --json`. It only reads; nothing is
+moved or written. Install ccusage first if it is missing.
 
 ## Failures and recovery
 

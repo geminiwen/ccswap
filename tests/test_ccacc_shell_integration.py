@@ -101,6 +101,8 @@ cleanup_stop_processes() { stop_claude; }
 cleanup_runtime_is_safe() { :; }
 read_credentials() { printf '{}'; }
 stop_claude() { printf 'stop\n' >> "$HOME/operations"; }
+# Real process checks are covered by test_ccacc_close_prompt.
+confirm_close_claude() { :; }
 note_device_keys() { :; }
 stash_paths() { :; }
 unstash_paths() { :; }

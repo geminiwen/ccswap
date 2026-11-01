@@ -18,6 +18,8 @@ write_credentials() { printf 'write\n' >> "$OPS"; printf '%s\n' "$1" > "$STRAY_C
 delete_credentials() { printf 'delete\n' >> "$OPS"; rm -f "$STRAY_CREDENTIALS_FILE"; }
 migrate_encrypted_backups() { printf 'password\n' >> "$OPS"; }
 stop_claude() { printf 'stop\n' >> "$OPS"; }
+# Real process checks are covered by test_ccacc_close_prompt.
+confirm_close_claude() { :; }
 note_device_keys() { :; }
 apply_surge() { printf 'surge\n' >> "$OPS"; }
 mktemp() { printf 'stage\n' >> "$OPS"; command mktemp "$@"; }

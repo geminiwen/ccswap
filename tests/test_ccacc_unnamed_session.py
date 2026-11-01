@@ -41,6 +41,8 @@ delete_credentials() { printf 'delete\n' >> "$SESSION_OPERATIONS"; rm -f "$STRAY
 # Deliberately plaintext fixture backups: never use real credentials or encryption.
 migrate_encrypted_backups() { printf 'password\n' >> "$SESSION_OPERATIONS"; }
 stop_claude() { printf 'stop\n' >> "$SESSION_OPERATIONS"; }
+# Real process checks are covered by test_ccacc_close_prompt.
+confirm_close_claude() { :; }
 note_device_keys() { :; }
 setup_surge() { printf 'setup-surge\n' >> "$SESSION_OPERATIONS"; }
 apply_surge() { printf 'apply-surge\n' >> "$SESSION_OPERATIONS"; }

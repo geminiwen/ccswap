@@ -66,6 +66,8 @@ class AliasTimezoneTests(unittest.TestCase):
         mocks = '''
 migrate_encrypted_backups() { :; }
 require_shell_hook() { :; }
+# Real process checks are covered by test_ccacc_close_prompt.
+confirm_close_claude() { :; }
 load_shell_companion() { :; }
 ccacc_check_shell_hook() { return 1; }
 cleanup_stop_processes() { stop_claude; }

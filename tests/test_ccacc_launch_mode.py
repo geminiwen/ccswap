@@ -40,6 +40,8 @@ class LaunchModeTests(unittest.TestCase):
 source "$FIXTURE_CORE" help >/dev/null
 migrate_encrypted_backups() { printf 'password\n' >> "$HOME/selection-operations"; }
 stop_claude() { printf 'stop\n' >> "$HOME/selection-operations"; }
+# Real process checks are covered by test_ccacc_close_prompt.
+confirm_close_claude() { :; }
 note_device_keys() { :; }
 backup_active() { :; }
 load_account() { :; }

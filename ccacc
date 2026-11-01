@@ -1984,6 +1984,9 @@ new_command() {
         echo "Error: Session cleaned, but recovery removal incomplete: $CLEANUP_RECOVERY_DIR" >&2; return 1;
     }
     echo "Cleaned current account; started unnamed Claude session (logged out)."
+    if find_surge; then
+        echo -e "${YELLOW}Note: switch Surge to the right profile for the new account before logging in${NC}"
+    fi
     echo "Run 'claude /login', then '$SCRIPT_NAME save <name>' to name and save it."
 }
 

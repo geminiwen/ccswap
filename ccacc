@@ -1454,7 +1454,7 @@ pick_saved_account() (
             _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_email" "${emails[index]}" || return 1
         fi
         if [ -n "${zones[index]}" ]; then
-            _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_zone" "TZ=${zones[index]}" || return 1
+            _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_zone" "${zones[index]}" || return 1
         fi
         if [ -n "${resets[index]}" ]; then
             _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_reset" "weekly reset ${resets[index]}" || return 1

@@ -287,8 +287,8 @@ class ProfilePickerTests(unittest.TestCase):
     def test_initial_current_saved_labels_and_enter_fast_path(self):
         status, menu, stdout = self.run_pty(["--no-yolo"], b"\r")
         self.assertEqual(status, 0, menu + stdout)
-        self.assertIn("> sydney (active) | saved-sydney@example.test | TZ=Australia/Sydney", plain(menu))
-        self.assertIn("  tokyo | saved-tokyo@example.test | TZ=Asia/Tokyo", plain(menu))
+        self.assertIn("> sydney (active) | saved-sydney@example.test | Australia/Sydney", plain(menu))
+        self.assertIn("  tokyo | saved-tokyo@example.test | Asia/Tokyo", plain(menu))
         self.assertNotIn("Confirm outgoing backup", menu)
         self.assertEqual(self.case.operations(), ["stage", "surge"])
         self.assertNotIn("Choose saved profile", stdout)
@@ -433,7 +433,7 @@ class ProfilePickerTests(unittest.TestCase):
         self.assertIn("\x1b[1msydney", menu)
         self.assertIn("\x1b[32m (active)", menu)
         self.assertIn("\x1b[36msaved-tokyo@example.test", menu)
-        self.assertIn("\x1b[33mTZ=Asia/Tokyo", menu)
+        self.assertIn("\x1b[33mAsia/Tokyo", menu)
         self.fixture.env["NO_COLOR"] = "1"
         try:
             status, menu, _ = self.run_pty()
@@ -475,7 +475,7 @@ class ProfilePickerTests(unittest.TestCase):
                                             size=(9, 45))
         self.assertEqual(status, 0, menu)
         self.assertEqual(stdout, "account09\n")
-        self.assertIn("> account00 | TZ=UTC", plain(menu))
+        self.assertIn("> account00 | UTC", plain(menu))
         self.assertIn("Profiles 6-10 of 22", menu)
         self.assertNotIn("account19", menu)
 

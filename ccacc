@@ -1065,7 +1065,7 @@ list_accounts() {
             email="${CYAN}${email}${NC}"
             [ -z "$plan" ] || email="$email ${MAGENTA}[$plan]${NC}"
             local reset=$(weekly_reset_label "$name")
-            [ -z "$reset" ] || email="$email ${BLUE}[weekly reset ${reset}]${NC}"
+            [ -z "$reset" ] || email="$email ${BLUE}[${reset}]${NC}"
             local surge=""
             if [ -f "$ACCOUNTS_DIR/${name}.surge" ]; then
                 surge=" [Surge: $(jq -r 'to_entries | map("\(.key)=\(.value)") | join(", ")' "$ACCOUNTS_DIR/${name}.surge")]"
@@ -1457,7 +1457,7 @@ pick_saved_account() (
             _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_zone" "${zones[index]}" || return 1
         fi
         if [ -n "${resets[index]}" ]; then
-            _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_reset" "weekly reset ${resets[index]}" || return 1
+            _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_reset" "${resets[index]}" || return 1
         fi
         printf '\033[0m%s%*s\033[0m' "$base" "$left" '' >&2
     }

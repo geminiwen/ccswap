@@ -171,6 +171,10 @@ Choosing the already-active profile changes its launch mode without reloading an
 older backup. A clean logged-out unnamed session can use a saved profile directly;
 unsaved login or unowned history/session files must be saved first. An otherwise clean unnamed session may retain an empty sessions registry
 directory; any entries, including hidden files or links, still require saving.
+If the unnamed session is not logged in (for example Claude Code was launched after
+`new` and quit at its login screen), `use` lists the files it left behind and asks
+once whether to discard them with the same cleanup as `new` and switch; only `y`
+continues. Without a terminal it refuses and suggests `ccacc new`, then `ccacc use <name>`.
 If Claude Code is running, `save`, switching `use` and `new` first ask
 `Claude Code is running. Close it now? (y/N)`. Only `y` closes it and continues;
 any other answer cancels with nothing changed. Without a terminal they refuse

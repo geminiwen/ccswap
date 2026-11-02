@@ -2,7 +2,11 @@
 import json
 import shlex
 import os
+import pty
+import select
 import shutil
+import signal
+import time
 import unittest
 
 import test_ccacc_shell_integration as integration
@@ -34,6 +38,10 @@ class UnnamedSessionTests(unittest.TestCase):
         self.shared = {"mcpOAuth": {"fixture": {"accessToken": "shared"}}, "futureField": {"keep": True}}
 
     def run_body(self, body, success=True, stdin="", process_mocks=True):
+        return self.fixture.run_process(["/bin/bash", "-c", self.mocks(process_mocks) + "\n" + body],
+                                        success=success, stdin=stdin)
+
+    def mocks(self, process_mocks=True):
         # Only these boundaries are fake. All metadata, backup staging, bounded
         # config reset, history stashing and installation checks use real code.
         mocks = r'''
@@ -56,8 +64,58 @@ new_identity() { printf '{"userID":"new-fixture-id","anonymousId":"new-anonymous
 '''
         if process_mocks:
             mocks += "\ncleanup_stop_processes() { stop_claude; }\ncleanup_runtime_is_safe() { :; }\n"
-        return self.fixture.run_process(["/bin/bash", "-c", mocks + "\n" + body],
-                                        success=success, stdin=stdin)
+        return mocks
+
+    def run_pty(self, body, prompt=None, answer=None):
+        """Run body on a terminal. Before answering prompt, nothing may have changed."""
+        output = self.fixture.fixture / "pty.stdout"
+        before = self.snapshot()
+        pid, master = pty.fork()
+        if pid == 0:
+            descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.dup2(descriptor, 1)
+            os.close(descriptor)
+            os.execve("/bin/bash", ["bash", "--noprofile", "--norc", "-c", self.mocks() + "\n" + body],
+                      self.fixture.env)
+        data = b""
+        status = None
+        sent = False
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    try:
+                        data += os.read(master, 65536)
+                    except OSError:
+                        pass
+                if prompt is not None and not sent and prompt.encode() in data:
+                    self.assertIsNotNone(answer, data.decode(errors="replace"))
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertNotIn("stop", self.operations())
+                    os.write(master, answer)
+                    sent = True
+                done, result = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    status = os.waitstatus_to_exitcode(result)
+                    while select.select([master], [], [], 0)[0]:
+                        try:
+                            chunk = os.read(master, 65536)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        data += chunk
+                    break
+            self.assertIsNotNone(status, data.decode(errors="replace"))
+        finally:
+            if status is None:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            os.close(master)
+        self.assertFalse(self.fixture.forbidden.exists())
+        if prompt is not None and answer is not None:
+            self.assertTrue(sent, data.decode(errors="replace"))
+        return status, data.decode(errors="replace"), output.read_text()
 
     def snapshot(self):
         return {p.relative_to(self.home): (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ino)
@@ -321,6 +379,203 @@ main new
         self.run_body("main use kept --no-yolo", success=False)
         self.assertFalse(self.active.exists())
         self.assertNotIn("password", self.operations())
+
+    DISCARD_PROMPT = "Discard them and switch to 'kept'? (y/N) "
+    NOT_SAVED = "Error: Current login/history is not saved; run 'ccacc save <name>' first"
+
+    def logged_out_leftovers(self):
+        # new, then a Claude launch that quits at its login screen.
+        self.saved_active()
+        self.run_body("main new")
+        self.ops.unlink(missing_ok=True)
+        leftovers = {}
+        for relative in (".claude/backups/claude.json.backup", ".claude/statsig/statsig.stable_id",
+                         ".claude/session-env/fixture/env", ".claude/sessions/synthetic.json",
+                         "Library/Caches/claude-cli-nodejs/fixture/log.txt"):
+            path = self.home / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic logged-out leftover")
+            leftovers[relative] = path
+        # Claude Code's own debug/latest link is ordinary leftover data.
+        debug = self.home / ".claude/debug"
+        debug.mkdir()
+        (debug / "latest").symlink_to("absent-debug-log")
+        return leftovers
+
+    def test_loggedout_leftovers_terminal_yes_discards_with_new_cleanup_and_switches(self):
+        leftovers = self.logged_out_leftovers()
+        status, stderr, stdout = self.run_pty("main use kept --no-yolo", self.DISCARD_PROMPT, b"y\n")
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("This session is not logged in, but Claude Code left files behind: ", stderr)
+        self.assertIn("~/.claude/backups, ~/.claude/debug, ", stderr)
+        self.assertIn("~/Library/Caches/claude-cli-nodejs", stderr)
+        self.assertNotIn(str(self.home), stderr)
+        self.assertIn("Switched", stdout)
+        for path in leftovers.values():
+            self.assertFalse(path.exists(), path)
+        for name in ("backups", "statsig", "session-env", "sessions", "debug"):
+            self.assertFalse((self.home / ".claude" / name).exists(), name)
+        self.assertEqual(self.active.read_text(), "kept\n")
+        login = json.loads(self.credentials.read_text())
+        self.assertEqual(login["claudeAiOauth"], {"accessToken": "fixture-login"})
+        self.assertEqual(login["mcpOAuth"], self.shared["mcpOAuth"])
+        self.assertEqual(json.loads(self.config.read_text())["oauthAccount"],
+                         {"emailAddress": "fixture@example.invalid"})
+        self.assertEqual((self.home / ".claude/projects/history.json").read_text(), "fixture history")
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+        self.assertFalse((self.accounts / "kept/backups").exists())
+        # new's machinery: processes stopped, login reset, then the target loaded.
+        operations = self.operations()
+        # The shared MCP login keeps the item, so the reset is a write, not a delete.
+        self.assertIn("stop", operations)
+        self.assertEqual(operations.count("write"), 2)
+        self.assertLess(operations.index("stop"), operations.index("write"))
+        self.assertEqual(self.fixture.cli("launch-mode").stdout, "false\n")
+
+    def test_loggedout_leftovers_terminal_no_or_blank_changes_nothing(self):
+        self.logged_out_leftovers()
+        for answer in (b"n\n", b"\n", b"no\n"):
+            with self.subTest(answer=answer):
+                before = self.snapshot()
+                status, stderr, stdout = self.run_pty("main use kept --no-yolo", self.DISCARD_PROMPT, answer)
+                self.assertNotEqual(status, 0)
+                self.assertIn("Cancelled; nothing changed.", stderr)
+                self.assertNotIn("Switched", stdout)
+                self.assertEqual(self.snapshot(), before)
+                self.assertFalse(self.active.exists())
+                for operation in ("stop", "write", "delete", "password"):
+                    self.assertNotIn(operation, self.operations())
+
+    def test_loggedout_leftovers_without_terminal_refuse_with_new_hint(self):
+        self.logged_out_leftovers()
+        before = self.snapshot()
+        for options in ("", " --no-yolo"):
+            result = self.run_body("main use kept" + options, success=False, stdin="y\n")
+            self.assertIn("Error: This session is not logged in but has leftover Claude Code files; "
+                          "run 'ccacc new' to discard them, then 'ccacc use kept'", result.stderr)
+            self.assertNotIn("Discard them", result.stderr)
+            self.assertEqual(self.snapshot(), before)
+            self.assertFalse(self.active.exists())
+            for operation in ("stop", "write", "delete", "password"):
+                self.assertNotIn(operation, self.operations())
+
+    def test_unsaved_login_with_leftovers_keeps_original_refusal(self):
+        self.logged_out_leftovers()
+        self.login("unsaved@example.invalid")
+        before = self.snapshot()
+        result = self.run_body("main use kept --no-yolo", success=False)
+        self.assertIn(self.NOT_SAVED, result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        status, stderr, _ = self.run_pty("main use kept --no-yolo")
+        self.assertNotEqual(status, 0)
+        self.assertIn(self.NOT_SAVED, stderr)
+        self.assertNotIn("Discard them", stderr)
+        self.assertEqual(self.snapshot(), before)
+        # A Keychain-only login (no oauthAccount in the config) is still a login.
+        self.credentials.unlink()
+        self.run_body("main new", stdin="yes\n")
+        self.ops.unlink(missing_ok=True)
+        self.logged_out_leftovers_again()
+        before = self.snapshot()
+        status, stderr, _ = self.run_pty(
+            "read_credentials() { printf '{\"claudeAiOauth\":{\"accessToken\":\"unsaved\"}}'; }; main use kept --no-yolo")
+        self.assertNotEqual(status, 0)
+        self.assertIn(self.NOT_SAVED, stderr)
+        self.assertNotIn("Discard them", stderr)
+        self.assertEqual(self.snapshot(), before)
+        for operation in ("stop", "write", "delete", "password"):
+            self.assertNotIn(operation, self.operations())
+
+    def logged_out_leftovers_again(self):
+        statsig = self.home / ".claude/statsig"
+        statsig.mkdir(parents=True, exist_ok=True)
+        (statsig / "statsig.stable_id").write_text("synthetic logged-out leftover")
+
+    def test_loggedout_unsafe_sessions_registry_keeps_original_refusal(self):
+        self.logged_out_leftovers()
+        sessions = self.home / ".claude/sessions"
+        cases = []
+        link = sessions / "dangling.key"
+        cases.append(("link", lambda: link.symlink_to("absent-synthetic-session-key"), link.unlink))
+        cases.append(("unreadable", lambda: sessions.chmod(0o000), lambda: sessions.chmod(0o700)))
+        nested = sessions / "nested"
+        def unreadable_nested():
+            nested.mkdir()
+            nested.chmod(0o300)
+        def restore_nested():
+            nested.chmod(0o700)
+            nested.rmdir()
+        cases.append(("unreadable nested", unreadable_nested, restore_nested))
+        for label, apply, restore in cases:
+            with self.subTest(case=label):
+                apply()
+                try:
+                    before = self.snapshot()
+                    result = self.run_body("main use kept --no-yolo", success=False)
+                    self.assertIn(self.NOT_SAVED, result.stderr)
+                    status, stderr, _ = self.run_pty("main use kept --no-yolo")
+                    self.assertNotEqual(status, 0)
+                    self.assertIn(self.NOT_SAVED, stderr)
+                    self.assertNotIn("Discard them", stderr)
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertFalse(self.active.exists())
+                finally:
+                    restore()
+        shutil.rmtree(sessions)
+        sessions.symlink_to(self.fixture.fixture, target_is_directory=True)
+        status, stderr, _ = self.run_pty("main use kept --no-yolo")
+        self.assertNotEqual(status, 0)
+        self.assertIn(self.NOT_SAVED, stderr)
+        self.assertFalse(self.active.exists())
+        for operation in ("stop", "write", "delete", "password"):
+            self.assertNotIn(operation, self.operations())
+
+    def test_loggedout_discard_failure_rolls_back_and_keeps_selection(self):
+        leftovers = self.logged_out_leftovers()
+        self.selection.write_text('{"version":1,"timezone":"Asia/Tokyo"}\n')
+        contents = {relative: path.read_bytes() for relative, path in leftovers.items()}
+        config = self.config.read_bytes()
+        status, stderr, stdout = self.run_pty("reset_account_state() { return 1; }; main use kept --no-yolo",
+                                              self.DISCARD_PROMPT, b"yes\n")
+        self.assertNotEqual(status, 0)
+        self.assertIn("previous account, credentials and history restored", stderr)
+        self.assertNotIn("Switched", stdout)
+        self.assertEqual({relative: path.read_bytes() for relative, path in leftovers.items()}, contents)
+        self.assertEqual(self.config.read_bytes(), config)
+        self.assertFalse(self.active.exists())
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
+        self.assertNotIn("password", self.operations())
+
+    def test_loggedout_discard_keeps_selection_when_later_switch_fails(self):
+        self.logged_out_leftovers()
+        self.selection.write_text('{"version":1,"timezone":"Asia/Tokyo"}\n')
+        status, _, stdout = self.run_pty("load_account() { return 1; }; main use kept --no-yolo",
+                                         self.DISCARD_PROMPT, b"y\n")
+        self.assertNotEqual(status, 0)
+        self.assertNotIn("Switched", stdout)
+        self.assertFalse((self.home / ".claude/statsig").exists())
+        self.assertFalse(self.active.exists())
+        self.assertEqual(self.fixture.cli("timezone").stdout, "Asia/Tokyo\n")
+
+    def test_login_while_stopping_claude_is_never_discarded(self):
+        leftovers = self.logged_out_leftovers()
+        contents = {relative: path.read_bytes() for relative, path in leftovers.items()}
+        body = r"""
+cleanup_stop_processes() {
+    stop_claude
+    printf '{"claudeAiOauth":{"accessToken":"late-login"}}' > "$STRAY_CREDENTIALS_FILE"
+}
+main use kept --no-yolo
+"""
+        status, stderr, stdout = self.run_pty(body, self.DISCARD_PROMPT, b"y\n")
+        self.assertNotEqual(status, 0)
+        self.assertIn("logged in while preparing to discard its files; nothing discarded", stderr)
+        self.assertNotIn("Switched", stdout)
+        self.assertEqual({relative: path.read_bytes() for relative, path in leftovers.items()}, contents)
+        self.assertEqual(json.loads(self.credentials.read_text()), {"claudeAiOauth": {"accessToken": "late-login"}})
+        self.assertFalse(self.active.exists())
+        self.assertFalse((self.accounts / ".cleanup-recovery").exists())
 
     def test_save_records_account_caches_and_new_removes_them(self):
         self.saved_active()

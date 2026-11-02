@@ -13,7 +13,7 @@
 set -e
 
 SCRIPT_NAME="ccacc"
-VERSION="1.1.0"
+VERSION="1.1.1"
 # The canonical installer always comes from main; it installs the latest GitHub Release.
 INSTALLER_URL="https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh"
 INSTALL_COMMAND="curl -fsSL $INSTALLER_URL | bash"
@@ -1747,7 +1747,7 @@ pick_saved_account() (
 # Function to switch to a saved account
 use_command() (
     local name='' name_seen=false zone active mode=false answer='' staged_mode='' mode_option='' status
-    local always_yolo
+    local always_yolo leftovers discard=''
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --yolo|--no-yolo)
@@ -1792,8 +1792,26 @@ use_command() (
     check_ready || return 1
     active=$(active_account)
     if [ "$active" != "$name" ] && [ -z "$active" ] && ! clean_unnamed_session; then
-        echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
-        return 1
+        # Launching Claude after 'new' and quitting at its login screen leaves
+        # files that belong to no account. Only that safe logged-out state may
+        # discard them, with new's cleanup; any login or doubt still refuses.
+        if ! leftovers=$(logged_out_session_leftovers 2>/dev/null); then
+            echo "Error: Current login/history is not saved; run '$SCRIPT_NAME save <name>' first" >&2
+            return 1
+        fi
+        if [ ! -t 0 ] || [ ! -t 2 ]; then
+            echo "Error: This session is not logged in but has leftover Claude Code files; run '$SCRIPT_NAME new' to discard them, then '$SCRIPT_NAME use $name'" >&2
+            return 1
+        fi
+        printf "This session is not logged in, but Claude Code left files behind: %s. Discard them and switch to '%s'? (y/N) " \
+            "$leftovers" "$name" >&2
+        answer=''
+        { IFS= read -r answer < /dev/tty; } 2>/dev/null || answer=''
+        case "$answer" in
+            y|Y|[yY][eE][sS]) discard=yes ;;
+            *) echo "Cancelled; nothing changed." >&2; return 1 ;;
+        esac
+        answer=''
     fi
     # Validate and stage this session record before migration or process/account
     # mutations. A failed selection leaves the previous launch mode untouched.
@@ -1825,6 +1843,9 @@ use_command() (
         return 0
     fi
     confirm_close_claude use || return 1
+    # After every prompt and before any other change: a failed discard leaves
+    # the session as it was (new's rollback) and nothing else switched.
+    if [ -n "$discard" ]; then discard_logged_out_session || return 1; fi
     migrate_encrypted_backups || return 1
     stop_claude || return 1
     note_device_keys
@@ -2103,20 +2124,10 @@ new_cleanup_plan() {
     fi
 }
 
-# Full current-account cleanup. The active profile's own login is backed up
-# first; a logout with no active profile is cleaned directly; anything else
-# needs confirmation.
-new_command() {
-    local active confirmation credentials entry path label selected_zone plan save_name=''
-    local optional_credentials='' optional_existed='' credentials_attempted='' config_attempted='' metadata_attempted=''
-    local index destination
-    local -a cleanup_paths staged_locations
-    load_shell_companion || return 1
-    cleanup_is_complete || return 1
-    [ "$#" -eq 0 ] || { echo "Error: new accepts no arguments; choose timezone in its menu" >&2; return 1; }
-    validate_unnamed_session || return 1
-    # Validate the entire bounded cleanup set, including optional credentials,
-    # before asking, reading the login, stopping processes or modifying anything.
+# Read-only: the bounded config/credential/metadata files cleanup rewrites must
+# be safe and well-formed before anyone is asked, any login is read or anything changes.
+cleanup_config_preflight() {
+    local path
     for path in "$CLAUDE_JSON" "$STRAY_CREDENTIALS_FILE" "$ACTIVE_FILE" "$LEGACY_PENDING_TIMEZONE_FILE" "$LAUNCH_MODE_FILE" "$UNNAMED_SESSION_FILE"; do
         _ccacc_shell_path "$path" file || { echo "Error: Unsafe cleanup path; cleanup incomplete: $path" >&2; return 1; }
     done
@@ -2128,24 +2139,15 @@ new_command() {
             echo "Error: Malformed optional credentials file; cleanup incomplete, credentials unchanged" >&2; return 1;
         }
     fi
-    plan=$(new_cleanup_plan) || return 1
-    case "$plan" in
-        save:*)
-            save_name=${plan#save:}
-            echo "The current login belongs to active profile '$save_name'; it will be saved before cleanup." >&2 ;;
-        clean)
-            echo "Not logged in; cleaning without a backup." >&2 ;;
-        *)
-            if [ "${plan%%:*}" = logout ]; then
-                echo "Not logged in, but profile '${plan#logout:}' is active; its saved login will not be updated." >&2
-            elif [ -n "${plan#ask:}" ]; then
-                echo "The current login does not match active profile '${plan#ask:}'; that profile will not be updated." >&2
-            fi
-            printf "Have you already run '$SCRIPT_NAME save <name>' to back up this account? (y/N): " >&2
-            if ! IFS= read -r confirmation; then confirmation=''; fi
-            case "$confirmation" in y|Y|yes) ;; *) echo "Cleanup cancelled; run '$SCRIPT_NAME save <name>' first." >&2; return 1 ;; esac ;;
-    esac
-    selected_zone=$(choose_timezone 'unnamed session' optional) || return 1
+}
+
+# Read-only. Takes the in-memory credential snapshot for rollback and fills the
+# caller's cleanup_paths and active (the matching profile that receives the
+# archive paths), checking every path, stash and destination before any change.
+# Uses the caller's locals: optional_existed, optional_credentials, credentials,
+# cleanup_paths and active (see new_command).
+cleanup_session_preflight() {
+    local entry path label
     if [ -f "$STRAY_CREDENTIALS_FILE" ]; then
         optional_existed=yes
         optional_credentials=$(cat "$STRAY_CREDENTIALS_FILE" && printf '.') || return 1
@@ -2204,15 +2206,30 @@ new_command() {
             }
         done
     fi
+}
+
+# The first change of a cleanup: ask to close Claude, stop it, then stage the
+# bounded paths and reset the login/config, rolling everything back on failure.
+# $1 is the command name for messages (new or use). Uses the caller's locals set by
+# cleanup_session_preflight, plus save_name, selected_zone and the attempt flags.
+cleanup_session_commit() {
+    local command="$1" entry path label index destination
     # Interactive and before any process stop, as in use: a plain backup must not
     # sit next to a differing encrypted one.
-    # Every check above is read-only: ask before closing Claude, the first change.
+    # Every check so far (cleanup_session_preflight) is read-only: ask before
+    # closing Claude, the first change.
     if [ -n "$save_name" ]; then prefetch_weekly_reset; fi
-    confirm_close_claude new || return 1
+    confirm_close_claude "$command" || return 1
     if [ -n "$save_name" ]; then migrate_encrypted_backups || return 1; fi
     cleanup_stop_processes && cleanup_runtime_is_safe || {
         echo "Error: Live or unverifiable processes/runtime owners; cleanup incomplete" >&2; return 1;
     }
+    # use discards only a logged-out session. A login completed while Claude was
+    # still running is never thrown away; it must be saved instead.
+    if [ "$command" = use ] && ! unnamed_session_is_logged_out; then
+        echo "Error: This session logged in while preparing to discard its files; nothing discarded, run '$SCRIPT_NAME save <name>' first" >&2
+        return 1
+    fi
     # Save only once Claude is stopped, and only if the login still is that profile's.
     if [ -n "$save_name" ]; then
         if [ "$active" != "$save_name" ] || [ "$(cleanup_matching_active)" != "$save_name" ]; then
@@ -2262,6 +2279,103 @@ new_command() {
     rm -rf -- "$CLEANUP_RECOVERY_DIR" || {
         echo "Error: Session cleaned, but recovery removal incomplete: $CLEANUP_RECOVERY_DIR" >&2; return 1;
     }
+}
+
+# Logged out with no active profile and no cleanup/profile recovery pending: the
+# same state in which new cleans without asking. Leftover files then belong to no account.
+unnamed_session_is_logged_out() {
+    [ ! -e "$ACTIVE_FILE" ] && [ ! -L "$ACTIVE_FILE" ] || return 1
+    cleanup_is_complete 2>/dev/null || return 1
+    [ "$(new_cleanup_plan 2>/dev/null)" = clean ]
+}
+
+# Leftovers of a logged-out session must be plainly removable. A link inside
+# the sessions registry, or any directory ccacc cannot fully read and empty,
+# keeps the refusal: those are never discarded on use's say-so.
+logged_out_leftovers_are_safe() {
+    local path found
+    for path in "${cleanup_paths[@]}"; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        cleanup_path_is_safe "$path" || return 1
+        [ -d "$path" ] || continue
+        found=$(find "$path" -type d ! -perm -0700 -print 2>/dev/null) && [ -z "$found" ] || return 1
+        if [ "$path" = "$CONFIG_DIR/sessions" ]; then
+            found=$(find "$path" -type l -print 2>/dev/null) && [ -z "$found" ] || return 1
+        fi
+    done
+}
+
+# Read-only checks for use to discard a logged-out session with new's cleanup.
+# Uses the caller's cleanup locals, like cleanup_session_preflight.
+logged_out_session_preflight() {
+    unnamed_session_is_logged_out && validate_unnamed_session && cleanup_config_preflight \
+        && cleanup_session_preflight && [ -z "$active" ] && logged_out_leftovers_are_safe
+}
+
+# Read-only: prints the paths a logged-out discard would remove (tilde-shortened,
+# comma-separated), or fails when the session is not a safe logged-out one.
+logged_out_session_leftovers() {
+    local active='' credentials='' optional_credentials='' optional_existed='' path list=''
+    local -a cleanup_paths
+    logged_out_session_preflight || return 1
+    for path in "${cleanup_paths[@]}"; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        case "$path" in "$HOME"/*) path="~/${path#"$HOME"/}" ;; esac
+        list="${list:+$list, }$path"
+    done
+    [ -n "$list" ] || return 1
+    printf '%s\n' "$list"
+}
+
+# use after confirmation: discard a logged-out unnamed session's leftovers with
+# exactly new's cleanup (process stop/runtime checks, recovery snapshot, rollback,
+# account-key reset). Every check is repeated, since time passed at the prompts.
+# A selected unnamed-session timezone is kept, so a failed switch loses nothing.
+discard_logged_out_session() {
+    local active='' credentials='' selected_zone='' save_name=''
+    local optional_credentials='' optional_existed='' credentials_attempted='' config_attempted='' metadata_attempted=''
+    local -a cleanup_paths staged_locations
+    if ! logged_out_session_preflight 2>/dev/null; then
+        echo "Error: Current login/history changed while preparing to discard it; nothing discarded, run '$SCRIPT_NAME use' again" >&2
+        return 1
+    fi
+    selected_zone=$(unnamed_session_timezone) || selected_zone=''
+    cleanup_session_commit use || return 1
+    echo "Discarded the files left by the logged-out session." >&2
+}
+
+# Full current-account cleanup. The active profile's own login is backed up
+# first; a logout with no active profile is cleaned directly; anything else
+# needs confirmation.
+new_command() {
+    local active confirmation credentials selected_zone plan save_name=''
+    local optional_credentials='' optional_existed='' credentials_attempted='' config_attempted='' metadata_attempted=''
+    local -a cleanup_paths staged_locations
+    load_shell_companion || return 1
+    cleanup_is_complete || return 1
+    [ "$#" -eq 0 ] || { echo "Error: new accepts no arguments; choose timezone in its menu" >&2; return 1; }
+    validate_unnamed_session || return 1
+    cleanup_config_preflight || return 1
+    plan=$(new_cleanup_plan) || return 1
+    case "$plan" in
+        save:*)
+            save_name=${plan#save:}
+            echo "The current login belongs to active profile '$save_name'; it will be saved before cleanup." >&2 ;;
+        clean)
+            echo "Not logged in; cleaning without a backup." >&2 ;;
+        *)
+            if [ "${plan%%:*}" = logout ]; then
+                echo "Not logged in, but profile '${plan#logout:}' is active; its saved login will not be updated." >&2
+            elif [ -n "${plan#ask:}" ]; then
+                echo "The current login does not match active profile '${plan#ask:}'; that profile will not be updated." >&2
+            fi
+            printf "Have you already run '$SCRIPT_NAME save <name>' to back up this account? (y/N): " >&2
+            if ! IFS= read -r confirmation; then confirmation=''; fi
+            case "$confirmation" in y|Y|yes) ;; *) echo "Cleanup cancelled; run '$SCRIPT_NAME save <name>' first." >&2; return 1 ;; esac ;;
+    esac
+    selected_zone=$(choose_timezone 'unnamed session' optional) || return 1
+    cleanup_session_preflight || return 1
+    cleanup_session_commit new || return 1
     echo "Cleaned current account; started unnamed Claude session (logged out)."
     if find_surge; then
         echo -e "${YELLOW}Note: switch Surge to the right profile for the new account before logging in${NC}"

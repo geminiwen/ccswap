@@ -14,6 +14,9 @@ import unittest
 
 import test_ccacc_use_confirmation as confirmation
 
+# save/use read the weekly reset from Keychain and network; fixtures forbid both.
+os.environ["CCACC_NO_WEEKLY_RESET"] = "1"
+
 
 ENTER = '\x1b[?1049h'
 LEAVE = '\x1b[0m\x1b[?25h\x1b[?1049l\x1b[0m\x1b[?25h'

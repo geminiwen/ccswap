@@ -48,7 +48,7 @@ ccacc save work                              # Choose work's saved timezone inde
 ccacc use personal                          # Auto-back up outgoing account, choose YOLO, switch
 ccacc use                                   # Pick a saved profile in the terminal
 ccacc list                                  # List profiles; ls is an alias
-ccacc current                               # Show current email and saved name
+ccacc current                               # Show current email, saved name and weekly reset
 ccacc timezone                              # Read the current session timezone
 ccacc timezone work                         # Read a saved profile's timezone
 ccacc rm work                               # Confirm deletion of that profile and stash
@@ -174,6 +174,17 @@ you accept that for every account you switch to. `use` reads the file before any
 picker, backup migration, process stop or account change. If the file exists but
 cannot be read, is not valid JSON, is not an object, or `alwaysYOLO` is not a
 boolean, `use` fails with an error naming the file and changes nothing.
+
+## Weekly reset
+
+`save`, `new` and `use` read the live login's weekly limit reset time once, first
+thing (for `use`, the outgoing account's), from the same endpoint Claude Code's
+`/usage` reads, and record it as `~/.claude/accounts/<name>.weekly`. `list`, the
+`use` picker and `current` then show the next reset, rolled forward a week at a
+time, in the session's timezone, without going online again. A profile with no
+recorded reset shows none. The lookup uses only an unexpired access token from the
+Keychain (never refreshes it) and passes it to `curl` on standard input; when it
+fails, an earlier record stays. Set `CCACC_NO_WEEKLY_RESET=1` to turn it off.
 
 ## Backup boundaries
 

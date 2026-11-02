@@ -9,6 +9,9 @@ import unittest
 
 import test_ccacc_shell_integration as integration
 
+# save/use read the weekly reset from Keychain and network; fixtures forbid both.
+os.environ["CCACC_NO_WEEKLY_RESET"] = "1"
+
 
 class LaunchModeTests(unittest.TestCase):
     def setUp(self):

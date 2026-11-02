@@ -25,6 +25,8 @@ STRAY_CREDENTIALS_FILE="$CONFIG_DIR/.credentials.json"
 KEYCHAIN_SERVICE="Claude Code-credentials"
 DEVICE_KEY_SERVICE="Claude Code-device-keys"
 DEVICE_KEY_FILE="$CONFIG_DIR/.device-keys.json"
+# Plan usage and reset times, as shown by Claude Code's /usage.
+USAGE_URL="https://api.anthropic.com/api/oauth/usage"
 ACCOUNTS_DIR="$CONFIG_DIR/accounts"
 # Hidden names cannot pass check_name, keeping metadata separate from account stashes.
 ALIASES_DIR="$ACCOUNTS_DIR/.aliases"
@@ -844,7 +846,8 @@ save_account() {
         return 1
     fi
 
-    mv "$temp_account" "$ACCOUNTS_DIR/${name}.json"
+    mv "$temp_account" "$ACCOUNTS_DIR/${name}.json" || return 1
+    record_weekly_reset "$name"
 }
 
 # Function to restore a saved account's credentials and account-bound keys
@@ -1061,6 +1064,8 @@ list_accounts() {
             local plan=$(account_plan_label "$file")
             email="${CYAN}${email}${NC}"
             [ -z "$plan" ] || email="$email ${MAGENTA}[$plan]${NC}"
+            local reset=$(weekly_reset_label "$name")
+            [ -z "$reset" ] || email="$email ${BLUE}[weekly reset ${reset}]${NC}"
             local surge=""
             if [ -f "$ACCOUNTS_DIR/${name}.surge" ]; then
                 surge=" [Surge: $(jq -r 'to_entries | map("\(.key)=\(.value)") | join(", ")' "$ACCOUNTS_DIR/${name}.surge")]"
@@ -1078,12 +1083,69 @@ list_accounts() {
     fi
 }
 
+# Print the live login's weekly reset time (Unix seconds) from the endpoint
+# Claude Code's /usage reads; nothing when it cannot be read. Uses only the
+# live Keychain login and never refreshes it: an expired token is left for
+# Claude Code to renew. The token reaches curl on stdin (printf is a builtin),
+# so it never appears in process listings.
+fetch_weekly_reset() {
+    local token
+    # CCACC_NO_WEEKLY_RESET=1 turns the lookup off (no Keychain read, no network).
+    [ -z "${CCACC_NO_WEEKLY_RESET:-}" ] || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    token=$(read_credentials 2>/dev/null | jq -r '.claudeAiOauth? | objects
+        | select((.expiresAt | numbers) > now * 1000) | .accessToken | strings
+        | select(test("^[A-Za-z0-9._~+/=-]+$"))' 2>/dev/null) || token=''
+    [ -n "$token" ] || return 0
+    printf 'Authorization: Bearer %s\n' "$token" \
+        | curl -fsS --connect-timeout 3 -m 5 -H @- -H 'anthropic-beta: oauth-2025-04-20' \
+            -H 'Accept: application/json' "$USAGE_URL" 2>/dev/null \
+        | jq -r '.seven_day.resets_at | strings
+            | capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})([.][0-9]+)?(?<tz>Z|[+-][0-9]{2}:[0-9]{2})$")
+            | (.base + "Z" | fromdateiso8601)
+              - (if .tz == "Z" then 0
+                 else ((.tz[1:3] | tonumber) * 3600 + (.tz[4:6] | tonumber) * 60)
+                      * (if .tz[0:1] == "-" then -1 else 1 end) end)' 2>/dev/null || :
+}
+
+# Read the live login's weekly reset first thing in a command that saves it,
+# before any prompt, process stop or file change; save_account records it.
+PREFETCHED_WEEKLY_RESET=''
+prefetch_weekly_reset() {
+    PREFETCHED_WEEKLY_RESET=$(fetch_weekly_reset)
+}
+
+# Record the prefetched weekly reset for profile <name>. When none was read,
+# an earlier record stays: the weekly reset recurs at the same time.
+record_weekly_reset() {
+    local file="$ACCOUNTS_DIR/$1.weekly" temporary
+    [[ "$PREFETCHED_WEEKLY_RESET" =~ ^[0-9]{9,11}$ ]] || return 0
+    temporary=$(mktemp "$ACCOUNTS_DIR/.weekly.XXXXXXXX") || return 0
+    if printf '%s\n' "$PREFETCHED_WEEKLY_RESET" > "$temporary" && chmod 600 "$temporary"; then
+        mv -f "$temporary" "$file" || rm -f "$temporary"
+    else
+        rm -f "$temporary"
+    fi
+}
+
+# Print profile <name>'s next weekly reset in the session's TZ, carried forward
+# a week at a time from the recorded one; nothing when none was recorded.
+weekly_reset_label() {
+    local file="$ACCOUNTS_DIR/$1.weekly"
+    [ -f "$file" ] && [ ! -L "$file" ] || return 0
+    jq -Rr 'select(test("^[0-9]{9,11}\\n?\\z")) | rtrimstr("\n") | tonumber
+        | . + ((now - .) / 604800 | if . > 0 then ceil else 0 end) * 604800
+        | strflocaltime("%a %d %b %H:%M")' "$file" 2>/dev/null || :
+}
+
 # Function to show the current account
 show_current() {
     check_ready
-    local active=$(active_account)
+    local active=$(active_account) reset=''
     echo -e "Account:    $(current_email)"
     echo -e "Saved as:   ${active:-(not saved)}"
+    [ -z "$active" ] || reset=$(weekly_reset_label "$active")
+    [ -z "$reset" ] || echo -e "Weekly:     resets ${reset}"
     echo -e "Config dir: ${CONFIG_DIR}"
 }
 
@@ -1186,6 +1248,7 @@ save_command() (
     local -a _ccacc_profile_tx_entries
     umask 077
     check_name "$name" || return 1
+    prefetch_weekly_reset
     load_shell_companion || return 1
     cleanup_is_complete || return 1
     # Only the active profile may be refreshed under its own name. Any other
@@ -1201,7 +1264,7 @@ save_command() (
     # same name: the current login may be a different identity. Nothing about
     # launch permissions is stored in the named profile backup.
     _ccacc_profile_tx_entries=("file|$LAUNCH_MODE_FILE" "file|$ACTIVE_FILE"
-        "file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials"
+        "file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials" "file|$ACCOUNTS_DIR/$name.weekly"
         "file|$TIMEZONES_DIR/$name" "file|$LEGACY_PENDING_TIMEZONE_FILE" "file|$UNNAMED_SESSION_FILE")
     if [ ! -f "$ACCOUNTS_DIR/$name.surge" ]; then
         _ccacc_profile_tx_entries+=("file|$ACCOUNTS_DIR/$name.surge")
@@ -1296,12 +1359,12 @@ pick_saved_account() (
     local tty_state='' size rows=24 columns=80 page first
     local screen=false resized=false read_status interrupted=0 read_started
     local LC_ALL=C
-    local -a names plans emails zones
+    local -a names plans emails zones resets
     # Colour only the picker's own text; NO_COLOR (any value) turns it off.
     local c_title=$'\033[1m' c_name=$'\033[1m' c_active=$'\033[32m' c_sep=$'\033[2m'
-    local c_plan=$'\033[1;35m' c_email=$'\033[36m' c_zone=$'\033[33m' c_hint=$'\033[2m'
+    local c_plan=$'\033[1;35m' c_email=$'\033[36m' c_zone=$'\033[33m' c_reset=$'\033[34m' c_hint=$'\033[2m'
     if [ -n "${NO_COLOR:-}" ]; then
-        c_title='' c_name='' c_active='' c_sep='' c_plan='' c_email='' c_zone='' c_hint=''
+        c_title='' c_name='' c_active='' c_sep='' c_plan='' c_email='' c_zone='' c_reset='' c_hint=''
     fi
     # A local SECONDS loses its clock behavior in Bash 3.2. This assignment is
     # confined to the picker subshell and keeps Bash's elapsed-time variable.
@@ -1316,7 +1379,7 @@ pick_saved_account() (
         active=$(jq -Rser 'select(test("^[A-Za-z0-9][A-Za-z0-9._-]*\\n?\\z"))
             | rtrimstr("\n")' "$ACTIVE_FILE" 2>/dev/null) || active=''
     fi
-    names=() plans=() emails=() zones=()
+    names=() plans=() emails=() zones=() resets=()
     for file in "$ACCOUNTS_DIR"/*.json; do
         name=${file##*/}; name=${name%.json}
         valid_saved_account "$name" || continue
@@ -1331,6 +1394,7 @@ pick_saved_account() (
         fi
         index=${#names[@]}
         names[index]=$name; plans[index]=$plan; emails[index]=$email; zones[index]=$zone
+        resets[index]=$(weekly_reset_label "$name")
         [ "$name" != "$active" ] || selected=$index
     done
     if [ "${#names[@]}" -eq 0 ]; then
@@ -1391,6 +1455,9 @@ pick_saved_account() (
         fi
         if [ -n "${zones[index]}" ]; then
             _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_zone" "TZ=${zones[index]}" || return 1
+        fi
+        if [ -n "${resets[index]}" ]; then
+            _ccacc_picker_piece "$c_sep" ' | ' && _ccacc_picker_piece "$c_reset" "weekly reset ${resets[index]}" || return 1
         fi
         printf '\033[0m%s%*s\033[0m' "$base" "$left" '' >&2
     }
@@ -1492,6 +1559,9 @@ use_command() (
     always_yolo=$(read_always_yolo) || return 1
     require_shell_hook || return 1
     cleanup_is_complete || return 1
+    # First thing, before the picker and any change: the outgoing (active)
+    # login's weekly reset, recorded when that profile is backed up.
+    if [ -n "$(active_account)" ]; then prefetch_weekly_reset; fi
     trap 'exit 130' INT
     if [ "$name_seen" = false ]; then
         status=0
@@ -1542,6 +1612,7 @@ use_command() (
         mv -f "$staged_mode" "$LAUNCH_MODE_FILE" || return 1
         rm -f "$UNNAMED_SESSION_FILE" || return 1
         echo -e "${YELLOW}'${name}' is already active${NC}"
+        record_weekly_reset "$name"
         # Re-apply the saved Surge policies, undoing manual changes in Surge.
         apply_surge "$name" || return 1
         return 0
@@ -1929,6 +2000,7 @@ new_command() {
     # Interactive and before any process stop, as in use: a plain backup must not
     # sit next to a differing encrypted one.
     # Every check above is read-only: ask before closing Claude, the first change.
+    if [ -n "$save_name" ]; then prefetch_weekly_reset; fi
     confirm_close_claude new || return 1
     if [ -n "$save_name" ]; then migrate_encrypted_backups || return 1; fi
     cleanup_stop_processes && cleanup_runtime_is_safe || {
@@ -2068,7 +2140,7 @@ delete_command() (
     echo
     case "$reply" in y|Y) ;; *) return 1 ;; esac
     _ccacc_profile_tx_entries+=("file|$ACCOUNTS_DIR/$name.json" "file|$ACCOUNTS_DIR/$name.credentials"
-        "file|$ACCOUNTS_DIR/$name.credentials.enc" "file|$ACCOUNTS_DIR/$name.surge" "file|$ALIASES_DIR/$name.json" "file|$TIMEZONES_DIR/$name"
+        "file|$ACCOUNTS_DIR/$name.credentials.enc" "file|$ACCOUNTS_DIR/$name.surge" "file|$ACCOUNTS_DIR/$name.weekly" "file|$ALIASES_DIR/$name.json" "file|$TIMEZONES_DIR/$name"
         "dir|$ACCOUNTS_DIR/$name")
     _ccacc_profile_tx_preflight || return 1
     trap '_ccacc_profile_tx_finish' EXIT

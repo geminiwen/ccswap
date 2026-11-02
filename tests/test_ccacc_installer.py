@@ -14,6 +14,9 @@ import termios
 import threading
 import unittest
 
+# save/use read the weekly reset from Keychain and network; fixtures forbid both.
+os.environ["CCACC_NO_WEEKLY_RESET"] = "1"
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"

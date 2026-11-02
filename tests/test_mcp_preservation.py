@@ -4,6 +4,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+# save/use read the weekly reset from Keychain and network; fixtures forbid both.
+os.environ["CCACC_NO_WEEKLY_RESET"] = "1"
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / 'ccacc').read_text().rsplit('main "$@"', 1)[0]

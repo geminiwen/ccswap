@@ -13,8 +13,14 @@
 set -e
 
 SCRIPT_NAME="ccacc"
-VERSION="1.0.0"
-INSTALL_COMMAND="curl -fsSL https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | bash"
+VERSION="1.1.0"
+# The canonical installer always comes from main; it installs the latest GitHub Release.
+INSTALLER_URL="https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh"
+INSTALL_COMMAND="curl -fsSL $INSTALLER_URL | bash"
+# The daily update check and 'ccacc update' read GitHub Releases, not tags or main.
+LATEST_RELEASE_URL="https://api.github.com/repos/geminiwen/ccacc/releases/latest"
+UPDATE_CHECK_FILE="$HOME/.ccacc/update-check.json"
+UPDATE_CHECK_INTERVAL=86400
 
 # Always the default config dir, whatever CLAUDE_CONFIG_DIR says
 CONFIG_DIR="$HOME/.claude"
@@ -131,6 +137,7 @@ Commands:
   new                   Log out to a clean session
   rm <name>             Delete a saved account${surge_line}
   timezone [name]       Print the session's or an account's timezone${usage_line}
+  update [--force]      Install the latest ccacc release over this one
   help                  Show this help message
   -v, --version         Show version information
 
@@ -143,6 +150,206 @@ EOF
 version() {
     echo "${SCRIPT_NAME} v${VERSION}"
 }
+
+# Release versions are plain X.Y.Z. Anything else, including terminal escapes
+# from a tampered response or cache, is never compared or printed.
+valid_release_version() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+# True when release version $1 is strictly newer than $2, comparing each
+# component as a number. Components are compared as digit strings (leading
+# zeros dropped, then length, then text) so large numbers cannot overflow.
+version_newer() {
+    local left right a b i
+    valid_release_version "$1" && valid_release_version "$2" || return 1
+    IFS=. read -r -a left <<< "$1"
+    IFS=. read -r -a right <<< "$2"
+    for i in 0 1 2; do
+        a=${left[i]} b=${right[i]}
+        while [ "${#a}" -gt 1 ] && [ "${a:0:1}" = 0 ]; do a=${a:1}; done
+        while [ "${#b}" -gt 1 ] && [ "${b:0:1}" = 0 ]; do b=${b:1}; done
+        if [ "${#a}" -ne "${#b}" ]; then [ "${#a}" -gt "${#b}" ]; return; fi
+        if [ "$a" != "$b" ]; then [[ "$a" > "$b" ]]; return; fi
+    done
+    return 1
+}
+
+# Print the latest Release version (X.Y.Z, without the v) from the GitHub API;
+# nothing and a failure status when it cannot be read or is not a vX.Y.Z tag.
+# Same HTTPS-only curl hardening as the installer; short timeouts.
+fetch_latest_release() {
+    local version
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
+    version=$(curl --disable --fail --silent --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 3 --max-time 10 -H 'Accept: application/vnd.github+json' \
+            "$LATEST_RELEASE_URL" 2>/dev/null \
+        | jq --slurp --exit-status --raw-output '
+            if length == 1 and (.[0] | type == "object") then
+                .[0].tag_name | select(type == "string")
+                | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+\\z")) | ltrimstr("v")
+            else empty end' 2>/dev/null) || return 1
+    valid_release_version "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+# ~/.ccacc must be a real directory owned by us, reached without symlinks.
+# Creates it (mode 700) when missing; never follows or replaces a link.
+update_check_directory() {
+    local directory=${UPDATE_CHECK_FILE%/*} path
+    case "$directory" in /*) ;; *) return 1 ;; esac
+    case "$directory/" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
+    path=$directory
+    while [ -n "$path" ]; do
+        [ ! -L "$path" ] || return 1
+        [ ! -e "$path" ] || [ -d "$path" ] || return 1
+        path=${path%/*}
+    done
+    [ -d "$directory" ] || mkdir -m 700 -- "$directory" 2>/dev/null || return 1
+    [ -d "$directory" ] && [ ! -L "$directory" ] && [ -O "$directory" ] && [ -w "$directory" ]
+}
+
+# Print "<checked_at> <latest>" from the cache; latest may be "-" when the
+# last check found nothing. Fails on a missing, linked or malformed cache.
+read_update_check() {
+    [ -f "$UPDATE_CHECK_FILE" ] && [ ! -L "$UPDATE_CHECK_FILE" ] && [ -r "$UPDATE_CHECK_FILE" ] || return 1
+    jq --slurp --exit-status --raw-output '
+        if length == 1 and (.[0] | type == "object")
+            and (.[0].checked_at | type == "number")
+            and .[0].checked_at >= 0 and .[0].checked_at < 100000000000
+            and (.[0].latest == null or (.[0].latest | type == "string"
+                 and test("^[0-9]+\\.[0-9]+\\.[0-9]+\\z")))
+        then "\(.[0].checked_at | floor) \(.[0].latest // "-")" else empty end' \
+        "$UPDATE_CHECK_FILE" 2>/dev/null
+}
+
+# Record a check atomically: a private temporary file renamed over the cache.
+# A linked or non-regular cache path is left alone (rename would replace a
+# link, but mv would move into a directory). $1 is X.Y.Z or empty.
+write_update_check() {
+    local latest=$1 temporary
+    [ -z "$latest" ] || valid_release_version "$latest" || return 1
+    update_check_directory || return 1
+    [ ! -L "$UPDATE_CHECK_FILE" ] || return 1
+    [ ! -e "$UPDATE_CHECK_FILE" ] || [ -f "$UPDATE_CHECK_FILE" ] || return 1
+    temporary=$(umask 077; mktemp "${UPDATE_CHECK_FILE%/*}/.update-check.XXXXXXXX" 2>/dev/null) || return 1
+    if jq -n --arg latest "$latest" \
+            '{checked_at: (now | floor), latest: (if $latest == "" then null else $latest end)}' \
+            > "$temporary" 2>/dev/null \
+        && chmod 600 "$temporary" && mv -f -- "$temporary" "$UPDATE_CHECK_FILE" 2>/dev/null; then
+        return 0
+    fi
+    rm -f -- "$temporary"
+    return 1
+}
+
+# At most once per UPDATE_CHECK_INTERVAL, refresh the cached latest Release in
+# a detached background process, so list/current/use never wait on the
+# network. The attempt is recorded first (keeping the last known version), so
+# an offline machine retries only once a day. All output and stdin are
+# detached: a pipeline or command substitution never waits for it either.
+start_update_check() {
+    local cached checked_at=0 latest=-
+    [ -z "${CCACC_NO_UPDATE_CHECK:-}" ] || return 0
+    if cached=$(read_update_check); then
+        checked_at=${cached%% *} latest=${cached#* }
+        # A future timestamp (clock moved back) would block checks forever.
+        if [ "$checked_at" -le "$(date +%s)" ] \
+            && [ $(( $(date +%s) - checked_at )) -lt "$UPDATE_CHECK_INTERVAL" ]; then
+            return 0
+        fi
+    fi
+    [ "$latest" != - ] || latest=''
+    (
+        set +e
+        write_update_check "$latest" || exit 0
+        latest=$(fetch_latest_release) || exit 0
+        write_update_check "$latest"
+    ) </dev/null >/dev/null 2>&1 &
+    return 0
+}
+
+# One line on stderr when the cached latest Release is newer than this
+# version. Reads only the cache; never touches the network. Silent otherwise.
+show_update_hint() {
+    local cached latest
+    [ -z "${CCACC_NO_UPDATE_CHECK:-}" ] || return 0
+    cached=$(read_update_check) || return 0
+    latest=${cached#* }
+    valid_release_version "$latest" && version_newer "$latest" "$VERSION" || return 0
+    printf "%s %s is available (you have %s); run '%s update'\n" \
+        "$SCRIPT_NAME" "$latest" "$VERSION" "$SCRIPT_NAME" >&2 || :
+}
+
+# Run list/current/use with the daily update check: refresh first (detached),
+# hint only after success. The command's own status is returned, because main
+# can run inside a condition, where set -e does not stop at a failure.
+with_update_check() {
+    local status
+    start_update_check
+    "$@"
+    status=$?
+    [ "$status" -ne 0 ] || show_update_hint
+    return "$status"
+}
+
+# Reinstall the latest Release into the directory of this ccacc with the
+# canonical installer from main. The installer keeps settings and redoes the
+# shell setup; nothing secret is passed to it, and a source override in the
+# environment is dropped so the latest Release is what gets installed.
+update_command() (
+    local force=false latest directory script stage
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --force) force=true ;;
+            *) echo "Error: Unknown update option '$1'; expected --force" >&2; return 1 ;;
+        esac
+        shift
+    done
+    command -v curl >/dev/null 2>&1 || { echo "Error: curl is required to update ccacc" >&2; return 1; }
+    command -v jq >/dev/null 2>&1 || { echo "Error: jq is required to update ccacc" >&2; return 1; }
+    echo "Checking the latest ccacc release on GitHub..."
+    latest=$(fetch_latest_release) || {
+        echo "Error: Cannot read the latest ccacc release from GitHub; nothing was changed" >&2
+        return 1
+    }
+    write_update_check "$latest" || :
+    if ! version_newer "$latest" "$VERSION" && [ "$force" = false ]; then
+        if [ "$latest" = "$VERSION" ]; then
+            echo "ccacc $VERSION is already the latest release; nothing to do (use --force to reinstall)"
+        else
+            echo "ccacc $VERSION is newer than the latest release ($latest); nothing to do (use --force to install $latest)"
+        fi
+        return 0
+    fi
+    script="${BASH_SOURCE[0]}"
+    directory=$(cd -- "$(dirname -- "$script")" && pwd -P) || {
+        echo "Error: Cannot locate the directory of this ccacc; nothing was changed" >&2
+        return 1
+    }
+    [ -f "$directory/$(basename -- "$script")" ] || {
+        echo "Error: Cannot locate this ccacc in $directory; reinstall with: $INSTALL_COMMAND" >&2
+        return 1
+    }
+    stage=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/ccacc-update.XXXXXXXX") || {
+        echo "Error: Cannot create a private temporary directory; nothing was changed" >&2
+        return 1
+    }
+    trap 'rm -rf -- "$stage"' EXIT
+    # Download first, then run: a cut-off download never runs half an installer.
+    echo "Updating ccacc $VERSION to $latest in $directory"
+    echo "Running the installer from $INSTALLER_URL with --prefix $directory"
+    curl --disable --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 10 --max-time 60 --output "$stage/install.sh" "$INSTALLER_URL" \
+        && [ -s "$stage/install.sh" ] && bash -n "$stage/install.sh" || {
+        echo "Error: Cannot download the ccacc installer; nothing was changed" >&2
+        return 1
+    }
+    env -u CCACC_INSTALL_REF -u CCACC_INSTALL_REPO bash "$stage/install.sh" --prefix "$directory" || {
+        echo "Error: The installer failed; see its message above" >&2
+        return 1
+    }
+)
 
 # Function to check that jq and Claude Code's config are available
 check_ready() {
@@ -2168,10 +2375,10 @@ main() {
     esac
     case "${1:-}" in
         list|ls)
-            list_accounts
+            with_update_check list_accounts
             ;;
         current)
-            show_current
+            with_update_check show_current
             ;;
         save)
             shift
@@ -2200,7 +2407,12 @@ main() {
             ;;
         use)
             shift
-            use_command "$@"
+            # The hint follows a successful switch, never inside the picker.
+            with_update_check use_command "$@"
+            ;;
+        update)
+            shift
+            update_command "$@"
             ;;
         new)
             shift

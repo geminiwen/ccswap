@@ -10,6 +10,8 @@ import unittest
 
 # save/use read the weekly reset from Keychain and network; fixtures forbid both.
 os.environ["CCACC_NO_WEEKLY_RESET"] = "1"
+# list/current/use refresh the latest Release from GitHub; fixtures forbid the network.
+os.environ["CCACC_NO_UPDATE_CHECK"] = "1"
 
 
 ROOT = Path(__file__).resolve().parents[1]

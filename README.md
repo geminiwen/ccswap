@@ -14,7 +14,7 @@ login, account-bound configuration, history and session files together.
 
 ## Installation
 
-Install or update with the same command:
+Install or reinstall with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | bash
@@ -22,7 +22,9 @@ source "$HOME/.ccacc-shell/hook.sh"
 ```
 
 The installer deploys `ccacc` and its required `ccacc_shell.sh` companion together
-from one resolved commit, into `~/.local/bin` by default. It configures the hook
+from the latest [GitHub Release](https://github.com/geminiwen/ccacc/releases/latest),
+resolved once to a single commit, into `~/.local/bin` by default. If the latest
+Release cannot be looked up, it stops and leaves any existing installation unchanged. It configures the hook
 without requiring a saved account, passwords or Claude credentials. Source the
 printed hook path once to activate it in the current shell, or open a new
 interactive terminal. The hook adds the installed directory to PATH. Keep both
@@ -34,9 +36,38 @@ To choose another absolute **bin directory**:
 curl -fsSL https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | bash -s -- --prefix /absolute/path/to/bin
 ```
 
+To install something other than the latest Release, set `CCACC_INSTALL_REF` to a
+branch, tag or full commit; it skips the Release lookup. `CCACC_INSTALL_REF=main`
+installs the development branch:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/geminiwen/ccacc/main/install.sh | CCACC_INSTALL_REF=main bash
+```
+
 Installation rejects symlinked targets or path components. It does not install
 packages or require `sudo`. If deployment succeeds but shell setup fails, follow
 the printed repair command or rerun the installer after resolving the error.
+
+## Updates
+
+```bash
+ccacc update          # Install the latest Release over this ccacc
+ccacc update --force  # Reinstall even when already on the latest Release
+```
+
+`update` asks GitHub for the latest Release and, when it is newer than the running
+version, runs the installer from `main` with `--prefix` set to the directory of the
+running `ccacc`. The installer keeps `~/.ccacc/settings.json` and redoes the shell
+setup. When already on the latest Release it says so and changes nothing, unless
+`--force` is given.
+
+At most once a day, `list`, `current` and `use` look up the latest Release in the
+background (they never wait for it) and cache the answer in
+`~/.ccacc/update-check.json`. When the cached Release is newer, they print one line
+to standard error, e.g. `ccacc 1.2.0 is available (you have 1.1.0); run 'ccacc update'`;
+for `use` it comes after the switch, never inside the picker. Other commands never
+check. Failures are silent. Set `CCACC_NO_UPDATE_CHECK=1` to turn off both the
+lookup and the line.
 
 ## Account workflow
 
@@ -280,6 +311,17 @@ A late `use` failure can leave some target state applied. Read the error and ins
 the current account before retrying; the command does not claim a completed switch.
 An earlier outgoing-backup report describes the saved backup only; it does not
 mean that the target restore or switch completed.
+
+## Releasing
+
+The installer and the update check read GitHub Releases, so a tag alone is not
+enough:
+
+1. Bump `VERSION=` near the top of `ccacc` and commit.
+2. `git tag -a vX.Y.Z -m "ccacc X.Y.Z"` and `git push origin vX.Y.Z`.
+3. `gh release create vX.Y.Z --title "ccacc X.Y.Z" --notes "..."`.
+
+Tags must be `vX.Y.Z`; the installer and update check ignore anything else.
 
 ## Development checks
 

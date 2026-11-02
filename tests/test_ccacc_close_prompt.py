@@ -9,6 +9,8 @@ import test_ccacc_shell_integration as integration
 
 # save/use read the weekly reset from Keychain and network; fixtures forbid both.
 os.environ["CCACC_NO_WEEKLY_RESET"] = "1"
+# list/current/use refresh the latest Release from GitHub; fixtures forbid the network.
+os.environ["CCACC_NO_UPDATE_CHECK"] = "1"
 
 
 # Only the process boundary is fake: the listed PIDs and the stop request.

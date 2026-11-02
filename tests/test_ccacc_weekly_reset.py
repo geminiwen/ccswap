@@ -8,6 +8,8 @@ import tempfile
 import time
 import unittest
 
+# list/current/use refresh the latest Release from GitHub; fixtures forbid the network.
+os.environ["CCACC_NO_UPDATE_CHECK"] = "1"
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "ccacc").read_text().rsplit('main "$@"', 1)[0]

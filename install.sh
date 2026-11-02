@@ -10,7 +10,9 @@ ccacc_install_main() (
     usage() {
         printf '%s\n' 'Usage: bash install.sh [--prefix /absolute/bin/directory]' \
             'Default: $HOME/.local/bin' \
-            'Source overrides: CCACC_INSTALL_REPO=owner/repo CCACC_INSTALL_REF=branch-or-commit'
+            'Installs the latest GitHub Release by default.' \
+            'Source overrides: CCACC_INSTALL_REPO=owner/repo CCACC_INSTALL_REF=branch-tag-or-commit' \
+            '(CCACC_INSTALL_REF=main installs the development branch)'
     }
 
     prefix="${HOME:-}/.local/bin"
@@ -48,7 +50,11 @@ ccacc_install_main() (
     valid_path "$HOME" || fail 'HOME must be absolute, without dot components or repeated slashes'
 
     repo=${CCACC_INSTALL_REPO:-geminiwen/ccacc}
-    ref=${CCACC_INSTALL_REF:-main}
+    # No explicit ref: install the latest GitHub Release, resolved below.
+    # An explicit ref (branch, tag or commit) skips the Release lookup.
+    ref=${CCACC_INSTALL_REF:-}
+    latest_release=
+    [ -n "$ref" ] || latest_release=yes
     case "$repo" in
         */*) owner=${repo%%/*}; name=${repo#*/} ;;
         *) fail 'CCACC_INSTALL_REPO must be owner/repo' ;;
@@ -58,9 +64,11 @@ ccacc_install_main() (
             ''|.|*[!A-Za-z0-9_.-]*|*..*) fail 'invalid CCACC_INSTALL_REPO' ;;
         esac
     done
-    case "$ref" in
-        ''|/*|*/|*//*|*..*|./*|*/./*|*/.|.|*[!A-Za-z0-9_./-]*) fail 'invalid CCACC_INSTALL_REF' ;;
-    esac
+    if [ -z "$latest_release" ]; then
+        case "$ref" in
+            /*|*/|*//*|*..*|./*|*/./*|*/.|.|*[!A-Za-z0-9_./-]*) fail 'invalid CCACC_INSTALL_REF' ;;
+        esac
+    fi
 
     for tool in bash curl jq mkdir mktemp chmod cp mv rm ln; do
         command -v "$tool" >/dev/null 2>&1 \
@@ -104,6 +112,22 @@ ccacc_install_main() (
     trap 'exit 143' TERM
     chmod 700 "$stage" || fail 'cannot secure staging directory'
 
+    if [ -n "$latest_release" ]; then
+        curl --disable --fail --silent --show-error --location --proto '=https' \
+            --proto-redir '=https' --output "$stage/release.json" \
+            "https://api.github.com/repos/$repo/releases/latest" \
+            || fail 'latest release lookup failed; existing installation was not changed; rerun the installer, or set CCACC_INSTALL_REF=main to install the development branch'
+        # Only a single object whose tag_name is vX.Y.Z is accepted; the tag
+        # then goes through the same commit lookup as any other ref.
+        ref=$(jq --slurp --exit-status --raw-output '
+            if length == 1 and (.[0] | type == "object") then
+                .[0].tag_name | select(type == "string")
+                | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+\\z"))
+            else empty end
+        ' "$stage/release.json") && [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || fail 'invalid latest release response; existing installation was not changed; set CCACC_INSTALL_REF=main to install the development branch'
+        printf 'Installing the latest ccacc release, %s\n' "$ref"
+    fi
     # Resolve mutable names once so a branch update cannot mix file revisions.
     # Full commit IDs already identify immutable content and need no API call.
     commit=$ref

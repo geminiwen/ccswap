@@ -16,6 +16,8 @@ import unittest
 
 # save/use read the weekly reset from Keychain and network; fixtures forbid both.
 os.environ["CCACC_NO_WEEKLY_RESET"] = "1"
+# list/current/use refresh the latest Release from GitHub; fixtures forbid the network.
+os.environ["CCACC_NO_UPDATE_CHECK"] = "1"
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +54,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 case "$url" in
+    https://api.github.com/*/releases/latest)
+        [ "${RELEASE_FAIL:-}" != yes ] || exit 22
+        printf '%s' "$RELEASE_RESPONSE" > "$output"
+        exit 0 ;;
     https://api.github.com/*)
         [ "${API_FAIL:-}" != yes ] || exit 22
         printf '%s' "$COMMIT_RESPONSE" > "$output"
@@ -106,11 +112,12 @@ class InstallerTests(unittest.TestCase):
                         PAYLOADS=str(self.payloads), SETUP_LOG=str(self.setup_log),
                         DOWNLOAD_LOG=str(self.download_log), STAGE_LOG=str(self.stage_log),
                         COMMIT_RESPONSE='{"sha":"' + COMMIT + '"}',
+                        RELEASE_RESPONSE='{"tag_name":"v1.0.0","name":"ccacc 1.0.0"}',
                         BRANCH_STATE=str(self.fixture / "branch-state"), NEXT_COMMIT=NEXT_COMMIT,
                         EXPECTED_CORE=str(self.prefix / "ccacc"))
         for name in ("BASH_ENV", "ENV", "ZDOTDIR", "CLAUDE_CONFIG_DIR",
                      "CCACC_INSTALL_REPO", "CCACC_INSTALL_REF", "SETUP_EXIT", "DOWNLOAD_FAIL",
-                     "API_FAIL", "MUTABLE_REF_ADVANCES", "FAKE_UNAME"):
+                     "API_FAIL", "RELEASE_FAIL", "MUTABLE_REF_ADVANCES", "FAKE_UNAME"):
             self.env.pop(name, None)
 
     def executable(self, name, body):
@@ -158,9 +165,12 @@ class InstallerTests(unittest.TestCase):
         args = self.log_args(self.download_log)
         for file in ("ccacc", "ccacc_shell.sh"):
             self.assertIn("https://raw.githubusercontent.com/geminiwen/ccacc/" + COMMIT + "/" + file, args)
-        self.assertEqual(args.count("https://api.github.com/repos/geminiwen/ccacc/commits/main"), 1)
+        # No ref: the latest Release tag is resolved, then pinned to its commit.
+        self.assertEqual(args.count("https://api.github.com/repos/geminiwen/ccacc/releases/latest"), 1)
+        self.assertEqual(args.count("https://api.github.com/repos/geminiwen/ccacc/commits/v1.0.0"), 1)
+        self.assertNotIn("https://api.github.com/repos/geminiwen/ccacc/commits/main", args)
         for flag in ("--disable", "--fail", "--location", "--proto", "--proto-redir"):
-            self.assertEqual(args.count(flag), 3)
+            self.assertEqual(args.count(flag), 4)
         self.assertEqual(self.log_args(self.setup_log), [str(self.prefix / "ccacc"), "configure-shell"])
         self.assertIn("source " + shlex.quote(str(self.home / ".ccacc-shell/hook.sh")),
                       self.shell_unescape_source(result.stdout))
@@ -194,7 +204,7 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.home / ".local").exists())
 
     def test_main_advances_but_downloads_use_one_resolved_commit(self):
-        self.env["MUTABLE_REF_ADVANCES"] = "yes"
+        self.env.update(MUTABLE_REF_ADVANCES="yes", CCACC_INSTALL_REF="main")
         self.run_installer()
         self.assertEqual(Path(self.env["BRANCH_STATE"]).read_text(), NEXT_COMMIT)
         urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
@@ -224,12 +234,61 @@ class InstallerTests(unittest.TestCase):
                                    *(("", response) for response in responses)]:
             with self.subTest(api_fail=api_fail, response=response):
                 self.download_log.unlink(missing_ok=True)
-                self.env.update(API_FAIL=api_fail, COMMIT_RESPONSE=response)
+                self.env.update(API_FAIL=api_fail, COMMIT_RESPONSE=response, CCACC_INSTALL_REF="main")
                 self.run_installer(success=False)
                 self.assert_old_pair()
                 self.assertFalse(self.stage_log.exists())
                 urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
                 self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccacc/commits/main"])
+
+    def test_default_resolves_latest_release_then_its_commit(self):
+        self.env["RELEASE_RESPONSE"] = '{"tag_name":"v1.10.2","draft":false}'
+        result = self.run_installer()
+        urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
+        self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccacc/releases/latest",
+                                "https://api.github.com/repos/geminiwen/ccacc/commits/v1.10.2",
+                                "https://raw.githubusercontent.com/geminiwen/ccacc/" + COMMIT + "/ccacc",
+                                "https://raw.githubusercontent.com/geminiwen/ccacc/" + COMMIT + "/ccacc_shell.sh"])
+        self.assertIn("v1.10.2", result.stdout)
+
+    def test_empty_ref_means_latest_release(self):
+        self.env["CCACC_INSTALL_REF"] = ""
+        self.run_installer()
+        self.assertIn("https://api.github.com/repos/geminiwen/ccacc/releases/latest",
+                      self.log_args(self.download_log))
+
+    def test_explicit_ref_skips_release_lookup(self):
+        for ref, lookup in (("main", "commits/main"), ("v1.0.0", "commits/v1.0.0"),
+                            ("feature/x", "commits/feature%2Fx"), (COMMIT, None)):
+            with self.subTest(ref=ref):
+                self.download_log.unlink(missing_ok=True)
+                self.env.update(CCACC_INSTALL_REF=ref, RELEASE_FAIL="yes")
+                self.run_installer()
+                urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
+                self.assertFalse(any(url.endswith("/releases/latest") for url in urls), urls)
+                expected = [] if lookup is None else ["https://api.github.com/repos/geminiwen/ccacc/" + lookup]
+                self.assertEqual(urls[:-2], expected)
+
+    def test_release_lookup_failure_or_garbage_fails_closed(self):
+        self.existing_pair()
+        responses = ["", "not json", "null", "[]", "{}", '{"tag_name":null}', '{"tag_name":1}',
+                     '{"tag_name":"1.0.0"}', '{"tag_name":"main"}', '{"tag_name":"v1.0"}',
+                     '{"tag_name":"v1.0.0-beta"}', '{"tag_name":"v1.0.0\\n"}',
+                     '{"tag_name":"v1.0.0\\u001b[31m"}', '{"tag_name":"../v1.0.0"}',
+                     '{"tag_name":["v1.0.0"]}',
+                     '{"tag_name":"v1.0.0"}\n{"tag_name":"v2.0.0"}']
+        for release_fail, response in [("yes", self.env["RELEASE_RESPONSE"]),
+                                       *(("", response) for response in responses)]:
+            with self.subTest(release_fail=release_fail, response=response):
+                self.download_log.unlink(missing_ok=True)
+                self.env.update(RELEASE_FAIL=release_fail, RELEASE_RESPONSE=response)
+                result = self.run_installer(success=False)
+                self.assert_old_pair()
+                self.assertFalse(self.stage_log.exists())
+                self.assertIn("existing installation was not changed", result.stderr)
+                self.assertIn("CCACC_INSTALL_REF=main", result.stderr)
+                urls = [arg for arg in self.log_args(self.download_log) if arg.startswith("https://")]
+                self.assertEqual(urls, ["https://api.github.com/repos/geminiwen/ccacc/releases/latest"])
 
     def test_short_sha_is_resolved_through_api(self):
         self.env["CCACC_INSTALL_REF"] = COMMIT[:12]
@@ -420,7 +479,9 @@ import sys
 args = sys.argv[1:]
 output = Path(args[args.index('--output') + 1])
 assert stat.S_IMODE(output.parent.stat().st_mode) == 0o700
-if args[-1].startswith('https://api.github.com/'):
+if args[-1].endswith('/releases/latest'):
+    output.write_text(os.environ['RELEASE_RESPONSE'])
+elif args[-1].startswith('https://api.github.com/'):
     output.write_text(os.environ['COMMIT_RESPONSE'])
 else:
     shutil.copyfile(Path(os.environ['PAYLOADS']) / output.name, output)
